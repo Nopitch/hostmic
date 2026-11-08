@@ -1,3 +1,4 @@
-[build]
-# Drivers link the C runtime statically.
+# Drivers link the C runtime statically. Windows only: on Linux, where the fuzz targets run,
+# a static C runtime cannot build proc-macros or sanitizer runtimes.
+[target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
