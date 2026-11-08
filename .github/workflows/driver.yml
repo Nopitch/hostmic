@@ -86,6 +86,11 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # hostmic-sys: Rust layouts and GUIDs checked against what MSVC computes from the WDK
+      # headers.
+      - name: Test
+        run: cargo test --locked
+
       - name: Install cargo-wdk
         shell: pwsh
         run: cargo install cargo-wdk --version $env:CARGO_WDK_VERSION --locked

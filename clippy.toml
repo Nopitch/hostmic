@@ -1,0 +1,3 @@
+# Domain names that are words, not code identifiers, in documentation. ".." keeps clippy's
+# defaults (GitHub, WebAssembly…).
+doc-valid-idents = ["PortCls", "WaveRT", ".."]

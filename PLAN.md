@@ -43,8 +43,9 @@ Windows audio engine period.
   only) plus a topology miniport. ACX (the newer KMDF-based model) is set aside: Windows 11 only,
   fewer virtual-device examples; to reconsider once the WaveRT version works.
 - **Bindings:** `wdk-sys` 0.5 (windows-drivers-rs, checked 2026-11-08) covers WDM/KMDF, HID, USB,
-  storage… but not `portcls.h`, `ks.h` or `ksmedia.h`. A `hostmic-sys` crate generates them with
-  bindgen, through `wdk-build`, restricted to what the driver uses.
+  storage… but not `portcls.h`, `ks.h` or `ksmedia.h`. A `hostmic-sys` crate (MIT OR Apache-2.0,
+  like `wdk-sys`: generated from the WDK headers, no sample code) generates them with bindgen,
+  through `wdk-build`, restricted to what the driver uses.
 - **COM-style interfaces:** PortCls calls the miniport through C++ interfaces (`IUnknown`,
   `IMiniportWaveRT`, `IMiniportWaveRTStream`, `IMiniportTopology`…). They are implemented in Rust
   as `#[repr(C)]` structs whose first field is a vtable pointer, with explicit reference counting.
@@ -119,6 +120,25 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 - **M2, audio bindings:** `hostmic-sys`, bindgen over the PortCls/KS headers, with the subset
   used by `simpleaudiosample`'s capture path; compiles, tests check struct sizes and offsets
   against the C headers.
+  *Done (2026-11-08):* the capture path (inventoried from the sample) uses KMDF in miniport mode
+  (`WdfDriverInitNoDispatchOverride`) next to PortCls, 8 PortCls functions, ~17 COM interfaces,
+  ~45 structs, ~45 GUIDs. `hostmic-sys/build.rs`:
+  - bindgen in C mode over `portcls.h` and `ksmedia.h`, name allowlists, non-recursive: every
+    WDM type is `wdk-sys`'s own. A parse callback tells bindgen those types are `Copy` (else C
+    unions such as `KSDATAFORMAT` become an over-aligned emulation that packed structs such as
+    `KSDATAFORMAT_WAVEFORMATEX` cannot contain).
+  - In C, `portcls.h` never defines `INTERFACE`, so each method's `This` would be a pointer to
+    WDM's unrelated `INTERFACE` struct: the headers are included in `portcls.h`'s order and
+    `INTERFACE` is `void` for `portcls.h` alone.
+  - GUIDs as Rust constants, values read through MSVC's preprocessor (KS: `STATIC_*` macros;
+    PortCls IIDs/CLSIDs: `DEFINE_GUID` under `INITGUID`, since no WDK library defines them).
+    `punknown.h`'s `IID_IUnknown` is `…-0000-C00000000046`, not COM's `…-C000-000000000046`
+    (the one in `ksguid.lib`).
+  - Tests (`cargo test`, in CI): sizes, alignments and field offsets of 38 structs and vtables
+    compared with MSVC (a C file compiled by `cc`), and GUIDs against published values.
+  For M3: `QueryInterface` accepts both `IID_IUnknown` values; the adapter keeps its state in
+  its own device extension (the sample writes into PortCls's reserved one); the sample's
+  timer, `GetPosition` and `GetReadPacket` take a spin lock, against the real-time rule.
 - **M3, a microphone that plays a tone:** port the adapter, the WaveRT capture miniport and the
   topology miniport; the driver itself fills the buffer with a sine, like the sample's tone
   generator. Done when "Microphone (hostmic)" appears in the VM and records a clean 1 kHz tone.
