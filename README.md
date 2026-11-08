@@ -1,5 +1,7 @@
 # hostmic
 
+[![OpenSSF Baseline](https://www.bestpractices.dev/projects/16465/baseline)](https://www.bestpractices.dev/projects/16465)
+
 An open-source Windows **virtual microphone driver fed by a user-mode host**, written in Rust.
 
 Some applications generate or process audio that other programs should receive as if it came
