@@ -1,0 +1,17 @@
+# Extends the built-in rules: without `useDefault`, this file would REPLACE them and the
+# repository would lose all detection.
+[extend]
+useDefault = true
+
+# GitHub moved App installation tokens to a "stateless" format of about 520 characters,
+# `ghs_<app-id>_<jwt>` (changelog of 2026-04-24). The built-in `github-app-token` rule
+# expects `(ghu|ghs)_[0-9a-zA-Z]{36}`: the underscore and dots of the new format break the
+# match. The pattern below is the one GitHub recommends; it also matches the old format, so
+# some tokens are reported twice, which is harmless.
+#
+# REMOVE once the upstream rule covers the new format.
+[[rules]]
+id = "github-app-token-stateless"
+description = "GitHub App installation token, stateless format (ghs_<app-id>_<jwt>)"
+regex = '''ghs_[A-Za-z0-9._-]{36,}'''
+keywords = ["ghs_"]

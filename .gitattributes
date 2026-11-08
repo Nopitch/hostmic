@@ -1,0 +1,6 @@
+# LF in the repository, whatever the contributor's platform.
+* text=auto eol=lf
+
+# Windows driver packaging files keep CRLF.
+*.inf text eol=crlf
+*.inx text eol=crlf

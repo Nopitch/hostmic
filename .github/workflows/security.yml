@@ -1,0 +1,69 @@
+name: security
+
+on:
+  # No `paths-ignore`: both jobs are required checks of the `Protect main` ruleset,
+  # and a path filter would leave documentation-only pull requests waiting forever.
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  # On a pull request, a new push makes the previous run obsolete. Never cancel on
+  # `main` or on the schedule: a cancelled gate proves nothing.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Public repository: GitHub-hosted runners only. A self-hosted runner would run code
+  # from any fork's pull request on the host.
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the token out of .git/config (zizmor's artipacked rule).
+          persist-credentials: false
+
+      - name: Audit GitHub Actions workflows with zizmor
+        run: |
+          set -euo pipefail
+          VERSION="1.29.0"
+          SHA="dd96df044a6e8538d5f423790f453bdd03d49e5b2bcc38214acc41a2f1297839"
+          curl -fsSL -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          # Verify the archive BEFORE extracting it: never run an unpinned binary.
+          echo "${SHA}  zizmor.tar.gz" | sha256sum -c -
+          tar -xzf zizmor.tar.gz zizmor
+          ./zizmor --no-online-audits --min-severity medium .github/workflows/
+
+  # Named after what it checks, not after the tool: changing tools must not break the
+  # ruleset's required check.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: secrets are searched in every commit, not only the last one.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan the git history for secrets with betterleaks
+        run: |
+          set -euo pipefail
+          VERSION="1.8.1"
+          # From the release's checksums.txt.
+          SHA="efa407244e1ea8e35f582b8a42becdeac08bdead04f68eb752adda722d583c2a"
+          curl -fsSL -o betterleaks.tar.gz \
+            "https://github.com/betterleaks/betterleaks/releases/download/v${VERSION}/betterleaks_${VERSION}_linux_x64.tar.gz"
+          echo "${SHA}  betterleaks.tar.gz" | sha256sum -c -
+          tar -xzf betterleaks.tar.gz betterleaks
+          ./betterleaks git . --redact --no-banner --confidence medium --config .gitleaks.toml \
+            --log-opts="--all --full-history" --exit-code 1

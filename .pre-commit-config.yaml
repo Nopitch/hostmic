@@ -1,0 +1,8 @@
+# Install: pre-commit install --hook-type pre-commit
+repos:
+  - repo: https://github.com/betterleaks/betterleaks
+    rev: 5eab48332cc48565864514e3bc6de89df091a7c4 # frozen: v1.8.1
+    hooks:
+      - id: betterleaks
+        args: [--confidence, medium, --config, .gitleaks.toml]
+        stages: [pre-commit]

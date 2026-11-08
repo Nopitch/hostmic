@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Cargo is added with the first crate (milestone M1).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
