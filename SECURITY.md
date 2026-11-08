@@ -42,6 +42,9 @@ In scope: the driver (IOCTL handling, buffer mapping, anything reachable from us
 host library. Out of scope: issues that require administrator rights or test signing to be
 enabled, since those already grant full control of the machine.
 
+What users can and cannot expect from the driver, its threat model and the reasons to trust
+its design are in [docs/security-assurance.md](docs/security-assurance.md).
+
 ## Secrets and credentials
 
 - **CI uses no repository secrets.** Workflows get a `GITHUB_TOKEN` restricted per job to the
