@@ -86,6 +86,9 @@ hostmic is experimental: try it in a virtual machine only. In about an hour, fro
 - The **user-mode host library** is original code, licensed under either the
   [MIT license](LICENSES/MIT.txt) or the [Apache License 2.0](LICENSES/Apache-2.0.txt), at
   your option.
+- **`hostmic-abi`**, the contract between the driver and the host (control codes and request
+  layouts), is shared by both and licensed like the host library: MIT or Apache-2.0, at your
+  option.
 - **`hostmic-sys`**, the bindings to the WDK's audio headers, is generated from those headers
   like `wdk-sys` and shares its license: MIT or Apache-2.0, at your option.
 

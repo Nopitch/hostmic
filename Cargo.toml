@@ -1,5 +1,5 @@
 [workspace]
-members = ["driver", "driver-core", "hostmic-sys", "tools/capture-check"]
+members = ["abi", "driver", "driver-core", "hostmic-sys", "tools/capture-check"]
 resolver = "3"
 
 [workspace.package]
