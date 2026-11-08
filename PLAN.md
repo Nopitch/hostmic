@@ -1,0 +1,133 @@
+# hostmic — plan
+
+This file is the source of truth for the project: read it before proposing anything, update it
+when a decision changes. One notion per pull request.
+
+## Goal
+
+A Windows kernel driver, written in Rust, that exposes **one capture endpoint** (a microphone)
+whose audio is supplied by a **user-mode host application** through a shared ring buffer, the host
+providing the clock. Signed through Microsoft attestation (via an open-source signing programme),
+so that it loads with Secure Boot enabled, on any Windows 10/11 x64 machine.
+
+First user: Résonnance, a real-time voice changer (not public yet), which today writes into a
+virtual cable (VAC, VB-Cable) to reach Discord.
+
+### Target, from measurements
+
+Measured on 2026-11-08 with the Thin Audio Gateway demo, which uses the same architecture
+(host-fed WaveRT microphone, host thread registered with MMCSS, shared-mode WASAPI reader as
+Discord uses):
+
+| | write → read | under load (16 saturated threads, 30 s) |
+|---|---|---|
+| host poll 5 ms | median 10.8 ms | 0 discontinuities |
+| host poll 2 ms | median 9.6 ms | 0 discontinuities |
+
+For comparison, VAC needs ~42 ms round trip (15 ms exclusive output period) and drops out under the
+same load below 15 ms. **hostmic is done when it matches the first table.** The ~10 ms floor is the
+Windows audio engine period.
+
+### Non-goals
+
+- No audio processing in the driver.
+- No render (speaker) endpoint at first: that would rebuild a virtual cable.
+- Not a clone of Thin Audio Gateway: no code, header or binary from it is used or read beyond its
+  public documentation.
+
+## Architecture
+
+### Driver (kernel, `no_std` Rust, MS-PL)
+
+- **Model:** PortCls with a WaveRT miniport, as in Microsoft's `simpleaudiosample` (capture path
+  only) plus a topology miniport. ACX (the newer KMDF-based model) is set aside: Windows 11 only,
+  fewer virtual-device examples; to reconsider once the WaveRT version works.
+- **Bindings:** `wdk-sys` 0.5 (windows-drivers-rs, checked 2026-11-08) covers WDM/KMDF, HID, USB,
+  storage… but not `portcls.h`, `ks.h` or `ksmedia.h`. A `hostmic-sys` crate generates them with
+  bindgen, through `wdk-build`, restricted to what the driver uses.
+- **COM-style interfaces:** PortCls calls the miniport through C++ interfaces (`IUnknown`,
+  `IMiniportWaveRT`, `IMiniportWaveRTStream`, `IMiniportTopology`…). They are implemented in Rust
+  as `#[repr(C)]` structs whose first field is a vtable pointer, with explicit reference counting.
+  Every `unsafe` block carries a `// SAFETY:` comment stating the invariant.
+- **Static descriptors:** filter, pin, node and property tables (`PCFILTER_DESCRIPTOR` and
+  friends) are `static` Rust data, built once, never mutated.
+- **Host interface:** a device interface (its own GUID) opened with `CreateFile`; `DeviceIoControl`
+  requests to attach as host, set the format range, receive a notification event, map the client
+  buffer, advance the position. The client buffer is described by an MDL and mapped into the
+  host process only.
+- **No host, no microphone:** without a host, the pin reports its jack as disconnected
+  (`KSPROPERTY_JACK_DESCRIPTION`), so Windows shows it unplugged instead of a silent device.
+- **One host at a time.** The handle's cleanup unmaps the buffer and marks the pin unplugged if the
+  host dies.
+
+### Host library (user mode, Rust, MIT OR Apache-2.0)
+
+- Crate `hostmic`: find and open the driver, attach as host, choose the format (48 kHz, 16-bit,
+  stereo first), get a safe view of the ring buffer, advance the position.
+- A reference host loop, clocked by QPC like Thin Audio Gateway's, registered with MMCSS
+  ("Pro Audio"). Later: let the caller drive the clock (Résonnance wants to follow its physical
+  microphone, to remove clock drift).
+- Real-time rule in the host's audio path: no allocation, no lock, no I/O.
+
+### Security
+
+A driver that maps memory into a user process is a classic source of vulnerabilities. Rules:
+
+- Validate every IOCTL input size and value; reject everything unexpected.
+- Device object security descriptor (SDDL) restricted to administrators and the interactive user.
+- Map only the client buffer, only into the attached host, with user-mode probing inside
+  structured exception handling; unmap on cleanup.
+- Compatible with Memory Integrity (HVCI): non-executable pool, no RWX mappings.
+- Driver Verifier enabled in the test VM; static analysis (CodeQL) before any signing request.
+
+## Development environment
+
+- **Never on an everyday machine.** Test signing needs Secure Boot off, which also breaks games
+  protected by anti-cheats such as BattlEye.
+- A Hyper-V virtual machine (Windows 11 Pro), test signing on, kernel debugging over the network
+  (KDNET), snapshots before each driver install.
+- Host build machine: Visual Studio with the WDK (or the eWDK) and LLVM/Clang for bindgen, as
+  required by windows-drivers-rs (re-read its README at M1 for exact versions).
+- Rust toolchain pinned in `rust-toolchain.toml`, bumped on purpose only.
+
+## Milestones (one notion per pull request)
+
+- **M0, bootstrap** (this commit): README, plan, licences.
+- **M1, toolchain proof:** a minimal Rust KMDF driver from windows-drivers-rs' samples builds,
+  installs and logs a message in the VM. Contact the signing programme in parallel (see M7).
+- **M2, audio bindings:** `hostmic-sys`, bindgen over the PortCls/KS headers, with the subset
+  used by `simpleaudiosample`'s capture path; compiles, tests check struct sizes and offsets
+  against the C headers.
+- **M3, a microphone that plays a tone:** port the adapter, the WaveRT capture miniport and the
+  topology miniport; the driver itself fills the buffer with a sine, like the sample's tone
+  generator. Done when "Microphone (hostmic)" appears in the VM and records a clean 1 kHz tone.
+- **M4, the host interface:** IOCTLs, buffer mapping, host-advanced position, unplugged without a
+  host; the tone generator goes away.
+- **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
+  ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
+- **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
+  resume, host crash, several hours of endurance.
+- **M7, signing:** submit to an open-source signing programme (OSSign signs kernel drivers through
+  Microsoft attestation; its conditions are not public and must be asked first), then install on a
+  real machine with Secure Boot on.
+- **M8, Résonnance:** in Résonnance's repository, an output "Résonnance microphone (hostmic)"
+  replacing the virtual cable.
+
+## Open questions
+
+- Endpoint naming: the device name is fixed in the INF; the endpoint name per line.
+- Windows 10 support: keep it if it costs nothing (WaveRT is fine there; ACX would not be).
+- ARM64: later.
+- Signing programme acceptance and turnaround: unknown until asked.
+
+## Prior art and references
+
+- Microsoft driver samples, MS-PL:
+  [`audio/simpleaudiosample`](https://github.com/microsoft/Windows-driver-samples/tree/main/audio/simpleaudiosample),
+  [`audio/sysvad`](https://github.com/microsoft/Windows-driver-samples/tree/main/audio/sysvad).
+- [windows-drivers-rs](https://github.com/microsoft/windows-drivers-rs) (`wdk`, `wdk-sys`,
+  `wdk-build`).
+- Thin Audio Gateway (public documentation only): the host-fed WaveRT design and its measured
+  latency.
+- [Leyline](https://github.com/slategraydev/LeylineVirtualAudioDeviceRust): early Rust WaveRT
+  driver. **No license** (all rights reserved): read to learn, never copy.
