@@ -10,14 +10,14 @@ whose audio is supplied by a **user-mode host application** through a shared rin
 providing the clock. Signed through Microsoft attestation (via an open-source signing programme),
 so that it loads with Secure Boot enabled, on any Windows 10/11 x64 machine.
 
-First user: Résonnance, a real-time voice changer (not public yet), which today writes into a
-virtual cable (VAC, VB-Cable) to reach Discord.
+First user: Résonnance (not public yet), a real-time audio processing application, which today
+writes into a virtual cable (VAC, VB-Cable) to reach other applications.
 
 ### Target, from measurements
 
 Measured on 2026-11-08 with the Thin Audio Gateway demo, which uses the same architecture
 (host-fed WaveRT microphone, host thread registered with MMCSS, shared-mode WASAPI reader as
-Discord uses):
+most communication and recording applications use):
 
 | | write → read | under load (16 saturated threads, 30 s) |
 |---|---|---|
