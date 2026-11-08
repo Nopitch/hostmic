@@ -97,23 +97,47 @@ certutil -addstore Root C:\hostmic\pkg\WDRLocalTestCert.cer
 certutil -f -addstore TrustedPublisher C:\hostmic\pkg\WDRLocalTestCert.cer
 ```
 
-Optionally start [DebugView](https://learn.microsoft.com/sysinternals/downloads/debugview)
-elevated with kernel capture (`Dbgview64.exe /accepteula /k /v`) to see the driver's
-`hostmic: …` messages. Then install and check:
+Then install and check:
 
 ```powershell
 C:\hostmic\devcon.exe install C:\hostmic\pkg\hostmic_driver.inf root\hostmic
 Get-PnpDevice -FriendlyName hostmic | Format-List FriendlyName,Status,Class,InstanceId,Problem
 sc.exe query hostmic
+Get-PnpDevice -Class AudioEndpoint | Format-Table FriendlyName,Status
 ```
 
 Expected: `hostmic`, status `OK`, class `MEDIA`, instance `ROOT\MEDIA\0000`, problem
-`CM_PROB_NONE`, service `RUNNING`. The topology filter's device interfaces (categories
-`KSCATEGORY_AUDIO` and `KSCATEGORY_TOPOLOGY`) appear under
-`HKLM\SYSTEM\CurrentControlSet\Control\DeviceClasses` for `ROOT#MEDIA#0000`. Until the wave
-filter exists, Windows shows no microphone.
+`CM_PROB_NONE`, service `RUNNING`, and an audio endpoint `Microphone (hostmic)`, status `OK`.
+`pnputil /enum-interfaces /enabled` lists the filters' enabled KS interfaces (`TopologyMic`:
+audio and topology; `WaveMic`: audio, capture and real time).
 
-Then remove it:
+## 4. Record the microphone (VM)
+
+`tools/capture-check` records the endpoint through shared-mode WASAPI and checks the tone.
+Build it on the host (`cargo build -p hostmic-capture-check --release`), copy
+`target\release\capture-check.exe` to `C:\hostmic\`, then in the VM:
+
+```powershell
+C:\hostmic\capture-check.exe --seconds 60
+```
+
+Expected (milestone M3, the driver's own tone): 1000.00 Hz, peak -6.02 dBFS, RMS -9.03 dBFS,
+identical channels, no discontinuity flag, no silent packet, no glitch, `PASS`.
+
+## 5. Read the driver's messages (VM, elevated)
+
+The driver logs its non-real-time events (`hostmic: …`: start, streams, state changes,
+interfaces it was asked for and does not have) with `DbgPrint`.
+[DebugView](https://learn.microsoft.com/sysinternals/downloads/debugview)'s command-line
+version captures them; run it in the foreground (redirected, it writes only its banner) while
+a background job reinstalls the device:
+
+```powershell
+$j = Start-Job { Start-Sleep 8; C:\hostmic\devcon.exe remove root\hostmic; Start-Sleep 3; C:\hostmic\devcon.exe install C:\hostmic\pkg\hostmic_driver.inf root\hostmic }
+C:\hostmic\dbgviewcli64.exe --accepteula -k -v --no-banner -i *hostmic* --duration 35
+```
+
+## 6. Remove the driver (VM, elevated)
 
 ```powershell
 C:\hostmic\devcon.exe remove root\hostmic

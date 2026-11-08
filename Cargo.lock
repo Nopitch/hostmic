@@ -272,6 +272,7 @@ dependencies = [
 name = "hostmic-driver"
 version = "0.1.0"
 dependencies = [
+ "hostmic-driver-core",
  "hostmic-sys",
  "wdk",
  "wdk-alloc",

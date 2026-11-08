@@ -35,6 +35,21 @@ pub const IID_IUNKNOWN_COM: GUID = GUID {
     Data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
 };
 
+/// Formats a GUID the usual way, for the debug output.
+pub struct GuidDisplay<'a>(pub &'a GUID);
+
+impl core::fmt::Display for GuidDisplay<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let g = self.0;
+        let d = g.Data4;
+        write!(
+            f,
+            "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+            g.Data1, g.Data2, g.Data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+        )
+    }
+}
+
 /// Whether two GUIDs are equal.
 #[must_use]
 pub const fn guid_eq(a: &GUID, b: &GUID) -> bool {
@@ -114,7 +129,8 @@ pub unsafe extern "C" fn query_interface<T: ComObject, const OFFSET: usize>(
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: the caller passes a valid IID or null.
-    let found = match unsafe { interface_id.as_ref() } {
+    let iid = unsafe { interface_id.as_ref() };
+    let found = match iid {
         Some(iid) if guid_eq(iid, &guid::IID_IUnknown) || guid_eq(iid, &IID_IUNKNOWN_COM) => {
             Some(0)
         }
@@ -125,15 +141,23 @@ pub unsafe extern "C" fn query_interface<T: ComObject, const OFFSET: usize>(
         None => None,
     };
     let base = this.wrapping_byte_sub(OFFSET);
-    let result = match found {
-        Some(offset) => {
-            // SAFETY: `base` is the live `T` that `this` belongs to.
-            unsafe { object::<T, 0>(base) }
-                .references()
-                .fetch_add(1, Ordering::Relaxed);
-            base.wrapping_byte_add(offset)
+    let result = if let Some(offset) = found {
+        // SAFETY: `base` is the live `T` that `this` belongs to.
+        unsafe { object::<T, 0>(base) }
+            .references()
+            .fetch_add(1, Ordering::Relaxed);
+        base.wrapping_byte_add(offset)
+    } else {
+        // Optional interfaces PortCls probes for (power, signal processing modes…); logged
+        // so that a missing required one shows up in the debug output.
+        if let Some(iid) = iid {
+            wdk::println!(
+                "hostmic: {} has no interface {}",
+                core::any::type_name::<T>(),
+                GuidDisplay(iid)
+            );
         }
-        None => ptr::null_mut(),
+        ptr::null_mut()
     };
     // SAFETY: `interface` is writable (caller's contract) and not null (checked above).
     unsafe { interface.write(result) };
@@ -206,6 +230,34 @@ impl Unknown {
     #[must_use]
     pub fn as_ptr(&self) -> *mut IUnknown {
         self.0.as_ptr()
+    }
+
+    /// Gives up ownership: the reference now belongs to whoever receives the pointer.
+    #[must_use]
+    pub fn into_raw(self) -> *mut IUnknown {
+        let raw = self.0.as_ptr();
+        core::mem::forget(self);
+        raw
+    }
+
+    /// `QueryInterface`: a new reference to the interface `iid` of the same object, or `None`
+    /// when the object does not implement it.
+    #[must_use]
+    pub fn query(&self, iid: &GUID) -> Option<Self> {
+        let this = self.0.as_ptr();
+        // SAFETY: `this` is a valid interface pointer (`from_raw`'s contract).
+        let vtable = unsafe { (*this).lpVtbl };
+        // SAFETY: an interface's vtable is valid for the interface's lifetime.
+        let query_interface = unsafe { (*vtable).QueryInterface }?;
+        let mut interface: PVOID = ptr::null_mut();
+        // SAFETY: valid interface, IID and out-parameter.
+        let status = unsafe { query_interface(this, iid, &raw mut interface) };
+        if status != STATUS_SUCCESS {
+            return None;
+        }
+        // SAFETY: a successful `QueryInterface` returns a new reference to an interface whose
+        // vtable starts with `IUnknown`'s methods.
+        unsafe { Self::from_raw(interface.cast()) }
     }
 }
 

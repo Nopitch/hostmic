@@ -5,13 +5,15 @@
 //! `simpleaudiosample` (Copyright (c) Microsoft Corporation, MS-PL); PLAN.md lists where it
 //! deliberately departs from it.
 //!
-//! Milestone M3, first step: the adapter and its topology filter. The wave filter, which
-//! completes the endpoint, comes next.
+//! Milestone M3: the endpoint "Microphone (hostmic)", whose capture stream the driver fills
+//! itself with a 1 kHz test tone; M4 hands the buffer and the clock to a user-mode host.
 //!
 //! - [`com`]: COM-style objects and interface references.
 //! - [`ks`]: Kernel Streaming descriptor and property helpers.
 //! - [`adapter`]: the PnP device and its subdevices.
 //! - [`topology`]: the topology miniport.
+//! - [`wave`]: the WaveRT miniport.
+//! - [`stream`]: the capture stream and its timer.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -22,7 +24,9 @@ extern crate wdk_panic;
 pub mod adapter;
 pub mod com;
 pub mod ks;
+pub mod stream;
 pub mod topology;
+pub mod wave;
 
 use core::{
     ffi::c_void,
