@@ -17,7 +17,9 @@ concurrency:
 
 jobs:
   # Public repository: GitHub-hosted runners only, never self-hosted.
-  build:
+  # A required check of the `Protect main` ruleset: named after what it checks, so that another
+  # workflow's `build` job can never satisfy it.
+  driver:
     runs-on: windows-2025
     timeout-minutes: 45
     env:
