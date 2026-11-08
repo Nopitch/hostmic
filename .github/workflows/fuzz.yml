@@ -1,0 +1,67 @@
+name: fuzz
+
+# Fuzzes the driver's validation of untrusted input (hostmic-driver-core, hostmic-abi) with
+# cargo-fuzz and libFuzzer: a short run of every target on each pull request and push, a
+# longer one every week. The code under test is pure Rust without kernel calls, so a Linux
+# runner fuzzes it like the Windows driver will run it.
+on:
+  # No `paths-ignore`: `fuzz` is a required check of the `Protect main` ruleset.
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 3 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Public repository: GitHub-hosted runners only, never self-hosted.
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # cargo-fuzz needs nightly for the sanitizer flags. A dated nightly, bumped on purpose
+      # like the repository's stable toolchain, so that a new nightly never breaks the check.
+      RUST_NIGHTLY: nightly-2026-10-26
+      CARGO_FUZZ_VERSION: "0.13.2"
+      # Seconds per target: 60 on pull requests and pushes, 10 minutes on the schedule.
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the token out of .git/config (zizmor's artipacked rule).
+          persist-credentials: false
+
+      # The fuzz crate is a workspace of its own, outside the root workspace's checks: format
+      # and lint it here, with the repository's pinned stable toolchain (rust-toolchain.toml).
+      - name: Check formatting and lint the fuzz targets
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          cargo fmt --manifest-path fuzz/Cargo.toml --check
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Install the pinned nightly toolchain and cargo-fuzz
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal
+          cargo +"$RUST_NIGHTLY" install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+
+      # cargo-fuzz builds with debug assertions and overflow checks, under AddressSanitizer.
+      # cargo-fuzz has no --locked: the lint step above already fails if fuzz/Cargo.lock is stale.
+      # A failing input is printed in the log (libFuzzer's base64 line) to reproduce locally.
+      - name: Fuzz every target
+        run: |
+          set -euo pipefail
+          for target in $(cargo +"$RUST_NIGHTLY" fuzz list); do
+            echo "::group::$target ($FUZZ_SECONDS s)"
+            cargo +"$RUST_NIGHTLY" fuzz run "$target" -- -max_total_time="$FUZZ_SECONDS"
+            echo "::endgroup::"
+          done

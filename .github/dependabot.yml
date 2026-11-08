@@ -19,3 +19,9 @@ updates:
         patterns:
           - "wdk"
           - "wdk-*"
+
+  # The fuzz targets are a Cargo workspace of their own.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"

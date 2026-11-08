@@ -25,13 +25,14 @@ Lints: `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings`
 ## Git and CI
 
 - Branches and pull requests; the maintainer merges them himself (`Protect main` ruleset:
-  required checks `zizmor`, `secrets`, `driver`, `dependencies` and `dco`, high or critical
-  CodeQL alerts blocking, squash only, code-owner review, admin bypass through a pull request).
+  required checks `zizmor`, `secrets`, `driver`, `fuzz`, `dependencies` and `dco`, high or
+  critical CodeQL alerts blocking, squash only, code-owner review, admin bypass through a pull
+  request).
   Never stack pull requests.
 - Every commit is signed off (`git commit -s`, Developer Certificate of Origin): the `dco` check
   rejects unsigned commits.
-- Merge command for the maintainer (PowerShell), waiting for the head and the 5 required checks:
-  `$h = gh pr view <n> --repo Nopitch/hostmic --json headRefOid -q .headRefOid; while ([int](gh pr checks <n> --repo Nopitch/hostmic --required --json name --jq length 2>$null) -lt 5) { Start-Sleep 10 }; gh pr checks <n> --repo Nopitch/hostmic --required --watch --fail-fast; if ($LASTEXITCODE -eq 0) { gh pr merge <n> --repo Nopitch/hostmic --squash --delete-branch --admin --match-head-commit $h }`
+- Merge command for the maintainer (PowerShell), waiting for the head and the 6 required checks:
+  `$h = gh pr view <n> --repo Nopitch/hostmic --json headRefOid -q .headRefOid; while ([int](gh pr checks <n> --repo Nopitch/hostmic --required --json name --jq length 2>$null) -lt 6) { Start-Sleep 10 }; gh pr checks <n> --repo Nopitch/hostmic --required --watch --fail-fast; if ($LASTEXITCODE -eq 0) { gh pr merge <n> --repo Nopitch/hostmic --squash --delete-branch --admin --match-head-commit $h }`
 - Public repository: GitHub-hosted runners only, never self-hosted. Actions pinned by full
   commit SHA (enforced by the repository settings).
 - `Protect tags`: `v*` tags can be neither moved nor deleted.
