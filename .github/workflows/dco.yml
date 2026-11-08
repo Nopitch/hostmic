@@ -1,0 +1,45 @@
+name: dco
+
+# Developer Certificate of Origin: every commit of a pull request carries a
+# `Signed-off-by:` trailer (`git commit -s`), by which its author certifies the right to
+# submit it under the project's licenses (CONTRIBUTING.md, OSPS-LE-01.01).
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # A required check of the `Protect main` ruleset. Public repository: GitHub-hosted runners
+  # only.
+  dco:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history, so that every commit between the base and the head is present.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check that every commit is signed off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for commit in $(git rev-list --no-merges "${BASE}..${HEAD}"); do
+            if git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "${commit}" \
+              | grep -q '<.*@.*>'; then
+              echo "signed off: ${commit}"
+            else
+              echo "::error::Commit ${commit} has no Signed-off-by trailer: sign it off with 'git commit -s' (see CONTRIBUTING.md)."
+              missing=1
+            fi
+          done
+          exit "${missing}"

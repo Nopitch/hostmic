@@ -58,6 +58,12 @@ By contributing, you agree that your contribution is licensed under the license 
 belongs to: the Microsoft Public License (MS-PL) for the driver, MIT OR Apache-2.0 for the host
 library (see [README.md](README.md#licensing)).
 
+**Every commit is signed off** under the [Developer Certificate of Origin 1.1](https://developercertificate.org/):
+the `Signed-off-by: Your Name <your@email>` line certifies that you wrote the change or have
+the right to submit it under the project's licenses. Add it with `git commit -s` (or
+`git commit --amend -s`, `git rebase --signoff main` for existing commits). The required `dco`
+check rejects a pull request with an unsigned commit.
+
 ## Code of conduct
 
 This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
