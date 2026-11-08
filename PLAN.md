@@ -52,13 +52,16 @@ Windows audio engine period.
   Every `unsafe` block carries a `// SAFETY:` comment stating the invariant.
 - **Static descriptors:** filter, pin, node and property tables (`PCFILTER_DESCRIPTOR` and
   friends) are `static` Rust data, built once, never mutated.
-- **Host interface:** a device interface (its own GUID) opened with `CreateFile`; `DeviceIoControl`
-  requests to attach as host, set the format range, receive a notification event, map the client
-  buffer, advance the position. The client buffer is described by an MDL and mapped into the
-  host process only.
+- **Host interface:** a device interface with its own GUID, found with
+  `CM_Get_Device_Interface_List` and opened with `CreateFile`, registered on a raw child PDO
+  that the adapter enumerates (M4 design below); `DeviceIoControl` requests to attach as host
+  with a format range and a notification event, read the stream state, advance the position,
+  read counters, detach. The ring buffer the audio engine reads is mapped into the host process
+  only, for as long as the host stays attached.
 - **No host, no microphone:** without a host, the pin reports its jack as disconnected
   (`KSPROPERTY_JACK_DESCRIPTION`), so Windows shows it unplugged instead of a silent device.
-- **One host at a time.** The handle's cleanup unmaps the buffer and marks the pin unplugged if the
+- **One host at a time.** Other processes of the same users may open the interface to read its
+  state and counters. The handle's cleanup unmaps the buffer and marks the pin unplugged if the
   host dies.
 
 ### Host library (user mode, Rust, MIT OR Apache-2.0)
@@ -67,7 +70,12 @@ Windows audio engine period.
   stereo first), get a safe view of the ring buffer, advance the position.
 - A reference host loop, clocked by QPC like Thin Audio Gateway's, registered with MMCSS
   ("Pro Audio"). Later: let the caller drive the clock (Résonnance wants to follow its physical
-  microphone, to remove clock drift).
+  microphone, to remove clock drift), with a clock correction ratio the caller can read and
+  adjust at run time, as Virtual Audio Cable offers.
+- A C header next to the Rust API: professional hosts are often C++ applications.
+- Tools in the style of Virtual Audio Cable's control panel: plain text, every setting and
+  counter visible with its unit (formats, stream state, overflows, underflows, rejected
+  requests), factual messages; no decoration.
 - Real-time rule in the host's audio path: no allocation, no lock, no I/O.
 
 ### Security
@@ -75,9 +83,13 @@ Windows audio engine period.
 A driver that maps memory into a user process is a classic source of vulnerabilities. Rules:
 
 - Validate every IOCTL input size and value; reject everything unexpected.
-- The host interface (its device object or interface) is restricted to administrators and the
-  interactive user. The Kernel Streaming filters keep the usual audio-device access (the INF's
-  SDDL, as in Microsoft's sample): the audio service and applications must open them.
+- The host interface is restricted to the system, administrators and interactive users. The
+  Kernel Streaming filters keep the usual audio-device access (the INF's SDDL, as in
+  Microsoft's sample): the audio service and applications must open them. Every device object
+  of a PnP stack shares one security descriptor, so the host interface lives on a device object
+  of its own: a raw child PDO created with `IoCreateDeviceSecure`, whose descriptor
+  administrators can override in the registry through its class GUID (for a host running as a
+  service, for example).
 - Map only the client buffer, only into the attached host, with user-mode probing inside
   structured exception handling; unmap on cleanup.
 - Compatible with Memory Integrity (HVCI): non-executable pool, no RWX mappings.
@@ -189,6 +201,78 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   host; the tone generator goes away. IOCTL input validation is pure Rust, without kernel
   calls, so that it can be unit-tested and **fuzzed** on the host with `cargo-fuzz`; a short
   fuzzing run in CI on each pull request (also OpenSSF Scorecard's Fuzzing check).
+  *Design (2026-11-08):*
+  - **The host interface is a device interface on a raw child PDO.** Microsoft recommends
+    device interfaces over named device objects for PnP drivers ("Named Device Objects"), and
+    OSR recommends against naming the FDO. But a device interface opens through its stack's
+    PDO, and every device object of the stack shares the INF's descriptor, which must let the
+    audio service in. The adapter therefore acts as a bus driver for one child: a raw PDO (no
+    function driver, as in the `kbfiltr` sample's sideband device) created with
+    `IoCreateDeviceSecure`, SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)` (system,
+    administrators, interactive users; `IU` is part of the device-object SDDL subset) and a
+    class GUID of its own for registry overrides. It registers the interface
+    `GUID_DEVINTERFACE_HOSTMIC_HOST`, so hosts find it by GUID, get arrival and removal
+    notifications (`CM_Register_Notification`), and several instances stay possible later. A
+    fixed-name control device was set aside: no notifications, one instance only, the legacy
+    pattern. Still WDM: `wdmsec.lib` provides `IoCreateDeviceSecure`, no KMDF needed.
+  - **Dispatch:** PortCls owns the driver object's dispatch table; the driver puts a switch in
+    front of it that sends the child PDO's requests to its own handlers (create, cleanup, close,
+    device control, PnP and power for a PDO) and everything else to `PcDispatchIrp`. The switch
+    compares device object pointers, never file names.
+  - **Requests** (`hostmic-abi`, MIT OR Apache-2.0 so that the host crate can use it; all
+    `METHOD_BUFFERED`, so the input is copied once by the I/O manager and never probed or read
+    twice; exact sizes, zero reserved fields, an ABI version): `GET_INFO` (version,
+    capabilities, supported formats), `ATTACH` (the host's format range and notification event;
+    returns the buffer's address in the host), `GET_STREAM` (generation, state, format, buffer
+    and packet size, position; the host reads it when its event is signaled), `ADVANCE`
+    (generation, expected position, frames written), `DETACH`, and with the position work
+    `GET_STATS` (counters). Any process the descriptor lets in may open the interface and read;
+    only the attached host's process may advance. Hosts are 64-bit processes: for a 32-bit
+    one the buffer could be mapped out of reach. The validation of every request is pure Rust
+    in `hostmic-driver-core`, unit-tested and fuzzed.
+  - **One buffer for the whole attachment.** WaveRT allocates a buffer per stream and frees it
+    when the stream closes; mapping that buffer into the host would mean taking it away while
+    the host writes. Instead the driver owns one buffer (1 s at most of the largest format),
+    reference-counted by the host and the stream, mapped once into the host on `ATTACH`;
+    `AllocateAudioBuffer` returns an MDL over it. The audio engine requires the actual size to
+    be at least the requested one, so a larger request fails. To check in the VM: that the
+    engine accepts an MDL the miniport built itself (the documentation describes the port's
+    allocators). The driver no longer writes audio: it zeroes the buffer and nothing else.
+  - **Mapping into the host:** `MmMapLockedPagesSpecifyCache` in user mode raises an exception
+    on failure and Rust cannot catch structured exceptions, so a C function of a few lines,
+    compiled with `cc`, wraps it in `__try`/`__except`; user mappings are never executable. The
+    mapping is undone in the host's context, on detach or on the handle's cleanup, and a process
+    notification routine covers a host that dies while another process holds a duplicate of its
+    handle (to confirm in the documentation before writing it).
+  - **The host advances the position, without a lock:** the stream's generation and position
+    share one 64-bit word (an even generation accepts frames, an odd one does not; writers
+    halt the generation before changing anything else), and `ADVANCE` moves it with one
+    compare-and-exchange, so a request computed for an earlier stream or racing another one
+    cannot win;
+    `GetPosition` and `GetReadPacket` only read. `ADVANCE` signals the engine's event when a
+    packet completes; rundown protection (`EX_RUNDOWN_REF`, a non-blocking atomic count) keeps
+    the event and the stream alive while it runs, instead of the timer's `KeFlushQueuedDpcs`.
+    The timer and the tone leave the driver; the tone moves to a test host.
+  - **Unplugged without a host:** the topology keeps its port's `IPortEvents`, reports
+    `IsConnected` from the host's presence with `JACKDESC2_PRESENCE_DETECT_CAPABILITY`, and
+    generates `KSEVENT_PINCAPS_JACKINFOCHANGE` on attach, detach and host death.
+  - **Formats:** the ABI carries format ranges (rates, channels, sample types) from the start;
+    M4 accepts 48 kHz, 16-bit, stereo only.
+  - **Counters and tools:** `GET_STATS` reports frames advanced, packets signaled, underflows,
+    overflows and rejected requests with the last reason, all atomic counters;
+    `tools/hostmic-ctl status` prints them, and the driver's rejection messages state the
+    operation, received and required sizes and the process, as Virtual Audio Cable's log does.
+  - **Fuzzing:** `fuzz/` (cargo-fuzz) with a target per request decoder and a target that
+    replays sequences of attach, stream, advance and detach against the pure model; a CI job on
+    a GitHub-hosted Linux runner with a pinned nightly (cargo-fuzz needs one; the repository's
+    toolchain stays stable), 60 s per target on each pull request, required as `fuzz`.
+  Pull requests, one at a time: the ABI and its validation; fuzzing; the child PDO and its
+  interface; attach, detach and the stream state with `tools/test-host`; the jack following
+  the host; the shared buffer and its mapping; the host-advanced position with the counters
+  and `tools/hostmic-ctl`; the closing notes. Done when `tools/test-host` plays a tone that
+  `tools/capture-check` records cleanly from "Microphone (hostmic)", the microphone shows
+  unplugged without a host, killing the host mid-capture leaves the system up, and fuzzing runs
+  in CI.
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
@@ -235,7 +319,15 @@ SECURITY.md.
 
 ## Open questions
 
-- Endpoint naming: the device name is fixed in the INF; the endpoint name per line.
+- Endpoint naming: the device name is fixed in the INF; the endpoint name per line. Thin Audio
+  Gateway names its endpoints at the customer's choice; a name chosen by the host would suit
+  hostmic's users.
+- Formats beyond 48 kHz, 16-bit, stereo: other rates (44.1 to 192 kHz), 24-bit and 32-bit
+  float, more channels, as professional virtual cables offer.
+- The `PROPOSEDATAFORMAT` probe: Virtual Audio Cable's log shows the endpoint builder
+  (`svchost`) sending the same bare 64-byte `KSDATAFORMAT` and Virtual Audio Cable refusing it
+  as too small (0x52 bytes required), while refusing it cost hostmic its endpoint in M3. The
+  status returned may be what matters; to investigate, not needed for M4.
 - Windows 10 support: keep it if it costs nothing (WaveRT is fine there; ACX would not be).
 - ARM64: later.
 - Signing programme: whether OSSign reopens applications, accepts the project and how long it
