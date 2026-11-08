@@ -8,8 +8,8 @@
 use core::{ffi::c_void, ptr};
 
 use hostmic_sys::{
-    IPort, PPORT, PRESOURCELIST, PcAddAdapterDevice, PcDispatchIrp, PcNewPort, PcRegisterSubdevice,
-    guid,
+    IPort, PPORT, PRESOURCELIST, PcAddAdapterDevice, PcDispatchIrp, PcNewPort,
+    PcRegisterPhysicalConnection, PcRegisterSubdevice, guid,
 };
 use wdk::println;
 use wdk_sys::{
@@ -20,7 +20,7 @@ use wdk_sys::{
 
 use crate::com::Unknown;
 use crate::ks::size_ulong;
-use crate::topology;
+use crate::{topology, wave};
 
 /// Bytes at the start of the device extension that belong to PortCls: `portcls.h`'s
 /// `PORT_CLASS_DEVICE_EXTENSION_SIZE`, `64 * sizeof(ULONG_PTR)`.
@@ -30,12 +30,14 @@ const PORT_CLASS_DEVICE_EXTENSION_SIZE: usize = 64 * size_of::<usize>();
 const DEVICE_EXTENSION_SIZE: ULONG =
     size_ulong::<[u8; PORT_CLASS_DEVICE_EXTENSION_SIZE]>() + size_ulong::<Adapter>();
 
-/// Subdevices of the adapter: the topology filter now, the wave filter later.
+/// Subdevices of the adapter: the topology filter and the wave filter.
 const MAX_SUBDEVICES: ULONG = 2;
 
 /// Reference string of the topology filter's device interfaces. The INF's `AddInterface`
 /// lines use the same name.
 static TOPOLOGY_NAME: [u16; 12] = wide("TopologyMic");
+/// Reference string of the wave filter's device interfaces, likewise.
+static WAVE_NAME: [u16; 8] = wide("WaveMic");
 
 /// The adapter's state, in the device extension after PortCls's part.
 ///
@@ -43,8 +45,9 @@ static TOPOLOGY_NAME: [u16; 12] = wide("TopologyMic");
 /// serializes for a device.
 #[repr(C)]
 struct Adapter {
-    /// The topology port, once registered; dropping it releases the driver's reference.
+    /// The ports of the registered filters; dropping them releases the driver's references.
     topology_port: Option<Unknown>,
+    wave_port: Option<Unknown>,
 }
 
 /// The adapter of a device created by [`add_device`].
@@ -95,33 +98,75 @@ unsafe extern "C" fn start_device(
     irp: PIRP,
     resources: PRESOURCELIST,
 ) -> NTSTATUS {
-    let status = match topology::new() {
-        // SAFETY: `device`, `irp` and `resources` come from PortCls for this start request.
-        Some(miniport) => match unsafe {
-            install_subdevice(
-                device,
-                irp,
-                resources,
-                &TOPOLOGY_NAME,
-                &guid::CLSID_PortTopology,
-                &miniport,
-            )
-        } {
-            Ok(port) => {
-                // SAFETY: `device` is the adapter's FDO, in a PnP request.
-                unsafe { adapter(device) }.topology_port = Some(port);
-                STATUS_SUCCESS
-            }
-            Err(status) => status,
-        },
-        None => STATUS_INSUFFICIENT_RESOURCES,
+    // SAFETY: `device`, `irp` and `resources` come from PortCls for this start request.
+    let status = match unsafe { install_filters(device, irp, resources) } {
+        Ok((topology_port, wave_port)) => {
+            // SAFETY: `device` is the adapter's FDO, in a PnP request.
+            let adapter = unsafe { adapter(device) };
+            adapter.topology_port = Some(topology_port);
+            adapter.wave_port = Some(wave_port);
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
     };
     println!("hostmic: StartDevice returned {status:#010x}");
     status
 }
 
+/// Installs the topology filter and the wave filter, then connects the topology's bridge pin
+/// to the wave's (Microsoft's `InstallEndpointFilters` and `ConnectTopologies`). Returns both
+/// ports' `IUnknown`.
+///
+/// # Safety
+///
+/// `device`, `irp` and `resources` come from PortCls for a start request of the adapter.
+unsafe fn install_filters(
+    device: PDEVICE_OBJECT,
+    irp: PIRP,
+    resources: PRESOURCELIST,
+) -> Result<(Unknown, Unknown), NTSTATUS> {
+    let topology_miniport = topology::new().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    // SAFETY: the caller's contract.
+    let topology_port = unsafe {
+        install_subdevice(
+            device,
+            irp,
+            resources,
+            &TOPOLOGY_NAME,
+            &guid::CLSID_PortTopology,
+            &topology_miniport,
+        )
+    }?;
+    let wave_miniport = wave::new().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    // SAFETY: the caller's contract.
+    let wave_port = unsafe {
+        install_subdevice(
+            device,
+            irp,
+            resources,
+            &WAVE_NAME,
+            &guid::CLSID_PortWaveRT,
+            &wave_miniport,
+        )
+    }?;
+    // SAFETY: `device` is the adapter's FDO; both ports are registered subdevices of it.
+    let status = unsafe {
+        PcRegisterPhysicalConnection(
+            device,
+            topology_port.as_ptr(),
+            topology::PIN_BRIDGE,
+            wave_port.as_ptr(),
+            wave::PIN_BRIDGE,
+        )
+    };
+    if !NT_SUCCESS(status) {
+        return Err(status);
+    }
+    Ok((topology_port, wave_port))
+}
+
 /// Creates a port of class `port_class`, binds `miniport` to it and registers the pair as a
-/// subdevice named `name`. Returns the port, which holds its own reference to the miniport.
+/// subdevice named `name`. Returns the port's `IUnknown`; the port holds its own reference to the miniport.
 ///
 /// Microsoft's `CAdapterCommon::InstallSubdevice`, without the interface properties.
 ///
@@ -168,7 +213,9 @@ unsafe fn install_subdevice(
     if !NT_SUCCESS(status) {
         return Err(status);
     }
-    Ok(port)
+    // The port's canonical `IUnknown`, which `PcRegisterPhysicalConnection` expects (the
+    // sample keeps the same).
+    port.query(&guid::IID_IUnknown).ok_or(STATUS_UNSUCCESSFUL)
 }
 
 /// `IPort::Init`.
@@ -221,7 +268,9 @@ pub unsafe extern "C" fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP)
         // SAFETY: `device` is the adapter's FDO (this driver creates no other device), in a
         // PnP request.
         let adapter = unsafe { adapter(device) };
-        if adapter.topology_port.take().is_some() {
+        let topology = adapter.topology_port.take();
+        let wave = adapter.wave_port.take();
+        if topology.is_some() || wave.is_some() {
             println!("hostmic: device stopping (minor function {minor:#04x}), ports released");
         }
     }

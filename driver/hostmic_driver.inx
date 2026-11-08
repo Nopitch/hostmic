@@ -50,8 +50,18 @@ HKR,Drivers\mixer\wdmaud.drv,Description,,%DeviceDesc%
 ; The reference strings match the names the driver passes to PcRegisterSubdevice.
 
 [Hostmic.NT.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_WaveMic%,Hostmic.I.WaveMic
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_WaveMic%,Hostmic.I.WaveMic
+AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_WaveMic%,Hostmic.I.WaveMic
 AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_TopologyMic%,Hostmic.I.TopologyMic
 AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_TopologyMic%,Hostmic.I.TopologyMic
+
+[Hostmic.I.WaveMic]
+AddReg=Hostmic.I.WaveMic.AddReg
+
+[Hostmic.I.WaveMic.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%WaveMic.FriendlyName%
 
 [Hostmic.I.TopologyMic]
 AddReg=Hostmic.I.TopologyMic.AddReg
@@ -92,9 +102,12 @@ HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 [Strings]
 ; Non-localizable
 SPSVCINST_ASSOCSERVICE = 0x00000002
+KSNAME_WaveMic         = "WaveMic"
 KSNAME_TopologyMic     = "TopologyMic"
 Proxy.CLSID            = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
 KSCATEGORY_AUDIO       = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_CAPTURE     = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME    = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
 KSCATEGORY_TOPOLOGY    = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
 KSNODETYPE_ANY         = "{00000000-0000-0000-0000-000000000000}"
 PKEY_AudioEndpoint_Association               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
@@ -106,4 +119,5 @@ StdMfg                 = "hostmic project"
 DiskId1                = "hostmic Installation Disk"
 DeviceDesc             = "hostmic"
 ServiceDesc            = "hostmic virtual microphone driver"
+WaveMic.FriendlyName     = "hostmic wave"
 TopologyMic.FriendlyName = "hostmic topology"

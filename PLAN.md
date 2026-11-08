@@ -174,6 +174,15 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   `Cargo.toml` it finds above `OUT_DIR`, so a `CARGO_TARGET_DIR` outside the workspace (or
   shared with another checkout) silently builds with another configuration: the first WDM
   build still linked KMDF's `WdfDriverEntry`. Keep each checkout's `target/` inside it.
+  *Done (2026-11-08):* the WaveRT miniport, its stream and the tone. In the VM, "Microphone
+  (hostmic)" is active and `capture-check` (shared-mode, event-driven WASAPI) records 60 s at
+  1000.00 Hz, -6.02 dBFS, identical channels, 6000 packets of 10 ms, no discontinuity and no
+  glitch; three stop/start cycles pass; `devcon remove` unloads the driver. Lesson: the audio
+  endpoint builder probes the capture pin with bare `KSDATAFORMAT`s (64 bytes, no
+  `WAVEFORMATEX`), one per subtype (PCM, then compressed pass-through); rejecting the PCM probe
+  leaves the endpoint "not present" (`DeviceState` 4) without any error message, so
+  `PROPOSEDATAFORMAT` accepts a bare PCM probe (`format::is_proposal_supported`). Not done in
+  M3: Driver Verifier (M6).
 - **M4, the host interface:** IOCTLs, buffer mapping, host-advanced position, unplugged without a
   host; the tone generator goes away. IOCTL input validation is pure Rust, without kernel
   calls, so that it can be unit-tested and **fuzzed** on the host with `cargo-fuzz`; a short
