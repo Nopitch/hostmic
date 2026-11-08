@@ -24,8 +24,19 @@ first, since it is the source of truth for what is being built and in which orde
 
 ## Build and test
 
-On Windows, with the Windows Driver Kit and LLVM (`libclang`, found through `LIBCLANG_PATH`);
-the Rust version is pinned in `rust-toolchain.toml`:
+Requirements (Windows 10 or 11, x64), the same as the `driver` CI job:
+
+- Rust through [rustup](https://rustup.rs/); the toolchain version is pinned in
+  `rust-toolchain.toml` and installed automatically, with rustfmt and clippy.
+- The MSVC build tools and the Windows SDK: Visual Studio (Community is enough) or Build Tools
+  with the "Desktop development with C++" workload.
+- The Windows Driver Kit 10.0.26100 (CI installs it from NuGet, `Microsoft.Windows.WDK.x64`
+  10.0.26100.6584).
+- LLVM for bindgen: `libclang.dll`, found through `LIBCLANG_PATH` (for example
+  `C:\Program Files\LLVM\bin`).
+- `cargo install cargo-wdk --version 0.2.0 --locked`.
+
+Rust dependencies are crates from crates.io, pinned in `Cargo.lock` and fetched by Cargo.
 
 - Build and package the driver: `cargo wdk build` (cargo-wdk 0.2.0). The test-signed package
   lands in `target/debug/hostmic_driver_package/`. Keep `target/` inside the checkout:
