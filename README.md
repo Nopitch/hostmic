@@ -21,9 +21,12 @@ host application ──writes into the shared ring buffer──▶ [hostmic micr
 
 ## Status
 
-**Experimental — nothing works yet.** See [PLAN.md](PLAN.md) for the roadmap. Until the driver is
-signed through Microsoft attestation, it can only be loaded with test signing enabled, which
-requires Secure Boot to be disabled: use a virtual machine, never your everyday machine.
+**Experimental, not usable yet.** The driver already exposes a working capture endpoint,
+"Microphone (hostmic)", which plays a built-in 1 kHz test tone (milestone M3, verified in a test
+VM); feeding it from a host application is the next milestone. See [PLAN.md](PLAN.md) for the
+roadmap. There is no release. Until the driver is signed through Microsoft attestation, it can
+only be loaded with test signing enabled, which requires Secure Boot to be disabled: use a
+virtual machine, never your everyday machine ([docs/test-vm.md](docs/test-vm.md)).
 
 ## Why Rust
 
