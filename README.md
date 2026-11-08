@@ -30,6 +30,22 @@ roadmap. There is no release. Until the driver is signed through Microsoft attes
 only be loaded with test signing enabled, which requires Secure Boot to be disabled: use a
 virtual machine, never your everyday machine ([docs/test-vm.md](docs/test-vm.md)).
 
+## How hostmic is built
+
+**Directed by a human, written with AI.** The maintainer sets the goals, makes the design
+decisions (recorded in [PLAN.md](PLAN.md)), tests the driver and decides what is merged; most of
+the code and documentation is written with Claude, Anthropic's AI assistant, and every such
+commit says so (`Co-Authored-By`). Nothing reaches `main` without:
+
+- the maintainer's review of the pull request;
+- the required checks: formatting, clippy with strict lints, unit tests, the driver build,
+  CodeQL, secret scanning, dependency review, workflow audit and a signed-off commit (DCO);
+- for driver changes, a test in a virtual machine with measured results
+  ([docs/test-vm.md](docs/test-vm.md)).
+
+Why the design can be trusted, and where it cannot yet, is argued in
+[docs/security-assurance.md](docs/security-assurance.md).
+
 ## Why Rust
 
 [windows-drivers-rs](https://github.com/microsoft/windows-drivers-rs) makes kernel drivers in
