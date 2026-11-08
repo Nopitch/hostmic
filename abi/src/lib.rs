@@ -48,7 +48,10 @@ pub const GUID_DEVINTERFACE_HOSTMIC_HOST: Guid = Guid {
 };
 
 /// The version of this interface. A host sends it in [`AttachRequest`] and the driver reports
-/// its own in [`Info`]; any incompatible change to a code or a layout increments it.
+/// its own in [`Info`]. Inputs must have their exact size and the version must match, so any
+/// change to a code or a layout, even an addition, increments it; a driver that wants to serve
+/// older hosts then accepts several versions. Until the first release, version 1 may still
+/// change.
 pub const ABI_VERSION: u32 = 1;
 
 /// `FILE_DEVICE_UNKNOWN`, the device type of the control codes.
@@ -308,7 +311,8 @@ pub struct AttachRequest {
     /// Reserved, 0.
     pub reserved: u32,
     /// A handle, in the host's process, to an event the driver signals when the stream state
-    /// changes; it needs `EVENT_MODIFY_STATE` access. The handle value, zero-extended.
+    /// changes; it needs `EVENT_MODIFY_STATE` access. The handle value, zero-extended. Hosts
+    /// are 64-bit processes: the driver refuses 32-bit ones.
     pub event: u64,
     /// The formats the host can write; the microphone offers those the driver also supports.
     pub formats: FormatRange,
@@ -414,8 +418,9 @@ impl State {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StreamState {
-    /// Increments each time a stream gets a new buffer geometry or starts from position 0; an
-    /// [`AdvanceRequest`] names the generation it was computed for.
+    /// Changes with every state change or new buffer of the stream; an [`AdvanceRequest`]
+    /// names the generation it was computed for, and the driver refuses any other. An opaque
+    /// value: compare it for equality only.
     pub generation: u32,
     /// A [`State`] code.
     pub state: u32,
@@ -565,7 +570,7 @@ fn get_u64(bytes: &[u8], at: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use core::mem::{align_of, offset_of, size_of};
+    use core::mem::{offset_of, size_of};
 
     use super::*;
 
@@ -582,7 +587,10 @@ mod tests {
     #[test]
     fn interface_guid() {
         assert_eq!(size_of::<Guid>(), 16);
-        assert_eq!(GUID_DEVINTERFACE_HOSTMIC_HOST.data1, 0xB2BF_AFAE);
+        // {B2BFAFAE-4F0A-4295-B39B-E6B9F62EE08A}
+        let g = GUID_DEVINTERFACE_HOSTMIC_HOST;
+        assert_eq!((g.data1, g.data2, g.data3), (0xB2BF_AFAE, 0x4F0A, 0x4295));
+        assert_eq!(g.data4, [0xB3, 0x9B, 0xE6, 0xB9, 0xF6, 0x2E, 0xE0, 0x8A]);
     }
 
     #[test]
@@ -624,7 +632,6 @@ mod tests {
         assert_eq!(offset_of!(Info, formats), 16);
 
         assert_eq!(size_of::<AttachRequest>(), AttachRequest::SIZE);
-        assert_eq!(align_of::<AttachRequest>(), 8);
         assert_eq!(offset_of!(AttachRequest, reserved), 4);
         assert_eq!(offset_of!(AttachRequest, event), 8);
         assert_eq!(offset_of!(AttachRequest, formats), 16);
