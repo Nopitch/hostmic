@@ -2,7 +2,8 @@
 //!
 //! The parts of the hostmic driver that are plain arithmetic on plain data: the stream format,
 //! the test tone, the conversion from the performance counter to audio frames, the writes into
-//! the capture ring buffer and the packet numbering of event-driven streams.
+//! the capture ring buffer, the packet numbering of event-driven streams, and, for the host
+//! interface, the validation of every request and the geometry of the shared buffer.
 //!
 //! None of it calls the kernel, so it builds and is unit-tested on the build machine
 //! (`cargo test`), which the driver crate itself cannot be. Everything here is meant for the
@@ -11,8 +12,10 @@
 
 #![no_std]
 
+pub mod buffer;
 pub mod clock;
 pub mod format;
+pub mod host;
 pub mod packet;
 pub mod ring;
 pub mod tone;
