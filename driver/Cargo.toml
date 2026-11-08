@@ -1,7 +1,7 @@
 [package]
 name = "hostmic-driver"
 version = "0.1.0"
-description = "hostmic kernel driver (milestone M1: a minimal KMDF driver proving the toolchain)"
+description = "hostmic kernel driver: a PortCls audio adapter exposing one capture endpoint"
 license = "MS-PL"
 edition.workspace = true
 publish.workspace = true
@@ -12,11 +12,12 @@ repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
-# No host unit tests: a test binary links the KMDF stub, which needs the kernel's `DriverEntry`
-# and fails to link. The driver is tested by loading it in the test VM.
+# No host unit tests: everything here calls the kernel or PortCls. The driver is tested by
+# loading it in the test VM; logic that needs no kernel call belongs in a crate of its own.
 test = false
 
 [dependencies]
+hostmic-sys = { path = "../hostmic-sys" }
 wdk.workspace = true
 wdk-alloc.workspace = true
 wdk-panic.workspace = true
