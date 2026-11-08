@@ -311,8 +311,12 @@ checks:
   (OSPS-QA-07.01), which needs a second maintainer.
 - **Metal:** passing at 99%, missing only release notes (no release yet); silver at 91%,
   missing passing, access continuity and bus factor (single maintainer), 80% statement
-  coverage, fuzzing (M4; in CI since 2026-11-09, to report on the badge), reproducible builds,
-  signed tags and hardening (M6).
+  coverage, dynamic analysis of the unsafe code (`dynamic_analysis_unsafe`: Driver Verifier,
+  M6), reproducible builds, signed tags and hardening (M6).
+- **Update 2026-11-09:** with fuzzing in CI (M4), passing's `dynamic_analysis` is Met.
+  `dynamic_analysis_unsafe` stays Unmet, with an updated justification: fuzzing covers the
+  safe validation code, not the kernel's unsafe code. The percentages do not change: both
+  criteria are suggested ones.
 
 **The first release must not be a hand-made one.** Several criteria answered "not applicable"
 because no release exists become requirements with it; in particular, OSPS-BR-06.01 (baseline-2)
