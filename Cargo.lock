@@ -273,6 +273,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostmic-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "wdk-build",
+ "wdk-sys",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

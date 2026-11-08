@@ -39,6 +39,8 @@ starting from Microsoft's
   [Microsoft Public License](LICENSE-MS-PL) (MS-PL), like the samples it derives from.
 - The **user-mode host library** is original code, licensed under either the
   [MIT license](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option.
+- **`hostmic-sys`**, the bindings to the WDK's audio headers, is generated from those headers
+  like `wdk-sys` and shares its license: MIT or Apache-2.0, at your option.
 
 Each crate states its license in its `Cargo.toml`.
 
