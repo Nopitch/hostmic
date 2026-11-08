@@ -2,8 +2,10 @@
 
 An open-source Windows **virtual microphone driver fed by a user-mode host**, written in Rust.
 
-Applications such as voice changers need to hand their processed audio to Discord, Teams or any
-other program as a regular microphone. Today this usually goes through a *virtual audio cable*:
+Some applications generate or process audio that other programs should receive as if it came
+from a regular microphone: audio processing and effects, sound synthesis, streaming and
+broadcasting tools, accessibility software, audio test and measurement. Today this usually goes
+through a *virtual audio cable*:
 the application plays into a virtual speaker, the cable copies the audio to a virtual microphone
 at its own pace, with its own buffering. That middleman costs latency and, under heavy CPU load,
 dropouts.
@@ -14,7 +16,7 @@ Windows reads them and **drives the clock** by advancing the device position. Wh
 connected, the microphone is reported as unplugged.
 
 ```
-host application ──writes into the shared ring buffer──▶ [hostmic microphone] ──▶ Windows audio engine ──▶ Discord
+host application ──writes into the shared ring buffer──▶ [hostmic microphone] ──▶ Windows audio engine ──▶ any recording application
 ```
 
 ## Status
