@@ -336,9 +336,20 @@ SECURITY.md.
   as too small (0x52 bytes required), while refusing it cost hostmic its endpoint in M3. The
   status returned may be what matters; to investigate, not needed for M4.
 - Windows 10 support: keep it if it costs nothing (WaveRT is fine there; ACX would not be).
-- ARM64: later.
+- ARM64: later. The same driver rebuilt for `aarch64`, with the same signing requirement, and
+  testing needs ARM64 hardware (Hyper-V on x64 does not run Windows on ARM): after signing,
+  not before.
 - Signing programme: whether OSSign reopens applications, accepts the project and how long it
   takes; a user base to show by then (a usable public release would help).
+- A cross-platform host crate (after M4, with M5): one API for "a virtual microphone fed by
+  this application", backed by the hostmic driver on Windows and by a PipeWire source node on
+  Linux (an application can already appear there as a microphone, `media.class=Audio/Source`,
+  with no driver and no signing); macOS later, where virtual devices are Audio Server plug-ins
+  in user space (BlackHole) and distribution needs an Apple Developer ID and notarization.
+  Ported drivers for Linux or macOS would bring little: free virtual devices already exist
+  there, and only Windows lacks an open-source, host-fed microphone. A portable crate, though,
+  would let an application such as Résonnance keep one code path on every platform, and could
+  bring Rust audio developers to the project before the Windows driver is signed.
 
 ## Prior art and references
 
