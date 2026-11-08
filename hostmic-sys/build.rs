@@ -43,6 +43,7 @@ impl ParseCallbacks for WdkSysTypesAreCopy {
 /// (`ks.h` needs the real `INTERFACE` struct, `punknown.h` `#undef`s the macro), then `This` is
 /// made a `void *` for `portcls.h` alone.
 const HEADERS: &str = "\
+#include <wdmsec.h>
 #include <windef.h>
 #define NOBITMAP
 #include <mmreg.h>
@@ -55,7 +56,8 @@ const HEADERS: &str = "\
 #include <portcls.h>
 ";
 
-/// PortCls functions used by the capture path of Microsoft's `simpleaudiosample`.
+/// PortCls functions used by the capture path of Microsoft's `simpleaudiosample`, and
+/// `wdmsec.h`'s secure device creation for the host interface (PLAN.md, M4).
 const FUNCTIONS: &[&str] = &[
     "PcAddAdapterDevice",
     "PcDispatchIrp",
@@ -65,6 +67,8 @@ const FUNCTIONS: &[&str] = &[
     "PcRegisterAdapterPowerManagement",
     "PcRegisterPhysicalConnection",
     "PcRegisterSubdevice",
+    // wdmsec.h (`IoCreateDeviceSecure` is a macro naming it), in `wdmsec.lib`.
+    "WdmlibIoCreateDeviceSecure",
 ];
 
 /// Types, matched with an optional `_` (struct tag) and `P` (pointer typedef) prefix.

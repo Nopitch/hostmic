@@ -17,6 +17,7 @@ crate-type = ["cdylib"]
 test = false
 
 [dependencies]
+hostmic-abi = { path = "../abi" }
 hostmic-driver-core = { path = "../driver-core" }
 hostmic-sys = { path = "../hostmic-sys" }
 wdk.workspace = true
