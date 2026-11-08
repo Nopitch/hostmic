@@ -1,0 +1,65 @@
+;===================================================================
+; hostmic, milestone M1: minimal KMDF test driver (no audio yet)
+; Adapted from windows-drivers-rs' sample-kmdf-driver (Microsoft, MIT OR Apache-2.0)
+;===================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HostmicTest
+ClassGuid   = {3DE3C0F6-EF31-48FE-B40C-D8A0CB38CC63}
+Provider    = %ProviderString%
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+hostmic_driver.sys = 1,,
+
+; ================= Class section =====================
+; A setup class of our own for the M1 test device; M3 moves to the MEDIA class.
+
+[ClassInstall32]
+Addreg=HostmicClassReg
+
+[HostmicClassReg]
+HKR,,,0,%ClassName%
+HKR,,Icon,,-5
+
+; ================= Install section =================
+
+[Manufacturer]
+%StdMfg%=Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceDesc%=HostmicDevice, root\HOSTMIC_M1
+
+[HostmicDevice.NT$ARCH$]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+hostmic_driver.sys
+
+; ================= Service installation =================
+[HostmicDevice.NT$ARCH$.Services]
+AddService = hostmic, %SPSVCINST_ASSOCSERVICE%, Hostmic_Service_Install
+
+[Hostmic_Service_Install]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\hostmic_driver.sys
+
+; ================= Strings =================
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderString         = "hostmic project"
+StdMfg                 = "(Standard system devices)"
+DiskId1                = "hostmic Installation Disk"
+DeviceDesc             = "hostmic test device (M1)"
+ServiceDesc            = "hostmic driver"
+ClassName              = "hostmic test devices"

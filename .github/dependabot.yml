@@ -1,6 +1,5 @@
 version: 2
 updates:
-  # Cargo is added with the first crate (milestone M1).
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -9,3 +8,14 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # windows-drivers-rs crates are released together and must move together.
+      windows-drivers-rs:
+        patterns:
+          - "wdk"
+          - "wdk-*"

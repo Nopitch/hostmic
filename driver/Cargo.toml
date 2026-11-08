@@ -1,0 +1,37 @@
+[package]
+name = "hostmic-driver"
+version = "0.1.0"
+description = "hostmic kernel driver (milestone M1: a minimal KMDF driver proving the toolchain)"
+license = "MS-PL"
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# Uses the workspace's WDK configuration.
+[package.metadata.wdk]
+
+[lib]
+crate-type = ["cdylib"]
+# No host unit tests: a test binary links the KMDF stub, which needs the kernel's `DriverEntry`
+# and fails to link. The driver is tested by loading it in the test VM.
+test = false
+
+[dependencies]
+wdk.workspace = true
+wdk-alloc.workspace = true
+wdk-panic.workspace = true
+wdk-sys.workspace = true
+
+[build-dependencies]
+wdk-build.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Every unsafe operation gets its own block and its own SAFETY comment.
+multiple_unsafe_ops_per_block = "forbid"
+undocumented_unsafe_blocks = "forbid"

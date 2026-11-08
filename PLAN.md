@@ -95,6 +95,27 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 - **M0, bootstrap** (this commit): README, plan, licences.
 - **M1, toolchain proof:** a minimal Rust KMDF driver from windows-drivers-rs' samples builds,
   installs and logs a message in the VM. Contact the signing programme in parallel (see M7).
+  *Build part done (2026-11-08):* workspace with the WDK configuration at the root (KMDF 1.33,
+  as Microsoft's `Windows-rust-driver-samples`), crate `driver/` (`hostmic-driver`,
+  `hostmic_driver.sys`), Rust 1.98.1, wdk 0.5.0 / wdk-sys 0.5.2 / wdk-build 0.6.0, WDK
+  10.0.26100, LLVM 23.1.3 through `LIBCLANG_PATH` (the README suggests 17 because of an ARM64
+  bug fixed in 19; x64 builds fine). Built with **`cargo wdk build`** (cargo-wdk 0.2.0, preview):
+  build, stampinf, inf2cat, infverif, test signing with a self-signed `WDRLocalTestCert`. The
+  older `cargo make` flow needs to create a symbolic link in `target/`, which Windows only
+  allows to administrators or in Developer Mode. infverif rejects the samples' `Sample` setup
+  class (reserved for Microsoft): the M1 device has a class of its own, `HostmicTest`.
+  *Loaded in the VM (2026-11-08):* Hyper-V generation 2, Windows 11 Pro, Secure Boot off, test
+  signing on; procedure in [`docs/test-vm.md`](docs/test-vm.md). `devcon install` (the device is
+  root-enumerated, so `pnputil` alone creates no device node) logs `DriverEntry`,
+  `WdfDriverCreate` and `WdfDeviceCreate` returning `STATUS_SUCCESS`; `devcon remove` unloads it.
+  Lesson: for a PnP driver, `WdfDriverCreate` overwrites `DRIVER_OBJECT::DriverUnload` with the
+  framework's routine, which only calls `WDF_DRIVER_CONFIG::EvtDriverUnload` (KMDF's
+  `FxDriver::Initialize`); the sample's direct `DriverUnload` is never called, so the driver
+  uses `EvtDriverUnload`. No host unit tests for the driver crate: a test binary links the KMDF
+  stub, which needs the kernel's `DriverEntry`.
+  *CI:* workflow `driver` on `windows-2025`: WDK from NuGet (`Microsoft.Windows.WDK.x64`, as
+  windows-drivers-rs' own CI does, instead of the image's), the image's LLVM, `cargo fmt`,
+  `cargo clippy`, `cargo wdk build`. Dependabot watches cargo (windows-drivers-rs crates grouped).
 - **M2, audio bindings:** `hostmic-sys`, bindgen over the PortCls/KS headers, with the subset
   used by `simpleaudiosample`'s capture path; compiles, tests check struct sizes and offsets
   against the C headers.

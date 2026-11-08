@@ -1,0 +1,30 @@
+[workspace]
+members = ["driver"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
+repository = "https://github.com/Nopitch/hostmic"
+
+# windows-drivers-rs supports one WDK configuration per workspace. The crates published on
+# crates.io target KMDF 1.33.
+[workspace.metadata.wdk.driver-model]
+driver-type = "KMDF"
+kmdf-version-major = 1
+target-kmdf-version-minor = 33
+
+# Kernel code cannot unwind.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[workspace.dependencies]
+wdk = "0.5.0"
+wdk-alloc = "0.4.2"
+wdk-build = "0.6.0"
+wdk-panic = "0.5.0"
+wdk-sys = "0.5.2"

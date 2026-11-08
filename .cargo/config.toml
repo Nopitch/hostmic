@@ -1,0 +1,3 @@
+[build]
+# Drivers link the C runtime statically.
+rustflags = ["-C", "target-feature=+crt-static"]
