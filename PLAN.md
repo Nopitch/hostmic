@@ -95,6 +95,16 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 - **M0, bootstrap** (this commit): README, plan, licences.
 - **M1, toolchain proof:** a minimal Rust KMDF driver from windows-drivers-rs' samples builds,
   installs and logs a message in the VM. Contact the signing programme in parallel (see M7).
+  *Build part done (2026-11-08):* workspace with the WDK configuration at the root (KMDF 1.33,
+  as Microsoft's `Windows-rust-driver-samples`), crate `driver/` (`hostmic-driver`,
+  `hostmic_driver.sys`), Rust 1.98.1, wdk 0.5.0 / wdk-sys 0.5.2 / wdk-build 0.6.0, WDK
+  10.0.26100, LLVM 23.1.3 through `LIBCLANG_PATH` (the README suggests 17 because of an ARM64
+  bug fixed in 19; x64 builds fine). Built with **`cargo wdk build`** (cargo-wdk 0.2.0, preview):
+  build, stampinf, inf2cat, infverif, test signing with a self-signed `WDRLocalTestCert`. The
+  older `cargo make` flow needs to create a symbolic link in `target/`, which Windows only
+  allows to administrators or in Developer Mode. infverif rejects the samples' `Sample` setup
+  class (reserved for Microsoft): the M1 device has a class of its own, `HostmicTest`.
+  Still to do: load it in the VM.
 - **M2, audio bindings:** `hostmic-sys`, bindgen over the PortCls/KS headers, with the subset
   used by `simpleaudiosample`'s capture path; compiles, tests check struct sizes and offsets
   against the C headers.
