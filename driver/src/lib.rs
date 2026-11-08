@@ -47,11 +47,14 @@ pub unsafe extern "system" fn driver_entry(
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
     println!("hostmic: DriverEntry");
-    driver.DriverUnload = Some(driver_unload);
 
+    // The unload callback goes through WDF, not `DRIVER_OBJECT::DriverUnload`: for a PnP
+    // driver, `WdfDriverCreate` overwrites `DriverUnload` with the framework's own routine,
+    // which only calls `EvtDriverUnload` (checked in the M1 test VM).
     let mut config = WDF_DRIVER_CONFIG {
         Size: WDF_DRIVER_CONFIG_SIZE,
         EvtDriverDeviceAdd: Some(evt_driver_device_add),
+        EvtDriverUnload: Some(evt_driver_unload),
         ..WDF_DRIVER_CONFIG::default()
     };
 
@@ -94,16 +97,7 @@ extern "C" fn evt_driver_device_add(
     status
 }
 
-/// Called by the kernel when the driver is unloaded.
-extern "C" fn driver_unload(_driver: *mut DRIVER_OBJECT) {
+/// Called by WDF just before the driver is unloaded, after its last device is removed.
+extern "C" fn evt_driver_unload(_driver: WDFDRIVER) {
     println!("hostmic: driver unloaded");
-}
-
-#[cfg(test)]
-mod tests {
-    /// Ensures test targets compile without linking the WDK libraries.
-    #[test]
-    fn unload_logs_without_crashing() {
-        super::driver_unload(core::ptr::null_mut());
-    }
 }

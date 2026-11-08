@@ -12,6 +12,9 @@ repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
+# No host unit tests: a test binary links the KMDF stub, which needs the kernel's `DriverEntry`
+# and fails to link. The driver is tested by loading it in the test VM.
+test = false
 
 [dependencies]
 wdk.workspace = true
