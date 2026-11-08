@@ -87,16 +87,17 @@ of the build.
   earlier check.
 - **Open design**: all code, design and tests are public (PLAN.md, this document).
 - **Separation of privilege**: changes to main need a pull request with required checks (format,
-  lint, tests, build, secret scanning, workflow audit, dependency review, DCO, CodeQL).
+  lint, tests, build, fuzzing, secret scanning, workflow audit, dependency review, DCO,
+  CodeQL).
 - **Defense in depth**: a memory-safe language, with every `unsafe` block justified by a
-  `// SAFETY:` comment (enforced by clippy), plus static analysis, VM tests and, planned,
-  fuzzing and Driver Verifier.
+  `// SAFETY:` comment (enforced by clippy), plus static analysis, fuzzing, VM tests and,
+  planned, Driver Verifier.
 
 ### 2.4 Common weaknesses and how they are countered
 
 | Weakness (CWE) | Countermeasure |
 |---|---|
-| Improper input validation (CWE-20) | Allowlist checks of formats and sizes in pure, unit-tested Rust (`format::is_supported`); IOCTL validation the same way, fuzzed (M4) |
+| Improper input validation (CWE-20) | Allowlist checks of formats and sizes in pure, unit-tested Rust (`format::is_supported`); IOCTL validation the same way; both fuzzed |
 | Out-of-bounds read or write (CWE-125, CWE-787) | Size checks before every access to a caller's buffer; ring writes through bounded slices; unaligned-safe reads and writes |
 | Integer overflow (CWE-190) | 128-bit intermediates for clock arithmetic, saturating and checked operations; overflow checks in tests and debug builds |
 | Use after free (CWE-416) | Atomic reference counting with `Arc`-like orderings; timers deleted and DPCs flushed before a stream is freed; the notification event dropped and callbacks flushed before unregistration returns |
@@ -111,6 +112,10 @@ of the build.
 
 - Unit tests of the pure logic (`hostmic-driver-core`), layout checks of the generated bindings
   against MSVC (`hostmic-sys`), run in CI on every pull request.
+- Fuzzing with cargo-fuzz and AddressSanitizer of every validation of untrusted input (Kernel
+  Streaming data formats, the host interface's requests, stream buffer sizes) and of the
+  lock-free protocol between stream state changes and the host's position updates: 60 s per
+  target on every pull request (the required `fuzz` check), 10 minutes every week.
 - Clippy (pedantic, `-D warnings`), with `undocumented_unsafe_blocks` and
   `multiple_unsafe_ops_per_block` forbidden in the driver; CodeQL; zizmor.
 - VM tests documented in [docs/test-vm.md](test-vm.md), including a measured recording
@@ -120,7 +125,8 @@ of the build.
 
 ### 2.6 Known gaps and plans
 
-- Fuzzing of the host interface's validation (M4); Driver Verifier and an HVCI run in the test
-  VM, sleep and resume, host crash and endurance tests (M6).
+- Driver Verifier and an HVCI run in the test VM, sleep and resume, host crash and endurance
+  tests (M6). Fuzzing covers the pure validation code, not the kernel code that calls it.
+
 - A single maintainer: no second human reviewer yet (GOVERNANCE.md).
 - Release signing and provenance attestations (M7).

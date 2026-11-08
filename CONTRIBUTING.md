@@ -61,11 +61,18 @@ Rust dependencies are crates from crates.io, pinned in `Cargo.lock` and fetched 
 - Lint: `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D warnings`.
 - Unit tests: `cargo test --locked`. CI runs all of the above on every pull request.
 - The driver itself is only tested in a virtual machine: [docs/test-vm.md](docs/test-vm.md).
+- Fuzzing: `fuzz/` holds [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+  targets for the validation of untrusted input. They need the nightly toolchain pinned in
+  `.github/workflows/fuzz.yml` and cargo-fuzz 0.13.2 (on Windows, also MSVC's AddressSanitizer,
+  see the cargo-fuzz book); for example `cargo +nightly-2026-10-26 fuzz run attach --
+  -max_total_time=60`, and `cargo fuzz list` for the targets. The `fuzz` CI job runs each
+  target for 60 s on every pull request and 10 minutes every week.
 
 ## Tests
 
 New functionality comes with automated tests. Logic that needs no kernel call lives in a crate
-that runs on the build machine, such as `hostmic-driver-core`, and gets unit tests there. Code
+that runs on the build machine, such as `hostmic-driver-core`, and gets unit tests there; when
+it handles input from user mode or from PortCls, it also gets a fuzz target in `fuzz/`. Code
 that only runs in the kernel gets a reproducible procedure in [docs/test-vm.md](docs/test-vm.md),
 with what to expect. A pull request says how it was tested.
 

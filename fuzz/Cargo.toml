@@ -1,0 +1,77 @@
+[package]
+name = "hostmic-fuzz"
+version = "0.0.0"
+description = "Fuzz targets for the hostmic driver's input validation (cargo-fuzz, libFuzzer)"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+publish = false
+
+# cargo-fuzz finds its targets through this marker.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.5.0", features = ["derive"] }
+hostmic-abi = { path = "../abi" }
+hostmic-driver-core = { path = "../driver-core" }
+libfuzzer-sys = "0.4.13"
+
+# A workspace of its own: fuzzing needs a nightly toolchain and sanitizer flags that the
+# driver's workspace (pinned stable, kernel target) must never see.
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Untrusted input reaching the driver from user mode.
+
+[[bin]]
+name = "ks_format"
+path = "fuzz_targets/ks_format.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "abi_layouts"
+path = "fuzz_targets/abi_layouts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attach"
+path = "fuzz_targets/attach.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "advance"
+path = "fuzz_targets/advance.rs"
+test = false
+doc = false
+bench = false
+
+# Values PortCls and the audio engine pass to the stream.
+
+[[bin]]
+name = "geometry"
+path = "fuzz_targets/geometry.rs"
+test = false
+doc = false
+bench = false
+
+# The lock-free protocol between the stream's state changes and ADVANCE.
+
+[[bin]]
+name = "sequence"
+path = "fuzz_targets/sequence.rs"
+test = false
+doc = false
+bench = false

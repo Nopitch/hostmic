@@ -266,6 +266,12 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     replays sequences of attach, stream, advance and detach against the pure model; a CI job on
     a GitHub-hosted Linux runner with a pinned nightly (cargo-fuzz needs one; the repository's
     toolchain stays stable), 60 s per target on each pull request, required as `fuzz`.
+    *Done (2026-11-09):* six targets: Kernel Streaming data formats, the ABI layouts' round
+    trips, `ATTACH`, `ADVANCE`, stream buffer geometry, and `sequence`, which replays any
+    interleaving of state changes and `ADVANCE`s (including a state change between an
+    `ADVANCE`'s check and its compare-and-exchange) on a model of the driver's atomics and
+    checks the `Cursor` protocol's invariants. The `fuzz` workflow also formats and lints the
+    fuzz crate, which is a workspace of its own; 10 minutes per target every week.
   Pull requests, one at a time: the ABI and its validation; fuzzing; the child PDO and its
   interface; attach, detach and the stream state with `tools/test-host`; the jack following
   the host; the shared buffer and its mapping; the host-advanced position with the counters
@@ -305,7 +311,8 @@ checks:
   (OSPS-QA-07.01), which needs a second maintainer.
 - **Metal:** passing at 99%, missing only release notes (no release yet); silver at 91%,
   missing passing, access continuity and bus factor (single maintainer), 80% statement
-  coverage, fuzzing (M4), reproducible builds, signed tags and hardening (M6).
+  coverage, fuzzing (M4; in CI since 2026-11-09, to report on the badge), reproducible builds,
+  signed tags and hardening (M6).
 
 **The first release must not be a hand-made one.** Several criteria answered "not applicable"
 because no release exists become requirements with it; in particular, OSPS-BR-06.01 (baseline-2)
