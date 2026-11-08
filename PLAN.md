@@ -210,6 +210,29 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 - **M8, Résonnance:** in Résonnance's repository, an output "Résonnance microphone (hostmic)"
   replacing the virtual cable.
 
+## OpenSSF Best Practices badge
+
+Project entry: <https://www.bestpractices.dev/projects/16465>; the README shows the Baseline
+badge. Status on 2026-11-08, after the governance and security documents (GOVERNANCE.md,
+SECURITY.md, docs/security-assurance.md), the DCO and the `dependencies` and `dco` required
+checks:
+
+- **Baseline:** level 1 and level 2 met; level 3 at 95%, missing only a non-author approval
+  (OSPS-QA-07.01), which needs a second maintainer.
+- **Metal:** passing at 99%, missing only release notes (no release yet); silver at 91%,
+  missing passing, access continuity and bus factor (single maintainer), 80% statement
+  coverage, fuzzing (M4), reproducible builds, signed tags and hardening (M6).
+
+**The first release must not be a hand-made one.** Several criteria answered "not applicable"
+because no release exists become requirements with it; in particular, OSPS-BR-06.01 (baseline-2)
+requires a signed release or a signed manifest of its assets' hashes, so an unsigned release
+would lose baseline-2. Before tagging `v0.1.0`, the release workflow (M7) must provide: a
+protected `v*` tag (signed if possible), release notes with functional and security changes,
+assets named after the version, build provenance attestations, a software bill of materials,
+documentation on verifying the assets and their author, a user guide and defect-reporting
+guide, the license files with the assets, and a statement of support scope and duration in
+SECURITY.md.
+
 ## Open questions
 
 - Endpoint naming: the device name is fixed in the INF; the endpoint name per line.
