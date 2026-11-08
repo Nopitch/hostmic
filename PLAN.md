@@ -95,7 +95,7 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 
 - **M0, bootstrap** (this commit): README, plan, licences.
 - **M1, toolchain proof:** a minimal Rust KMDF driver from windows-drivers-rs' samples builds,
-  installs and logs a message in the VM. Contact the signing programme in parallel (see M7).
+  installs and logs a message in the VM. Signing programme: criteria read, see M7.
   *Build part done (2026-11-08):* workspace with the WDK configuration at the root (KMDF 1.33,
   as Microsoft's `Windows-rust-driver-samples`), crate `driver/` (`hostmic-driver`,
   `hostmic_driver.sys`), Rust 1.98.1, wdk 0.5.0 / wdk-sys 0.5.2 / wdk-build 0.6.0, WDK
@@ -143,14 +143,27 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   topology miniport; the driver itself fills the buffer with a sine, like the sample's tone
   generator. Done when "Microphone (hostmic)" appears in the VM and records a clean 1 kHz tone.
 - **M4, the host interface:** IOCTLs, buffer mapping, host-advanced position, unplugged without a
-  host; the tone generator goes away.
+  host; the tone generator goes away. IOCTL input validation is pure Rust, without kernel
+  calls, so that it can be unit-tested and **fuzzed** on the host with `cargo-fuzz`; a short
+  fuzzing run in CI on each pull request (also OpenSSF Scorecard's Fuzzing check).
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance.
-- **M7, signing:** submit to an open-source signing programme (OSSign signs kernel drivers through
-  Microsoft attestation; its conditions are not public and must be asked first), then install on a
-  real machine with Secure Boot on.
+- **M7, signing:** submit to an open-source signing programme, then install on a real machine
+  with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
+  criteria (read 2026-11-08; applications were then suspended because of a backlog):
+  - an OSI-approved license, all released code public;
+  - an actively maintained project with a demonstrable user base or community, and **at least
+    6 months of activity** of the account and the project: the repository was created on
+    2026-11-08, so not before May 2027;
+  - **public automation**: a build pipeline where the whole build is verifiable and each
+    release binary is linked to its source, with code quality checks. Before applying, add a
+    release workflow: a `v*` tag builds the package on GitHub-hosted runners, attaches it to
+    the GitHub release and publishes a build provenance attestation;
+  - no commercial focus (possible on request) and no political or controversial purpose.
+  Fallback if refused: Microsoft attestation signing through a Partner Center hardware
+  developer account, which requires an EV code-signing certificate (yearly cost).
 - **M8, Résonnance:** in Résonnance's repository, an output "Résonnance microphone (hostmic)"
   replacing the virtual cable.
 
@@ -159,7 +172,8 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 - Endpoint naming: the device name is fixed in the INF; the endpoint name per line.
 - Windows 10 support: keep it if it costs nothing (WaveRT is fine there; ACX would not be).
 - ARM64: later.
-- Signing programme acceptance and turnaround: unknown until asked.
+- Signing programme: whether OSSign reopens applications, accepts the project and how long it
+  takes; a user base to show by then (a usable public release would help).
 
 ## Prior art and references
 
