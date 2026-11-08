@@ -1,12 +1,12 @@
 ;===================================================================
-; hostmic, milestone M1: minimal KMDF test driver (no audio yet)
-; Adapted from windows-drivers-rs' sample-kmdf-driver (Microsoft, MIT OR Apache-2.0)
+; hostmic: a virtual microphone (PortCls audio adapter)
+; Adapted from Microsoft's simpleaudiosample INF (Microsoft, MS-PL)
 ;===================================================================
 
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = HostmicTest
-ClassGuid   = {3DE3C0F6-EF31-48FE-B40C-D8A0CB38CC63}
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderString%
 PnpLockDown = 1
 
@@ -19,32 +19,53 @@ DefaultDestDir = 13
 [SourceDisksFiles]
 hostmic_driver.sys = 1,,
 
-; ================= Class section =====================
-; A setup class of our own for the M1 test device; M3 moves to the MEDIA class.
-
-[ClassInstall32]
-Addreg=HostmicClassReg
-
-[HostmicClassReg]
-HKR,,,0,%ClassName%
-HKR,,Icon,,-5
-
-; ================= Install section =================
+; ================= Device =================
 
 [Manufacturer]
 %StdMfg%=Standard,NT$ARCH$.10.0...16299
 
 [Standard.NT$ARCH$.10.0...16299]
-%DeviceDesc%=HostmicDevice, root\HOSTMIC_M1
+%DeviceDesc%=Hostmic, ROOT\hostmic
 
-[HostmicDevice.NT$ARCH$]
+[Hostmic.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration,WDMAUDIO.Registration
 CopyFiles=Drivers_Dir
+AddReg=Hostmic.AddReg
 
 [Drivers_Dir]
 hostmic_driver.sys
 
-; ================= Service installation =================
-[HostmicDevice.NT$ARCH$.Services]
+[Hostmic.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,hostmic_driver.sys
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%DeviceDesc%
+
+; ================= Kernel Streaming interfaces =================
+; The reference strings match the names the driver passes to PcRegisterSubdevice.
+
+[Hostmic.NT.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_TopologyMic%,Hostmic.I.TopologyMic
+AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_TopologyMic%,Hostmic.I.TopologyMic
+
+[Hostmic.I.TopologyMic]
+AddReg=Hostmic.I.TopologyMic.AddReg
+
+[Hostmic.I.TopologyMic.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%TopologyMic.FriendlyName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+; Event-driven (pull) mode for shared-mode clients.
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+; ================= Service =================
+
+[Hostmic.NT.Services]
 AddService = hostmic, %SPSVCINST_ASSOCSERVICE%, Hostmic_Service_Install
 
 [Hostmic_Service_Install]
@@ -54,12 +75,35 @@ StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\hostmic_driver.sys
 
+; ================= Device object =================
+
+[Hostmic.NT.HW]
+AddReg=Hostmic.HW.AddReg
+
+[Hostmic.HW.AddReg]
+; FILE_DEVICE_SOUND
+HKR,,DeviceType,0x10001,0x0000001D
+; The audio filters must be open to the audio service and engine (LOCAL SERVICE), as in
+; Microsoft's sample: system all access; administrators, everyone and restricted code read,
+; write and execute. The host interface (M4) gets its own access control.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
+
 ; ================= Strings =================
 [Strings]
+; Non-localizable
 SPSVCINST_ASSOCSERVICE = 0x00000002
+KSNAME_TopologyMic     = "TopologyMic"
+Proxy.CLSID            = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO       = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_TOPOLOGY    = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSNODETYPE_ANY         = "{00000000-0000-0000-0000-000000000000}"
+PKEY_AudioEndpoint_Association               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+
+; Localizable
 ProviderString         = "hostmic project"
-StdMfg                 = "(Standard system devices)"
+StdMfg                 = "hostmic project"
 DiskId1                = "hostmic Installation Disk"
-DeviceDesc             = "hostmic test device (M1)"
-ServiceDesc            = "hostmic driver"
-ClassName              = "hostmic test devices"
+DeviceDesc             = "hostmic"
+ServiceDesc            = "hostmic virtual microphone driver"
+TopologyMic.FriendlyName = "hostmic topology"

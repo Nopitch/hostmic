@@ -166,6 +166,14 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   Pull requests: `hostmic-driver-core`; the adapter, the COM plumbing, the topology miniport
   and the `MEDIA` INF; a user-mode capture checker (frequency, level, discontinuities) for the
   VM test; the WaveRT miniport, its stream and the tone.
+  *`hostmic-driver-core` done (#9).* *Adapter and topology (2026-11-08):* the workspace builds
+  a WDM driver (imports `ntoskrnl.exe` and `portcls.sys` only); in the VM the device installs
+  as `ROOT\MEDIA\0000` (class `MEDIA`, no problem code), registers the topology filter's
+  `KSCATEGORY_AUDIO` and `KSCATEGORY_TOPOLOGY` interfaces, shows no microphone yet, and
+  `devcon remove` unloads it. Lesson: `wdk-build` reads the WDK configuration from the
+  `Cargo.toml` it finds above `OUT_DIR`, so a `CARGO_TARGET_DIR` outside the workspace (or
+  shared with another checkout) silently builds with another configuration: the first WDM
+  build still linked KMDF's `WdfDriverEntry`. Keep each checkout's `target/` inside it.
 - **M4, the host interface:** IOCTLs, buffer mapping, host-advanced position, unplugged without a
   host; the tone generator goes away. IOCTL input validation is pure Rust, without kernel
   calls, so that it can be unit-tested and **fuzzed** on the host with `cargo-fuzz`; a short

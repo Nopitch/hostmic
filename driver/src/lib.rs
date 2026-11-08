@@ -1,46 +1,54 @@
 //! # hostmic driver
 //!
-//! Milestone M1: a minimal KMDF driver that only proves the toolchain (build, packaging, test
-//! signing, loading in a test VM). It creates one device and logs its lifecycle with
-//! `DbgPrint`; it does no audio yet.
+//! A PortCls audio adapter, written in Rust, that will expose one capture endpoint (a
+//! microphone) fed by a user-mode host. It ports the capture path of Microsoft's
+//! `simpleaudiosample` (Copyright (c) Microsoft Corporation, MS-PL); PLAN.md lists where it
+//! deliberately departs from it.
 //!
-//! Adapted from the `sample-kmdf-driver` example of
-//! [windows-drivers-rs](https://github.com/microsoft/windows-drivers-rs)
-//! (Copyright (c) Microsoft Corporation, MIT OR Apache-2.0).
+//! Milestone M3, first step: the adapter and its topology filter. The wave filter, which
+//! completes the endpoint, comes next.
+//!
+//! - [`com`]: COM-style objects and interface references.
+//! - [`ks`]: Kernel Streaming descriptor and property helpers.
+//! - [`adapter`]: the PnP device and its subdevices.
+//! - [`topology`]: the topology miniport.
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
 #[cfg(not(test))]
 extern crate wdk_panic;
 
+pub mod adapter;
+pub mod com;
+pub mod ks;
+pub mod topology;
+
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicPtr, Ordering},
+};
+
+use hostmic_sys::PcInitializeAdapterDriver;
 use wdk::println;
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
-use wdk_sys::{
-    DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, WDF_DRIVER_CONFIG,
-    WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER,
-    call_unsafe_wdf_function_binding,
-};
+use wdk_sys::{DRIVER_OBJECT, IRP_MJ_PNP, NT_SUCCESS, NTSTATUS, PCUNICODE_STRING};
 
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
-/// Size of `WDF_DRIVER_CONFIG`, checked at compile time to fit the `ULONG` WDF expects.
-#[allow(clippy::cast_possible_truncation)]
-const WDF_DRIVER_CONFIG_SIZE: ULONG = {
-    let size = core::mem::size_of::<WDF_DRIVER_CONFIG>();
-    assert!(size <= ULONG::MAX as usize);
-    size as ULONG
-};
+/// The unload routine `PcInitializeAdapterDriver` installed, called by [`driver_unload`].
+static PORTCLS_UNLOAD: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 /// The driver's entry point, called once by the kernel when the driver is loaded.
 ///
 /// # Safety
 ///
 /// Called by the kernel only, with a valid driver object and registry path.
-// SAFETY: `DriverEntry` is the symbol name the kernel and WDF look for; no other function in
-// this crate exports it.
+// SAFETY: `DriverEntry` is the symbol name the kernel looks for; no other function in this
+// crate exports it.
 #[cfg_attr(not(test), unsafe(export_name = "DriverEntry"))]
 pub unsafe extern "system" fn driver_entry(
     driver: &mut DRIVER_OBJECT,
@@ -48,56 +56,40 @@ pub unsafe extern "system" fn driver_entry(
 ) -> NTSTATUS {
     println!("hostmic: DriverEntry");
 
-    // The unload callback goes through WDF, not `DRIVER_OBJECT::DriverUnload`: for a PnP
-    // driver, `WdfDriverCreate` overwrites `DriverUnload` with the framework's own routine,
-    // which only calls `EvtDriverUnload` (checked in the M1 test VM).
-    let mut config = WDF_DRIVER_CONFIG {
-        Size: WDF_DRIVER_CONFIG_SIZE,
-        EvtDriverDeviceAdd: Some(evt_driver_device_add),
-        EvtDriverUnload: Some(evt_driver_unload),
-        ..WDF_DRIVER_CONFIG::default()
+    // PortCls fills the dispatch table, the AddDevice routine and the unload routine.
+    // SAFETY: the driver object and registry path come from the kernel and are valid;
+    // `add_device` matches `DRIVER_ADD_DEVICE`. PortCls does not write the registry path.
+    let status = unsafe {
+        PcInitializeAdapterDriver(driver, registry_path.cast_mut(), Some(adapter::add_device))
     };
-
-    let status;
-    // SAFETY: `driver` and `registry_path` come from the kernel and are valid for this call;
-    // no object attributes and no output handle are allowed by `WdfDriverCreate`; `config` is
-    // a valid, fully initialised `WDF_DRIVER_CONFIG` that outlives the call.
-    unsafe {
-        status = call_unsafe_wdf_function_binding!(
-            WdfDriverCreate,
-            core::ptr::from_mut(driver) as PDRIVER_OBJECT,
-            registry_path,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &raw mut config,
-            WDF_NO_HANDLE.cast::<WDFDRIVER>(),
-        );
+    println!("hostmic: PcInitializeAdapterDriver returned {status:#010x}");
+    if !NT_SUCCESS(status) {
+        return status;
     }
-    println!("hostmic: WdfDriverCreate returned {status:#010x}");
+
+    // PnP requests go through the adapter first, then to PortCls.
+    driver.MajorFunction[IRP_MJ_PNP as usize] = Some(adapter::dispatch_pnp);
+    // The driver's unload routine is installed whatever PortCls left there, so that the driver
+    // stays unloadable; it chains to PortCls's when there is one (Microsoft's sample does the
+    // same).
+    if let Some(unload) = driver.DriverUnload {
+        PORTCLS_UNLOAD.store(unload as *mut c_void, Ordering::Release);
+    }
+    driver.DriverUnload = Some(driver_unload);
     status
 }
 
-/// Called by WDF when the device described by `hostmic_driver.inf` is added.
-extern "C" fn evt_driver_device_add(
-    _driver: WDFDRIVER,
-    mut device_init: *mut WDFDEVICE_INIT,
-) -> NTSTATUS {
-    let mut device: WDFDEVICE = WDF_NO_HANDLE.cast();
-    let status;
-    // SAFETY: `device_init` is provided by WDF for this call and is valid; no object
-    // attributes are allowed; `device` receives the created handle.
-    unsafe {
-        status = call_unsafe_wdf_function_binding!(
-            WdfDeviceCreate,
-            &raw mut device_init,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &raw mut device,
-        );
-    }
-    println!("hostmic: device added, WdfDeviceCreate returned {status:#010x}");
-    status
-}
-
-/// Called by WDF just before the driver is unloaded, after its last device is removed.
-extern "C" fn evt_driver_unload(_driver: WDFDRIVER) {
+/// The driver's unload routine: logs, then runs PortCls's.
+unsafe extern "C" fn driver_unload(driver: *mut DRIVER_OBJECT) {
     println!("hostmic: driver unloaded");
+    let unload = PORTCLS_UNLOAD.load(Ordering::Acquire);
+    if !unload.is_null() {
+        // SAFETY: `unload` was stored from a `DRIVER_UNLOAD` function pointer in
+        // `driver_entry`, before this routine was installed.
+        let unload = unsafe {
+            core::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut DRIVER_OBJECT)>(unload)
+        };
+        // SAFETY: forwards the kernel's call with the same driver object.
+        unsafe { unload(driver) };
+    }
 }

@@ -7,12 +7,11 @@ edition = "2024"
 publish = false
 repository = "https://github.com/Nopitch/hostmic"
 
-# windows-drivers-rs supports one WDK configuration per workspace. The crates published on
-# crates.io target KMDF 1.33.
+# windows-drivers-rs supports one WDK configuration per workspace. The driver is a plain WDM
+# PortCls adapter: Microsoft's audio sample uses KMDF only for a framework device that serves
+# Bluetooth bypass, which hostmic does not have (PLAN.md, M3).
 [workspace.metadata.wdk.driver-model]
-driver-type = "KMDF"
-kmdf-version-major = 1
-target-kmdf-version-minor = 33
+driver-type = "WDM"
 
 # Kernel code cannot unwind.
 [profile.dev]
