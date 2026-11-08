@@ -22,6 +22,36 @@ first, since it is the source of truth for what is being built and in which orde
 2. Fork, create a branch, open a pull request against `main`.
 3. The required checks must pass. Pull requests are squash-merged by the maintainer.
 
+## Build and test
+
+Requirements (Windows 10 or 11, x64), the same as the `driver` CI job:
+
+- Rust through [rustup](https://rustup.rs/); the toolchain version is pinned in
+  `rust-toolchain.toml` and installed automatically, with rustfmt and clippy.
+- The MSVC build tools and the Windows SDK: Visual Studio (Community is enough) or Build Tools
+  with the "Desktop development with C++" workload.
+- The Windows Driver Kit 10.0.26100 (CI installs it from NuGet, `Microsoft.Windows.WDK.x64`
+  10.0.26100.6584).
+- LLVM for bindgen: `libclang.dll`, found through `LIBCLANG_PATH` (for example
+  `C:\Program Files\LLVM\bin`).
+- `cargo install cargo-wdk --version 0.2.0 --locked`.
+
+Rust dependencies are crates from crates.io, pinned in `Cargo.lock` and fetched by Cargo.
+
+- Build and package the driver: `cargo wdk build` (cargo-wdk 0.2.0). The test-signed package
+  lands in `target/debug/hostmic_driver_package/`. Keep `target/` inside the checkout:
+  `wdk-build` reads the WDK configuration from the workspace above it.
+- Lint: `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D warnings`.
+- Unit tests: `cargo test --locked`. CI runs all of the above on every pull request.
+- The driver itself is only tested in a virtual machine: [docs/test-vm.md](docs/test-vm.md).
+
+## Tests
+
+New functionality comes with automated tests. Logic that needs no kernel call lives in a crate
+that runs on the build machine, such as `hostmic-driver-core`, and gets unit tests there. Code
+that only runs in the kernel gets a reproducible procedure in [docs/test-vm.md](docs/test-vm.md),
+with what to expect. A pull request says how it was tested.
+
 ## Licensing of contributions
 
 By contributing, you agree that your contribution is licensed under the license of the crate it
