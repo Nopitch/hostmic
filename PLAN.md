@@ -75,7 +75,9 @@ Windows audio engine period.
 A driver that maps memory into a user process is a classic source of vulnerabilities. Rules:
 
 - Validate every IOCTL input size and value; reject everything unexpected.
-- Device object security descriptor (SDDL) restricted to administrators and the interactive user.
+- The host interface (its device object or interface) is restricted to administrators and the
+  interactive user. The Kernel Streaming filters keep the usual audio-device access (the INF's
+  SDDL, as in Microsoft's sample): the audio service and applications must open them.
 - Map only the client buffer, only into the attached host, with user-mode probing inside
   structured exception handling; unmap on cleanup.
 - Compatible with Memory Integrity (HVCI): non-executable pool, no RWX mappings.
