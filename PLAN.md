@@ -104,7 +104,18 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   older `cargo make` flow needs to create a symbolic link in `target/`, which Windows only
   allows to administrators or in Developer Mode. infverif rejects the samples' `Sample` setup
   class (reserved for Microsoft): the M1 device has a class of its own, `HostmicTest`.
-  Still to do: load it in the VM.
+  *Loaded in the VM (2026-11-08):* Hyper-V generation 2, Windows 11 Pro, Secure Boot off, test
+  signing on; procedure in [`docs/test-vm.md`](docs/test-vm.md). `devcon install` (the device is
+  root-enumerated, so `pnputil` alone creates no device node) logs `DriverEntry`,
+  `WdfDriverCreate` and `WdfDeviceCreate` returning `STATUS_SUCCESS`; `devcon remove` unloads it.
+  Lesson: for a PnP driver, `WdfDriverCreate` overwrites `DRIVER_OBJECT::DriverUnload` with the
+  framework's routine, which only calls `WDF_DRIVER_CONFIG::EvtDriverUnload` (KMDF's
+  `FxDriver::Initialize`); the sample's direct `DriverUnload` is never called, so the driver
+  uses `EvtDriverUnload`. No host unit tests for the driver crate: a test binary links the KMDF
+  stub, which needs the kernel's `DriverEntry`.
+  *CI:* workflow `driver` on `windows-2025`: WDK from NuGet (`Microsoft.Windows.WDK.x64`, as
+  windows-drivers-rs' own CI does, instead of the image's), the image's LLVM, `cargo fmt`,
+  `cargo clippy`, `cargo wdk build`. Dependabot watches cargo (windows-drivers-rs crates grouped).
 - **M2, audio bindings:** `hostmic-sys`, bindgen over the PortCls/KS headers, with the subset
   used by `simpleaudiosample`'s capture path; compiles, tests check struct sizes and offsets
   against the C headers.

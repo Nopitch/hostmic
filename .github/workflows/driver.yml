@@ -1,0 +1,93 @@
+name: driver
+
+# Builds, lints and packages the kernel driver on a GitHub-hosted Windows runner. Loading it
+# is only ever done in the maintainer's test VM (see PLAN.md, "Development environment").
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: driver-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Public repository: GitHub-hosted runners only, never self-hosted.
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      # The WDK comes from NuGet, as in windows-drivers-rs' own CI, rather than from whatever
+      # the runner image ships: the image's WDK changes without notice. Same SDK base version
+      # (10.0.26100) as the maintainer's machine.
+      WDK_NUGET_VERSION: "10.0.26100.6584"
+      CARGO_WDK_VERSION: "0.2.0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the token out of .git/config (zizmor's artipacked rule).
+          persist-credentials: false
+
+      - name: Install the WDK from NuGet
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = 'C:\packages'
+          nuget install Microsoft.Windows.WDK.x64 -Version $env:WDK_NUGET_VERSION -OutputDirectory $root -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "nuget install failed ($LASTEXITCODE)" }
+
+          # Same layout and variables as windows-drivers-rs' install-wdk action; wdk-build
+          # reads them instead of looking for an installed WDK.
+          $sdkVersion = ($env:WDK_NUGET_VERSION.Split('.')[0..2]) -join '.'
+          $wdk = @(Get-ChildItem $root -Directory | Where-Object Name -match "^Microsoft\.Windows\.WDK\.x64\.$([regex]::Escape($sdkVersion))\.\d+$")
+          $sdk = @(Get-ChildItem $root -Directory | Where-Object Name -match "^Microsoft\.Windows\.SDK\.CPP\.$([regex]::Escape($sdkVersion))\.\d+$")
+          if ($wdk.Count -ne 1 -or $sdk.Count -ne 1) {
+            Get-ChildItem $root -Directory | ForEach-Object Name
+            throw "Expected exactly one WDK x64 and one SDK CPP package, found $($wdk.Count) and $($sdk.Count)"
+          }
+          $vars = [ordered]@{
+            Version_Number     = "$sdkVersion.0"
+            WindowsSdkBinPath  = "$($sdk[0].FullName)\c\bin"
+            WDKContentRoot     = "$($wdk[0].FullName)\c\"
+            WDKBinRoot         = "$($wdk[0].FullName)\c\bin\$sdkVersion.0"
+            WDKToolRoot        = "$($wdk[0].FullName)\c\tools\$sdkVersion.0"
+          }
+          foreach ($name in $vars.Keys) {
+            $value = $vars[$name]
+            if ($name -ne 'Version_Number' -and -not (Test-Path $value)) { throw "Missing $name = $value" }
+            Write-Host "$name=$value"
+            "$name=$value" >> $env:GITHUB_ENV
+          }
+
+      - name: Point bindgen at the runner's LLVM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path "$llvm\libclang.dll")) { throw "libclang.dll not found in $llvm" }
+          & "$llvm\clang.exe" --version
+          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Install cargo-wdk
+        shell: pwsh
+        run: cargo install cargo-wdk --version $env:CARGO_WDK_VERSION --locked
+
+      # Build, stampinf, inf2cat, infverif and test signing with a throwaway certificate.
+      - name: Build and package the driver
+        run: cargo wdk build --locked
