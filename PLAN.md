@@ -227,7 +227,8 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     and packet size, position; the host reads it when its event is signaled), `ADVANCE`
     (generation, expected position, frames written), `DETACH`, and with the position work
     `GET_STATS` (counters). Any process the descriptor lets in may open the interface and read;
-    only the attached host's process may advance. The validation of every request is pure Rust
+    only the attached host's process may advance. Hosts are 64-bit processes: for a 32-bit
+    one the buffer could be mapped out of reach. The validation of every request is pure Rust
     in `hostmic-driver-core`, unit-tested and fuzzed.
   - **One buffer for the whole attachment.** WaveRT allocates a buffer per stream and frees it
     when the stream closes; mapping that buffer into the host would mean taking it away while
@@ -243,8 +244,11 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     mapping is undone in the host's context, on detach or on the handle's cleanup, and a process
     notification routine covers a host that dies while another process holds a duplicate of its
     handle (to confirm in the documentation before writing it).
-  - **The host advances the position, without a lock:** `ADVANCE` moves the position with one
-    compare-and-exchange from the expected value, so concurrent requests cannot both win;
+  - **The host advances the position, without a lock:** the stream's generation and position
+    share one 64-bit word (an even generation accepts frames, an odd one does not; writers
+    halt the generation before changing anything else), and `ADVANCE` moves it with one
+    compare-and-exchange, so a request computed for an earlier stream or racing another one
+    cannot win;
     `GetPosition` and `GetReadPacket` only read. `ADVANCE` signals the engine's event when a
     packet completes; rundown protection (`EX_RUNDOWN_REF`, a non-blocking atomic count) keeps
     the event and the stream alive while it runs, instead of the timer's `KeFlushQueuedDpcs`.
