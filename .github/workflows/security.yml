@@ -1,7 +1,7 @@
 name: security
 
 on:
-  # No `paths-ignore`: both jobs are required checks of the `Protect main` ruleset,
+  # No `paths-ignore`: every job is a required check of the `Protect main` ruleset,
   # and a path filter would leave documentation-only pull requests waiting forever.
   pull_request:
   push:
@@ -67,3 +67,21 @@ jobs:
           tar -xzf betterleaks.tar.gz betterleaks
           ./betterleaks git . --redact --no-banner --confidence medium --config .gitleaks.toml \
             --log-opts="--all --full-history" --exit-code 1
+
+  # SECURITY.md, "Dependencies": a pull request that adds or updates a dependency with a known
+  # vulnerability (any severity) or a malware advisory is blocked. GitHub's dependency graph
+  # covers Cargo.lock and the workflows' actions. Named after what it checks.
+  dependencies:
+    # The comparison needs a pull request's base and head; on other events there is nothing to
+    # compare, and a skipped job does not block anything.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Review dependency changes against the GitHub Advisory Database
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          # Writing a summary comment would need `pull-requests: write`; the job summary is
+          # enough.
+          comment-summary-in-pr: never
