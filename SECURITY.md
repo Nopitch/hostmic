@@ -10,8 +10,9 @@ about; use a virtual machine with test signing enabled.
 
 ## Reporting a vulnerability
 
-**Please do not open a public issue.** Use GitHub's private reporting instead: on this repository,
-open the **Security** tab and choose **Report a vulnerability**. Include:
+**Please do not open a public issue.** Use GitHub's private reporting instead:
+<https://github.com/Nopitch/hostmic/security/advisories/new> (on this repository, the
+**Security** tab, then **Report a vulnerability**). Include:
 
 - what an attacker can do (crash, information disclosure, privilege escalation…);
 - the Windows version and the hostmic commit;
