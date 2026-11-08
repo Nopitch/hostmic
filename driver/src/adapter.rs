@@ -327,8 +327,8 @@ pub unsafe fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATU
             {
                 // SAFETY: the adapter's bus relations query, with its live child.
                 if let Err(status) = unsafe { host_device::report(irp, host) } {
-                    // SAFETY: a request owned by this driver, not completed yet.
-                    return unsafe { host_device::complete(irp, status, 0) };
+                    // The request goes down unchanged: the child is missing this time only.
+                    println!("hostmic: host interface not reported: {status:#010x}");
                 }
             }
         }

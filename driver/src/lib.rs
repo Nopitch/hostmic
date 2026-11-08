@@ -13,6 +13,7 @@
 //! - [`ks`]: Kernel Streaming descriptor and property helpers.
 //! - [`adapter`]: the PnP device and its subdevices.
 //! - [`host_device`]: the host interface's device object, a child of the adapter.
+//! - [`fast_io`]: the fast I/O table, kept away from the host interface.
 //! - [`topology`]: the topology miniport.
 //! - [`wave`]: the WaveRT miniport.
 //! - [`stream`]: the capture stream and its timer.
@@ -25,6 +26,7 @@ extern crate wdk_panic;
 
 pub mod adapter;
 pub mod com;
+pub mod fast_io;
 pub mod host_device;
 pub mod ks;
 pub mod stream;
@@ -84,6 +86,8 @@ pub unsafe extern "system" fn driver_entry(
         PORTCLS_DISPATCH[major].store(original, Ordering::Release);
         *routine = Some(dispatch);
     }
+    // SAFETY: once, after PortCls installed its routines, before any I/O.
+    unsafe { fast_io::install(driver) };
     // The driver's unload routine is installed whatever PortCls left there, so that the driver
     // stays unloadable; it chains to PortCls's when there is one (Microsoft's sample does the
     // same).
@@ -109,8 +113,7 @@ static PORTCLS_DISPATCH: [AtomicPtr<c_void>; IRP_MJ_MAXIMUM_FUNCTION as usize + 
 ///
 /// Called by the I/O manager with a device object of this driver and an IRP for it.
 unsafe extern "C" fn dispatch(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATUS {
-    // SAFETY: a device object of this driver.
-    if unsafe { host_device::owns(device) } {
+    if host_device::owns(device) {
         // SAFETY: a request for the host interface's PDO.
         return unsafe { host_device::dispatch(device, irp) };
     }

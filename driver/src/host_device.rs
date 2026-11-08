@@ -11,14 +11,16 @@
 //! bus relations ([`report`]) and lets it go when it is removed itself ([`detach`]).
 //!
 //! The PnP manager serializes PnP requests for a device, and removes children before their
-//! parent; create, close and device control requests may arrive at any time.
+//! parent; create, close and device control requests may arrive at any time. A request's IRP
+//! may be freed as soon as it is completed: handlers work on a copy of its stack location and
+//! hold no reference into it across the completion.
 
 use core::{
     cell::UnsafeCell,
     mem::{offset_of, size_of},
     ptr::{self, NonNull},
     slice,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
 use hostmic_abi::{GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_GET_INFO, Info};
@@ -35,9 +37,10 @@ use wdk_sys::{
     IRP_MN_QUERY_DEVICE_RELATIONS, IRP_MN_QUERY_DEVICE_TEXT, IRP_MN_QUERY_ID, IRP_MN_QUERY_POWER,
     IRP_MN_QUERY_REMOVE_DEVICE, IRP_MN_QUERY_STOP_DEVICE, IRP_MN_REMOVE_DEVICE, IRP_MN_SET_POWER,
     IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE, IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS,
-    PDEVICE_OBJECT, POOL_FLAG_PAGED, STATUS_BUFFER_TOO_SMALL, STATUS_INSUFFICIENT_RESOURCES,
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE,
-    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
+    PDEVICE_OBJECT, POOL_FLAG_PAGED, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
+    STATUS_NO_SUCH_DEVICE, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    ULONG, UNICODE_STRING,
     ntddk::{
         ExAllocatePool2, ExFreePool, IoDeleteDevice, IoRegisterDeviceInterface,
         IoSetDeviceInterfaceState, IofCompleteRequest, ObfReferenceObject, PsGetCurrentProcessId,
@@ -48,19 +51,18 @@ use wdk_sys::{
 use crate::adapter::{current_stack_location, wide};
 use crate::ks::size_ulong;
 
-/// The child's device type. The adapter's FDO is a sound device (`FILE_DEVICE_SOUND` from the
-/// INF, `FILE_DEVICE_KS` from PortCls), never this type, so [`owns`] tells them apart without
-/// reading PortCls's device extension.
+/// The child's device type.
 const DEVICE_TYPE: ULONG = FILE_DEVICE_UNKNOWN;
-
-/// The first field of a [`HostDevice`]: "hmichost" in little-endian.
-const MAGIC: u64 = u64::from_le_bytes(*b"hmichost");
 
 /// Pool tag of the PnP replies this module allocates (the PnP manager frees them): "hmic".
 const POOL_TAG: u32 = u32::from_le_bytes(*b"hmic");
 
 /// `IO_NO_INCREMENT`, as `IofCompleteRequest`'s `CCHAR`.
 const IO_NO_INCREMENT: i8 = 0;
+
+/// The live host interface PDOs, one per adapter: [`owns`] recognizes them by address, without
+/// reading anything from a device object (the adapter's FDO belongs to PortCls).
+static DEVICES: [AtomicPtr<DEVICE_OBJECT>; 4] = [const { AtomicPtr::new(ptr::null_mut()) }; 4];
 
 /// The child's device class, `{FEFD76E2-6428-43C6-A8E1-776C497C8CB4}`: administrators can
 /// override its security descriptor under this class in the registry, as for any device
@@ -94,15 +96,17 @@ static DESCRIPTION: [u16; 23] = wide("hostmic host interface");
 /// The child's device extension.
 #[repr(C)]
 pub struct HostDevice {
-    /// [`MAGIC`].
-    magic: u64,
     /// Whether the adapter still reports this child; cleared by [`detach`].
     present: AtomicBool,
-    /// Whether the PnP manager removed this child (`IRP_MN_REMOVE_DEVICE`).
+    /// Whether the adapter reported this child to the PnP manager at least once ([`report`]).
+    enumerated: AtomicBool,
+    /// Between `IRP_MN_START_DEVICE` and a stop or removal: only then can it be opened.
+    started: AtomicBool,
+    /// Whether the PnP manager removed this child (`IRP_MN_REMOVE_DEVICE`) since its last start.
     removed: AtomicBool,
     /// The interface's symbolic link name, registered on the first start. Only PnP requests
-    /// for this child and [`detach`] (the parent's removal, after the child's) touch it, and the
-    /// PnP manager serializes them.
+    /// for this child and [`delete`] (once nothing else can reach it) touch it, and the PnP
+    /// manager serializes them.
     link: UnsafeCell<UNICODE_STRING>,
 }
 
@@ -121,7 +125,8 @@ fn unicode(text: &'static [u16]) -> UNICODE_STRING {
 ///
 /// # Errors
 ///
-/// The status of `IoCreateDeviceSecure`.
+/// The status of `IoCreateDeviceSecure`, or `STATUS_INSUFFICIENT_RESOURCES` when [`DEVICES`]
+/// is full.
 ///
 /// # Safety
 ///
@@ -152,49 +157,63 @@ pub unsafe fn create(parent: PDEVICE_OBJECT) -> Result<NonNull<DEVICE_OBJECT>, N
     let device = NonNull::new(device).ok_or(STATUS_UNSUCCESSFUL)?;
     // SAFETY: a device object just created and not reported to anyone yet: unique access.
     let object = unsafe { &mut *device.as_ptr() };
-    let extension = object.DeviceExtension.cast::<HostDevice>();
     // SAFETY: the extension is `size_of::<HostDevice>()` bytes, aligned for pointers, unused.
     unsafe {
-        extension.write(HostDevice {
-            magic: MAGIC,
-            present: AtomicBool::new(true),
-            removed: AtomicBool::new(false),
-            link: UnsafeCell::new(UNICODE_STRING {
-                Length: 0,
-                MaximumLength: 0,
-                Buffer: ptr::null_mut(),
-            }),
-        });
+        object
+            .DeviceExtension
+            .cast::<HostDevice>()
+            .write(HostDevice {
+                present: AtomicBool::new(true),
+                enumerated: AtomicBool::new(false),
+                started: AtomicBool::new(false),
+                removed: AtomicBool::new(false),
+                link: UnsafeCell::new(UNICODE_STRING {
+                    Length: 0,
+                    MaximumLength: 0,
+                    Buffer: ptr::null_mut(),
+                }),
+            });
     };
     // Power requests at PASSIVE_LEVEL; the device is ready for requests.
     object.Flags |= DO_POWER_PAGABLE;
     object.Flags &= !DO_DEVICE_INITIALIZING;
+
+    // Registered before anyone can send it a request: the PnP manager only learns of it from
+    // the next bus relations query.
+    let registered = DEVICES.iter().any(|slot| {
+        slot.compare_exchange(
+            ptr::null_mut(),
+            device.as_ptr(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    });
+    if !registered {
+        // SAFETY: a device object nobody else knows of.
+        unsafe { IoDeleteDevice(device.as_ptr()) };
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     Ok(device)
 }
 
-/// Whether `device` is a host interface PDO (as opposed to the adapter's FDO).
-///
-/// # Safety
-///
-/// `device` is a device object of this driver.
-pub unsafe fn owns(device: PDEVICE_OBJECT) -> bool {
-    // SAFETY: a valid device object (caller's contract).
-    let object = unsafe { &*device };
-    if object.DeviceType != DEVICE_TYPE || object.DeviceExtension.is_null() {
-        return false;
-    }
-    // SAFETY: only this module creates devices of `DEVICE_TYPE` in this driver, with a
-    // `HostDevice` extension whose first field is the magic value.
-    unsafe { object.DeviceExtension.cast::<u64>().read() == MAGIC }
+/// Whether `device` is a host interface PDO (as opposed to the adapter's FDO). Compares
+/// addresses only.
+#[must_use]
+pub fn owns(device: PDEVICE_OBJECT) -> bool {
+    !device.is_null()
+        && DEVICES
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) == device)
 }
 
 /// The [`HostDevice`] of a host interface PDO.
 ///
 /// # Safety
 ///
-/// [`owns`] is true for `device`.
+/// [`owns`] is true for `device`, which is not deleted yet.
 unsafe fn this<'a>(device: PDEVICE_OBJECT) -> &'a HostDevice {
-    // SAFETY: a valid device object (caller's contract).
+    // SAFETY: a valid device object (caller's contract); a raw field read.
     let extension = unsafe { (*device).DeviceExtension };
     // SAFETY: the extension was initialized by `create` and lives as long as the device
     // object; all shared access goes through atomics or the `UnsafeCell`.
@@ -206,10 +225,10 @@ unsafe fn this<'a>(device: PDEVICE_OBJECT) -> &'a HostDevice {
 /// # Safety
 ///
 /// Called from a PnP request for the device whose extension is `this` (serialized), or from
-/// [`delete`] once that device is removed: no other access at the same time.
+/// [`delete`] once nothing else can reach it: no other access at the same time.
 #[allow(
     clippy::mut_from_ref,
-    reason = "the UnsafeCell's access is serialized by the PnP manager"
+    reason = "the UnsafeCell's accesses are serialized by the PnP manager"
 )]
 unsafe fn link(this: &HostDevice) -> &mut UNICODE_STRING {
     // SAFETY: the caller's contract.
@@ -221,7 +240,8 @@ unsafe fn link(this: &HostDevice) -> &mut UNICODE_STRING {
 ///
 /// # Errors
 ///
-/// `STATUS_INSUFFICIENT_RESOURCES`: the caller completes the request with it.
+/// `STATUS_INSUFFICIENT_RESOURCES`, leaving the request unchanged: the child is just not
+/// reported this time.
 ///
 /// # Safety
 ///
@@ -230,9 +250,15 @@ unsafe fn link(this: &HostDevice) -> &mut UNICODE_STRING {
 pub unsafe fn report(irp: *mut IRP, child: NonNull<DEVICE_OBJECT>) -> Result<(), NTSTATUS> {
     // SAFETY: a valid IRP owned by this driver for the call (caller's contract).
     let irp = unsafe { &mut *irp };
-    // For this query, `Information` is null or a `DEVICE_RELATIONS` from paged pool that the
-    // request's current owner owns.
-    let old = irp.IoStatus.Information as *mut DEVICE_RELATIONS;
+    // SAFETY: `Status` is the union's member for a request being processed.
+    let status = unsafe { irp.IoStatus.__bindgen_anon_1.Status };
+    // On success, `Information` is null or a `DEVICE_RELATIONS` from paged pool that the
+    // request's current owner owns (from a driver above); otherwise there is none.
+    let old = if NT_SUCCESS(status) {
+        irp.IoStatus.Information as *mut DEVICE_RELATIONS
+    } else {
+        ptr::null_mut()
+    };
     let old_objects: &[PDEVICE_OBJECT] = if old.is_null() {
         &[]
     } else {
@@ -241,7 +267,10 @@ pub unsafe fn report(irp: *mut IRP, child: NonNull<DEVICE_OBJECT>) -> Result<(),
         // SAFETY: a `DEVICE_RELATIONS` holds `Count` object pointers from `Objects` on.
         unsafe { slice::from_raw_parts(old.Objects.as_ptr(), old.Count as usize) }
     };
+    // SAFETY: the caller's contract.
+    let this = unsafe { this(child.as_ptr()) };
     if old_objects.contains(&child.as_ptr()) {
+        this.enumerated.store(true, Ordering::Release);
         return Ok(());
     }
     let count = old_objects.len() + 1;
@@ -268,11 +297,13 @@ pub unsafe fn report(irp: *mut IRP, child: NonNull<DEVICE_OBJECT>) -> Result<(),
     }
     irp.IoStatus.Information = new as u64;
     irp.IoStatus.__bindgen_anon_1.Status = STATUS_SUCCESS;
+    this.enumerated.store(true, Ordering::Release);
     Ok(())
 }
 
-/// The adapter goes away: `child` is no longer reported, and it is deleted if the PnP manager
-/// already removed it (it removes children first), else when it does.
+/// The adapter goes away: `child` is no longer reported. It is deleted now if the PnP manager
+/// already removed it (it removes the children it knows before their parent) or never learned
+/// of it; otherwise when the PnP manager removes it.
 ///
 /// # Safety
 ///
@@ -281,26 +312,30 @@ pub unsafe fn detach(child: NonNull<DEVICE_OBJECT>) {
     // SAFETY: the caller's contract.
     let this = unsafe { this(child.as_ptr()) };
     this.present.store(false, Ordering::Release);
-    if this.removed.load(Ordering::Acquire) {
-        // SAFETY: removed and no longer reported: nothing will send it requests.
+    if this.removed.load(Ordering::Acquire) || !this.enumerated.load(Ordering::Acquire) {
+        // SAFETY: removed (or never known to the PnP manager) and no longer reported: nothing
+        // will send it requests.
         unsafe { delete(child.as_ptr()) };
     }
 }
 
-/// Frees the interface's link name and deletes the device object.
+/// Unregisters the device, frees the interface's link name and deletes the device object.
 ///
 /// # Safety
 ///
-/// `device` is a host interface PDO that the PnP manager removed and that the adapter no
-/// longer reports.
+/// `device` is a host interface PDO that the PnP manager removed (or never learned of) and
+/// that the adapter no longer reports.
 unsafe fn delete(device: PDEVICE_OBJECT) {
     // SAFETY: the caller's contract.
     let this = unsafe { this(device) };
-    // SAFETY: removed: no PnP request for it is in flight.
+    // SAFETY: nothing else can reach the device any more.
     let link = unsafe { link(this) };
     if !link.Buffer.is_null() {
         // SAFETY: allocated by `IoRegisterDeviceInterface`.
         unsafe { RtlFreeUnicodeString(link) };
+    }
+    for slot in &DEVICES {
+        let _ = slot.compare_exchange(device, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire);
     }
     println!("hostmic: host interface device deleted");
     // SAFETY: the caller's contract; nothing uses the extension after this.
@@ -315,24 +350,27 @@ unsafe fn delete(device: PDEVICE_OBJECT) {
 pub unsafe fn dispatch(device: PDEVICE_OBJECT, irp: *mut IRP) -> NTSTATUS {
     // SAFETY: an IRP being dispatched to this driver.
     let stack = unsafe { current_stack_location(irp) };
-    // SAFETY: its current stack location is valid for the call.
-    let stack = unsafe { &*stack };
-    // SAFETY: the caller's contract.
-    let this = unsafe { this(device) };
+    // SAFETY: its current stack location is valid until the request completes; copied, so
+    // that nothing refers into the IRP afterwards.
+    let stack: IO_STACK_LOCATION = unsafe { stack.read() };
     match u32::from(stack.MajorFunction) {
         // SAFETY: a PnP request for this device.
-        IRP_MJ_PNP => unsafe { pnp(device, this, irp, stack) },
+        IRP_MJ_PNP => unsafe { pnp(device, irp, &stack) },
         // SAFETY: a request owned by this driver.
-        IRP_MJ_POWER => unsafe { power(irp, stack) },
+        IRP_MJ_POWER => unsafe { power(irp, &stack) },
         // No WMI: leave the request as the I/O manager initialized it.
         // SAFETY: as above.
         IRP_MJ_SYSTEM_CONTROL => unsafe { complete_unchanged(irp) },
-        // SAFETY: as above.
-        IRP_MJ_CREATE => unsafe { complete(irp, create_file(this, stack), 0) },
+        IRP_MJ_CREATE => {
+            // SAFETY: the caller's contract.
+            let status = create_file(unsafe { this(device) }, &stack);
+            // SAFETY: a request owned by this driver.
+            unsafe { complete(irp, status, 0) }
+        }
         // SAFETY: as above.
         IRP_MJ_CLEANUP | IRP_MJ_CLOSE => unsafe { complete(irp, STATUS_SUCCESS, 0) },
         // SAFETY: a device control request owned by this driver.
-        IRP_MJ_DEVICE_CONTROL => unsafe { device_control(irp, stack) },
+        IRP_MJ_DEVICE_CONTROL => unsafe { device_control(irp, &stack) },
         // SAFETY: a request owned by this driver.
         _ => unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) },
     }
@@ -362,11 +400,13 @@ pub unsafe fn complete(irp: *mut IRP, status: NTSTATUS, information: u64) -> NTS
 ///
 /// As [`complete`].
 unsafe fn complete_unchanged(irp: *mut IRP) -> NTSTATUS {
-    // SAFETY: the caller's contract.
-    let io_status = unsafe { &(*irp).IoStatus };
-    // SAFETY: `Status` is the union's member for a request being processed.
-    let status = unsafe { io_status.__bindgen_anon_1.Status };
-    // SAFETY: the caller's contract.
+    let status = {
+        // SAFETY: the caller's contract.
+        let io_status = unsafe { &(*irp).IoStatus };
+        // SAFETY: `Status` is the union's member for a request being processed.
+        unsafe { io_status.__bindgen_anon_1.Status }
+    };
+    // SAFETY: the caller's contract; the reference above is gone.
     unsafe { IofCompleteRequest(irp, IO_NO_INCREMENT) };
     status
 }
@@ -392,40 +432,43 @@ unsafe fn complete_status(irp: *mut IRP, status: NTSTATUS) -> NTSTATUS {
 ///
 /// # Safety
 ///
-/// A PnP request owned by this driver for `device`, whose extension is `this`;
-/// `PASSIVE_LEVEL`.
-unsafe fn pnp(
-    device: PDEVICE_OBJECT,
-    this: &HostDevice,
-    irp: *mut IRP,
-    stack: &IO_STACK_LOCATION,
-) -> NTSTATUS {
+/// A PnP request owned by this driver for `device`, whose stack location is copied in
+/// `stack`; `PASSIVE_LEVEL`.
+unsafe fn pnp(device: PDEVICE_OBJECT, irp: *mut IRP, stack: &IO_STACK_LOCATION) -> NTSTATUS {
     let status = match u32::from(stack.MinorFunction) {
         // SAFETY: a start request for `device`.
-        IRP_MN_START_DEVICE => unsafe { start(device, this) },
+        IRP_MN_START_DEVICE => unsafe { start(device) },
         IRP_MN_QUERY_STOP_DEVICE
         | IRP_MN_CANCEL_STOP_DEVICE
-        | IRP_MN_STOP_DEVICE
         | IRP_MN_QUERY_REMOVE_DEVICE
         | IRP_MN_CANCEL_REMOVE_DEVICE => STATUS_SUCCESS,
+        IRP_MN_STOP_DEVICE => {
+            // SAFETY: a live device of this module.
+            unsafe { this(device) }
+                .started
+                .store(false, Ordering::Release);
+            STATUS_SUCCESS
+        }
         IRP_MN_SURPRISE_REMOVAL => {
             // SAFETY: a PnP request for this device.
-            unsafe { disable_interface(this) };
+            unsafe { stop(device) };
             STATUS_SUCCESS
         }
         IRP_MN_REMOVE_DEVICE => {
             // SAFETY: a PnP request for this device.
-            unsafe { disable_interface(this) };
+            unsafe { stop(device) };
+            // SAFETY: a live device of this module.
+            let this = unsafe { this(device) };
             this.removed.store(true, Ordering::Release);
             if !this.present.load(Ordering::Acquire) {
                 // SAFETY: removed and no longer reported by the adapter. As in Microsoft's
                 // bus samples, deleted before the request completes: the I/O manager keeps
-                // the object alive while it references it.
+                // the object alive while it references it. `this` is not used afterwards.
                 unsafe { delete(device) };
             }
             STATUS_SUCCESS
         }
-        // SAFETY: the stack location of a capabilities query.
+        // SAFETY: the copied stack location of a capabilities query.
         IRP_MN_QUERY_CAPABILITIES => unsafe { capabilities(stack) },
         IRP_MN_QUERY_ID => {
             // SAFETY: the parameters of an ID query.
@@ -470,12 +513,15 @@ unsafe fn pnp(
     unsafe { complete_status(irp, status) }
 }
 
-/// `IRP_MN_START_DEVICE`: registers the interface on the first start, then enables it.
+/// `IRP_MN_START_DEVICE`: registers the interface on the first start, then enables it; the
+/// device can then be opened.
 ///
 /// # Safety
 ///
-/// A start request for `device`, whose extension is `this`.
-unsafe fn start(device: PDEVICE_OBJECT, this: &HostDevice) -> NTSTATUS {
+/// A start request for `device`.
+unsafe fn start(device: PDEVICE_OBJECT) -> NTSTATUS {
+    // SAFETY: a live device of this module.
+    let this = unsafe { this(device) };
     // SAFETY: a PnP request for this device.
     let link = unsafe { link(this) };
     if link.Buffer.is_null() {
@@ -492,15 +538,23 @@ unsafe fn start(device: PDEVICE_OBJECT, this: &HostDevice) -> NTSTATUS {
     // SAFETY: a link name registered above.
     let status = unsafe { IoSetDeviceInterfaceState(link, 1) };
     println!("hostmic: host interface enabled: {status:#010x}");
+    if NT_SUCCESS(status) {
+        // A device disabled and enabled again in Device Manager is removed, then started.
+        this.removed.store(false, Ordering::Release);
+        this.started.store(true, Ordering::Release);
+    }
     status
 }
 
-/// Disables the interface, if it was ever registered.
+/// Surprise removal or removal: no more opens, interface disabled (if it was ever registered).
 ///
 /// # Safety
 ///
-/// Called from a PnP request for the device whose extension is `this`.
-unsafe fn disable_interface(this: &HostDevice) {
+/// A PnP request for `device`.
+unsafe fn stop(device: PDEVICE_OBJECT) {
+    // SAFETY: a live device of this module.
+    let this = unsafe { this(device) };
+    this.started.store(false, Ordering::Release);
     // SAFETY: the caller's contract.
     let link = unsafe { link(this) };
     if !link.Buffer.is_null() {
@@ -514,11 +568,13 @@ unsafe fn disable_interface(this: &HostDevice) {
 ///
 /// # Safety
 ///
-/// The stack location of a capabilities query.
+/// The copied stack location of a capabilities query, whose structure the PnP manager owns
+/// until the request completes.
 unsafe fn capabilities(stack: &IO_STACK_LOCATION) -> NTSTATUS {
     // SAFETY: the parameters of a capabilities query.
     let capabilities = unsafe { stack.Parameters.DeviceCapabilities.Capabilities };
-    // SAFETY: the PnP manager passes a structure it owns for the request, possibly null.
+    // SAFETY: the PnP manager passes a structure it owns for the request, possibly null; the
+    // reference ends before the request completes.
     let Some(capabilities) = (unsafe { capabilities.as_mut() }) else {
         return STATUS_INVALID_PARAMETER;
     };
@@ -553,22 +609,19 @@ unsafe fn capabilities(stack: &IO_STACK_LOCATION) -> NTSTATUS {
 unsafe fn reply_text(irp: *mut IRP, text: &'static [u16], extra_nuls: usize) -> NTSTATUS {
     let units = text.len() + extra_nuls;
     // SAFETY: PASSIVE_LEVEL; paged pool, zeroed by `ExAllocatePool2`.
-    let copy = unsafe {
-        ExAllocatePool2(
-            POOL_FLAG_PAGED,
-            size_of_val(text) as u64 + 2 * extra_nuls as u64,
-            POOL_TAG,
-        )
-    };
+    let copy =
+        unsafe { ExAllocatePool2(POOL_FLAG_PAGED, (units * size_of::<u16>()) as u64, POOL_TAG) };
     if copy.is_null() {
         // SAFETY: the caller's contract.
         return unsafe { complete(irp, STATUS_INSUFFICIENT_RESOURCES, 0) };
     }
-    // SAFETY: `copy` holds `units` zeroed UTF-16 units, aligned by the pool.
-    let copy = unsafe { slice::from_raw_parts_mut(copy.cast::<u16>(), units) };
-    copy[..text.len()].copy_from_slice(text);
+    {
+        // SAFETY: `copy` holds `units` zeroed UTF-16 units, aligned by the pool.
+        let units = unsafe { slice::from_raw_parts_mut(copy.cast::<u16>(), units) };
+        units[..text.len()].copy_from_slice(text);
+    }
     // SAFETY: the caller's contract.
-    unsafe { complete(irp, STATUS_SUCCESS, copy.as_ptr() as u64) }
+    unsafe { complete(irp, STATUS_SUCCESS, copy as u64) }
 }
 
 /// Completes `IRP_MN_QUERY_DEVICE_RELATIONS` (`TargetDeviceRelation`) with the device itself.
@@ -616,15 +669,20 @@ unsafe fn power(irp: *mut IRP, stack: &IO_STACK_LOCATION) -> NTSTATUS {
     }
 }
 
-/// `IRP_MJ_CREATE`: the interface itself only, no name below it; nothing once removed.
+/// `IRP_MJ_CREATE`: the interface itself only, while started, never relative to another
+/// handle (which could skip the access check) nor with a name below it.
 fn create_file(this: &HostDevice, stack: &IO_STACK_LOCATION) -> NTSTATUS {
-    if this.removed.load(Ordering::Acquire) {
+    if !this.started.load(Ordering::Acquire) || this.removed.load(Ordering::Acquire) {
         return STATUS_NO_SUCH_DEVICE;
     }
-    // SAFETY: a create request carries its file object, valid for the request.
+    // SAFETY: a create request carries its file object, valid until the request completes;
+    // the reference ends before.
     let Some(file) = (unsafe { stack.FileObject.as_ref() }) else {
         return STATUS_INVALID_PARAMETER;
     };
+    if !file.RelatedFileObject.is_null() {
+        return STATUS_ACCESS_DENIED;
+    }
     if file.FileName.Length != 0 {
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -637,45 +695,50 @@ fn create_file(this: &HostDevice, stack: &IO_STACK_LOCATION) -> NTSTATUS {
 ///
 /// # Safety
 ///
-/// A device control request owned by this driver.
+/// A device control request owned by this driver, whose stack location is copied in `stack`.
 unsafe fn device_control(irp: *mut IRP, stack: &IO_STACK_LOCATION) -> NTSTATUS {
     // SAFETY: the parameters of a device control request.
     let parameters = unsafe { stack.Parameters.DeviceIoControl };
-    // SAFETY: METHOD_BUFFERED: `SystemBuffer` is the union's member, holding max(input,
-    // output) bytes, the input copied from the caller once by the I/O manager.
-    let associated = unsafe { &(*irp).AssociatedIrp };
-    // SAFETY: as above.
-    let buffer = unsafe { associated.SystemBuffer }.cast::<u8>();
-    let input = if buffer.is_null() || parameters.InputBufferLength == 0 {
-        &[][..]
-    } else {
-        // SAFETY: as above; no reference to it outlives the reply below.
-        unsafe { slice::from_raw_parts(buffer, parameters.InputBufferLength as usize) }
+    let buffer = {
+        // SAFETY: the caller's contract.
+        let associated = unsafe { &(*irp).AssociatedIrp };
+        // SAFETY: METHOD_BUFFERED: `SystemBuffer` is the union's member, holding max(input,
+        // output) bytes, the input copied from the caller once by the I/O manager.
+        unsafe { associated.SystemBuffer }.cast::<u8>()
     };
     let output = parameters.OutputBufferLength as usize;
-
-    let (name, result) = match parameters.IoControlCode {
-        IOCTL_GET_INFO => (
-            "GET_INFO",
-            host::no_input(input)
-                .and_then(|()| host::output(output, Info::SIZE))
-                .map(|()| host::info().to_bytes()),
-        ),
-        code => {
-            println!(
-                "hostmic: unknown control code {code:#010x}, process {}",
-                current_process()
-            );
-            // SAFETY: the caller's contract.
-            return unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) };
+    let (name, result) = {
+        let input = if buffer.is_null() || parameters.InputBufferLength == 0 {
+            &[][..]
+        } else {
+            // SAFETY: as above; the slice ends with this block, before the reply is written.
+            unsafe { slice::from_raw_parts(buffer, parameters.InputBufferLength as usize) }
+        };
+        match parameters.IoControlCode {
+            IOCTL_GET_INFO => (
+                "GET_INFO",
+                host::no_input(input)
+                    .and_then(|()| host::output(output, Info::SIZE))
+                    .map(|()| host::info().to_bytes()),
+            ),
+            code => {
+                println!(
+                    "hostmic: unknown control code {code:#010x}, process {}",
+                    current_process()
+                );
+                // SAFETY: the caller's contract.
+                return unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) };
+            }
         }
     };
     match result {
         Ok(reply) => {
-            // SAFETY: `output` >= the reply's size was checked, so the system buffer exists and
-            // holds it; the input slice is no longer used.
-            let out = unsafe { slice::from_raw_parts_mut(buffer, reply.len()) };
-            out.copy_from_slice(&reply);
+            {
+                // SAFETY: `output` >= the reply's size was checked, so the system buffer
+                // exists and holds it; the slice ends before the request completes.
+                let out = unsafe { slice::from_raw_parts_mut(buffer, reply.len()) };
+                out.copy_from_slice(&reply);
+            }
             // SAFETY: the caller's contract.
             unsafe { complete(irp, STATUS_SUCCESS, reply.len() as u64) }
         }
