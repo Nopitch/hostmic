@@ -142,6 +142,30 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 - **M3, a microphone that plays a tone:** port the adapter, the WaveRT capture miniport and the
   topology miniport; the driver itself fills the buffer with a sine, like the sample's tone
   generator. Done when "Microphone (hostmic)" appears in the VM and records a clean 1 kHz tone.
+  *Design (2026-11-08), deviations from the sample (read at commit `d49bb7d`):*
+  - **WDM, no KMDF.** The sample's only framework object is a `WdfDeviceMiniportCreate` device
+    used for Bluetooth bypass; without it the driver is plain PortCls. To reconsider in M4 if
+    a KMDF control device helps the host interface.
+  - **No adapter COM object, no adapter power management** (M6): the adapter state is a Rust
+    struct in the driver's own part of the device extension (`PcAddAdapterDevice` with
+    `PORT_CLASS_DEVICE_EXTENSION_SIZE` plus its size), not in PortCls's reserved part.
+  - **A plain microphone:** topology bridge pin of category `KSNODETYPE_MICROPHONE` without a
+    custom name, hence "Microphone (hostmic)"; no microphone-array geometry, SNR or sensitivity;
+    no volume or mute node (Windows applies software volume); no signal processing modes.
+  - **One format:** 48 kHz, 16-bit, stereo (the sample: 32-bit).
+  - **No lock in the real-time path:** the stream's only writer is its high-resolution timer
+    callback, which publishes the position through atomics; `GetPosition` and `GetReadPacket`
+    only read them. The position is a pure function of the performance counter since RUN.
+  - **The tone is a table:** one period of 1 kHz at 48 kHz is exactly 48 frames, computed at
+    compile time; frame `n` is `TABLE[n % 48]`, so no floating point runs in the kernel.
+  - **COM objects:** `#[repr(C)]` structs with one `&'static` vtable field per interface chain,
+    an atomic reference count, allocated in non-paged pool and freed by the last `Release`;
+    methods find their object from the interface pointer with `offset_of!`.
+  - Arithmetic that needs no kernel call lives in `hostmic-driver-core` (`no_std`, no `unsafe`,
+    MS-PL), unit-tested by `cargo test`; M4's IOCTL validation will go there too.
+  Pull requests: `hostmic-driver-core`; the adapter, the COM plumbing, the topology miniport
+  and the `MEDIA` INF; a user-mode capture checker (frequency, level, discontinuities) for the
+  VM test; the WaveRT miniport, its stream and the tone.
 - **M4, the host interface:** IOCTLs, buffer mapping, host-advanced position, unplugged without a
   host; the tone generator goes away. IOCTL input validation is pure Rust, without kernel
   calls, so that it can be unit-tested and **fuzzed** on the host with `cargo-fuzz`; a short

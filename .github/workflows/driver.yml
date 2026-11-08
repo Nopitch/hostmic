@@ -87,7 +87,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       # hostmic-sys: Rust layouts and GUIDs checked against what MSVC computes from the WDK
-      # headers.
+      # headers. hostmic-driver-core: the driver's pure logic (tone, clock, ring, packets).
       - name: Test
         run: cargo test --locked
 
