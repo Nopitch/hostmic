@@ -16,6 +16,23 @@ first, since it is the source of truth for what is being built and in which orde
   [SECURITY.md](SECURITY.md).
 - Everything is in English: code, comments, documentation, commit messages.
 
+## Coding standards
+
+- **Rust code** follows the [Rust Style Guide](https://doc.rust-lang.org/style-guide/) as
+  rustfmt applies it, with its default configuration, and the
+  [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) for public items.
+- **Lints**: clippy's `all` group is denied and `pedantic` enabled for every crate; in the
+  driver, `unsafe_op_in_unsafe_fn`, `undocumented_unsafe_blocks` and
+  `multiple_unsafe_ops_per_block` are forbidden (one unsafe operation per block, each with its
+  `// SAFETY:` comment). An exception is a local `#[allow(…, reason = "…")]` that says why.
+- **Documentation**: every public item has a doc comment (`missing_docs`); comments explain
+  why, not what.
+- **GitHub Actions workflows** pass [zizmor](https://docs.zizmor.sh/): least-privilege
+  permissions, actions pinned by full commit SHA, no untrusted data expanded in scripts.
+
+CI enforces all of it on every pull request (`cargo fmt --all --check`,
+`cargo clippy --all-targets --locked -- -D warnings`, zizmor).
+
 ## Workflow
 
 1. Open an issue to discuss anything non-trivial before writing code.
