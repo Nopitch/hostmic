@@ -1,2 +1,15 @@
 /target/
 *.pdb
+
+# Keys and certificates never belong in the repository. The driver build generates a local
+# test certificate (WDRLocalTestCert.cer); push rulesets do not exist for personal public
+# repositories, so this file, push protection and the `secrets` check are the safeguards.
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.pvk
+*.spc
+.env
+.env.*
