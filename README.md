@@ -38,6 +38,31 @@ its own bindings for the audio headers and implements the WaveRT miniport interf
 starting from Microsoft's
 [`simpleaudiosample`](https://github.com/microsoft/Windows-driver-samples/tree/main/audio/simpleaudiosample).
 
+## Quick start
+
+hostmic is experimental: try it in a virtual machine only. In about an hour, from scratch:
+
+1. **A test VM.** Create a Hyper-V virtual machine with Windows 11, turn Secure Boot off and
+   test signing on: [docs/test-vm.md](docs/test-vm.md), sections 1 and 2.
+2. **Build the driver** on your Windows machine (requirements in
+   [CONTRIBUTING.md](CONTRIBUTING.md#build-and-test)):
+
+   ```powershell
+   git clone https://github.com/Nopitch/hostmic
+   cd hostmic
+   cargo wdk build
+   ```
+
+   The test-signed package lands in `target\debug\hostmic_driver_package\`.
+3. **Install it in the VM**: copy the package and the WDK's `devcon.exe` into the VM, trust the
+   test certificate, then run `devcon install hostmic_driver.inf root\hostmic` as administrator
+   ([docs/test-vm.md](docs/test-vm.md), section 3).
+4. **Use it**: "Microphone (hostmic)" appears in Settings → System → Sound → Input. Record it
+   with any application, for example the Sound Recorder: you hear a steady 1 kHz tone (the
+   built-in test signal until the host interface exists). `tools/capture-check` measures it
+   ([docs/test-vm.md](docs/test-vm.md), section 4).
+5. **Remove it**: `devcon remove root\hostmic`.
+
 ## Licensing
 
 - The **driver** is a port of Microsoft's audio driver samples and is distributed under the
