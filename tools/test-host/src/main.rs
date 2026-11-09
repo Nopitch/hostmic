@@ -155,6 +155,13 @@ fn print_state(state: &StreamState) {
         None => "unknown",
     };
     let format = state.format;
+    if format.rate == 0 {
+        println!(
+            "stream     gen {:>5}  {name:<8} no stream",
+            state.generation
+        );
+        return;
+    }
     let sample = match SampleType::from_code(format.sample_type) {
         Some(SampleType::Int16) => "int16",
         Some(SampleType::Int24) => "int24",
