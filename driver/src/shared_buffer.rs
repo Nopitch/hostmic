@@ -30,7 +30,7 @@ use hostmic_driver_core::host::MAX_BUFFER_BYTES;
 use hostmic_sys::hostmic_map_user;
 use wdk_sys::{
     _MEMORY_CACHING_TYPE, _MM_PAGE_PRIORITY, MDL, MM_ALLOCATE_FULLY_REQUIRED, MdlMappingNoExecute,
-    PAGE_SIZE, PHYSICAL_ADDRESS,
+    NTSTATUS, PAGE_SIZE, PHYSICAL_ADDRESS, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS,
     ntddk::{
         ExFreePool, IoAllocateMdl, IoBuildPartialMdl, IoFreeMdl, MmAllocatePagesForMdlEx,
         MmFreePagesFromMdl, MmMapLockedPagesSpecifyCache, MmUnmapLockedPages,
@@ -225,19 +225,34 @@ impl BufferRef {
     }
 
     /// Maps the whole buffer into the current process, readable and writable, never
-    /// executable; `None` when it cannot be mapped.
+    /// executable.
+    ///
+    /// # Errors
+    ///
+    /// The status of the exception `MmMapLockedPagesSpecifyCache` raised, when the buffer
+    /// cannot be mapped.
     ///
     /// # Safety
     ///
     /// `PASSIVE_LEVEL`, in the context of the process that gets the mapping, which must be
     /// undone by [`BufferRef::unmap_user`] in that process's context before the process ends
     /// and before `self` is dropped.
-    #[must_use]
-    pub unsafe fn map_user(&self) -> Option<NonNull<c_void>> {
-        // SAFETY: an MDL of locked pages; the caller's contract.
-        NonNull::new(unsafe {
-            hostmic_map_user(self.get().mdl.as_ptr(), _MEMORY_CACHING_TYPE::MmCached)
-        })
+    pub unsafe fn map_user(&self) -> Result<NonNull<c_void>, NTSTATUS> {
+        let mut address = ptr::null_mut();
+        // SAFETY: an MDL of locked pages; a writable address; the caller's contract.
+        let status = unsafe {
+            hostmic_map_user(
+                self.get().mdl.as_ptr(),
+                _MEMORY_CACHING_TYPE::MmCached,
+                &raw mut address,
+            )
+        };
+        match NonNull::new(address) {
+            Some(address) if status == STATUS_SUCCESS => Ok(address),
+            // No mapping must never complete `ATTACH` as a success.
+            _ if status == STATUS_SUCCESS => Err(STATUS_INSUFFICIENT_RESOURCES),
+            _ => Err(status),
+        }
     }
 
     /// Undoes a mapping made by [`BufferRef::map_user`].

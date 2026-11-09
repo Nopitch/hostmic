@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Copies a driver package, the release tools, devcon and campaign.ps1 into the test VM, in a
-    folder of their own, and prints the command that runs the campaign there.
+    Copies a driver package, the release tools, devcon, campaign.ps1 and verifier.ps1 into the
+    test VM, in a folder of their own, and prints the command that runs the campaign there.
 
 .DESCRIPTION
     Runs on the host, as a member of Hyper-V Administrators (Copy-VMFile needs the VM's Guest
@@ -54,7 +54,7 @@ foreach ($file in 'hostmic_driver.sys', 'hostmic_driver.inf', 'hostmic_driver.ca
 foreach ($tool in 'test-host', 'capture-check', 'measure', 'handle-check', 'hostmic-ctl') {
     $files += Join-Path $Tools "$tool.exe"
 }
-$files += $Devcon, (Join-Path $PSScriptRoot 'campaign.ps1')
+$files += $Devcon, (Join-Path $PSScriptRoot 'campaign.ps1'), (Join-Path $PSScriptRoot 'verifier.ps1')
 foreach ($file in $files) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "missing $file" }
 }

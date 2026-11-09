@@ -116,8 +116,8 @@ of the build.
   lint, tests, build, fuzzing, secret scanning, workflow audit, dependency review, DCO,
   CodeQL).
 - **Defense in depth**: a memory-safe language, with every `unsafe` block justified by a
-  `// SAFETY:` comment (enforced by clippy), plus static analysis, fuzzing, VM tests and,
-  planned, Driver Verifier.
+  `// SAFETY:` comment (enforced by clippy), plus static analysis, fuzzing, VM tests and
+  Driver Verifier.
 
 ### 2.4 Common weaknesses and how they are countered
 
@@ -145,7 +145,14 @@ of the build.
 - Clippy (pedantic, `-D warnings`), with `undocumented_unsafe_blocks` and
   `multiple_unsafe_ops_per_block` forbidden in the driver; CodeQL; zizmor.
 - VM tests documented in [docs/test-vm.md](test-vm.md), including a measured recording
-  (`tools/capture-check`: frequency, level, discontinuities).
+  (`tools/capture-check`: frequency, level, discontinuities), run as a campaign of ten
+  scenarios (`tools/vm/campaign.ps1`) on the debug and the release packages.
+- Driver Verifier (M6, [docs/test-vm.md](test-vm.md), section 9): the campaign passes with the
+  driver, `portcls.sys` and `ks.sys` under the standard rule classes, DDI compliance,
+  PortCls's port/miniport rules and code integrity checks, and survives randomized allocation
+  failures without a bug check. Its first run found the host mapping requested without
+  `MdlMappingNoExecute`, a code integrity violation that a too-broad exception handler had
+  hidden (PLAN.md, M6).
 - The host crate `hostmic` (M5) under the same `unsafe` lints; its writes into the shared
   buffer are volatile, never through a Rust reference, and its pure parts (the clock, the
   ring's wrap, sample conversion) are unit-tested in CI.
@@ -154,8 +161,9 @@ of the build.
 
 ### 2.6 Known gaps and plans
 
-- Driver Verifier and an HVCI run in the test VM, sleep and resume, host crash and endurance
-  tests (M6). Fuzzing covers the pure validation code, not the kernel code that calls it.
+- An HVCI run in the test VM, the Device Fundamentals tests (IOCTL fuzzing in the kernel among
+  them), sleep and resume, and endurance tests (M6). Fuzzing covers the pure validation code,
+  not the kernel code that calls it.
 
 - A single maintainer: no second human reviewer yet (GOVERNANCE.md).
 - Release signing and provenance attestations (M7).

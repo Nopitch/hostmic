@@ -301,7 +301,7 @@ Restore-VMCheckpoint -VMName hostmic-test -Name clean-testsigning -Confirm:$fals
 
 ## 8. Run the test campaign
 
-`tools/vm/campaign.ps1` runs sections 3 to 7 in one go: it installs the package next to it,
+`tools/vm/campaign.ps1` runs sections 3 to 7 in one go (under Driver Verifier: section 9): it installs the package next to it,
 runs every scenario, prints one `PASS` or `FAIL` line per scenario (with the check that failed
 and the log to read), removes the driver, and exits with the number of failed scenarios. Each
 tool's output goes to a numbered file in a `log-<date>` folder next to the script.
@@ -338,6 +338,35 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 
 `-Only` runs a subset (in that order; without `install` the driver must already be installed,
 without `uninstall` it stays installed), `-Seconds` sets the recordings' length (default 30),
-`-Kills` the number of killed hosts. The header line `checks` says whether Driver Verifier
-verifies `hostmic_driver.sys` and whether Memory Integrity runs, so that a run's output says
-under which conditions it passed.
+`-Kills` the number of killed hosts. The header line `checks` gives Driver Verifier's settings
+for the next boot and whether Memory Integrity runs; the `install` line gives what Driver
+Verifier verifies now (its flags and drivers, from `verifier /query`), so that a run's output
+says under which conditions it passed.
+
+## 9. Run the campaign under Driver Verifier
+
+`tools/vm/verifier.ps1` (staged with the campaign) sets one of M6's Driver Verifier profiles
+for the next boot only (`verifier /bootmode oneboot`), and a kernel memory dump:
+
+| Profile | What Driver Verifier checks |
+|---|---|
+| `standard` | `hostmic_driver.sys` under rule classes 1, 2, 4, 5, 6, 9, 12, 18 (the standard classes without DMA and WDF verification), 20 (additional DDI compliance), 17 (port/miniport interface checking: PortCls's audio rules) and 26 (code integrity) |
+| `stack` | the same classes on `hostmic_driver.sys`, `portcls.sys` and `ks.sys` |
+| `low-resources` | randomized low resources simulation (class 3) on `hostmic_driver.sys`: from 8 minutes after the boot, about 6 % of its allocations fail |
+| `off`, `status` | Driver Verifier off; the settings for the next boot and what is verified now |
+
+In the VM, elevated, then restart **from Windows**:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\verifier.ps1 standard
+shutdown /r /t 0
+```
+
+Do not restart with `Restart-VM` on the host: it resets the VM (a hard reset, its default
+`-Type`), and the new settings were then lost, Driver Verifier coming back with an earlier
+profile's. After the restart (and the sign-in), run the campaign (section 8); its `install`
+line must show the profile's flags and drivers. Under `standard` and `stack` every scenario
+passes; under `low-resources` some may fail, but the system must stay up. A bug check restarts
+the VM with Driver Verifier off and leaves `C:\Windows\MEMORY.DMP`: copy the WDK's
+`Debuggers\x64` folder into the VM and run `kd -z C:\Windows\MEMORY.DMP`, then `!analyze -v`
+and `!verifier`.

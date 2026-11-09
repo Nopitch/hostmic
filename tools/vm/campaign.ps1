@@ -284,7 +284,19 @@ function Test-Install {
     $interface = Get-HostInterface
     Check ($null -ne $interface -and $interface.Status -eq 'OK') 'the host interface device is not OK'
     Check (Wait-Unplugged 20) "the microphone is not unplugged without a host (DeviceState $(Get-EndpointState))"
-    "driver $(Get-DriverState), $($adapter.InstanceId), host interface OK, microphone unplugged"
+    # What Driver Verifier verifies now, with the driver loaded: its settings may be pending a
+    # restart.
+    $query = (verifier.exe /query | Out-String)
+    Set-Content -Path (New-LogPath 'verifier-query') -Value $query
+    # The flags in effect and the drivers verified, as they are, not as they were set.
+    $flags = if ($query -match 'Verifier Flags:\s*(0x[0-9a-fA-F]+)') { $Matches[1] } else { 'none' }
+    $verifiedDrivers = @([regex]::Matches($query, '[A-Za-z0-9_]+\.sys') | ForEach-Object Value | Sort-Object -Unique)
+    $now = if ($verifiedDrivers -contains 'hostmic_driver.sys') {
+        "verified now: flags $flags, $($verifiedDrivers -join ' ')"
+    } else {
+        'not verified now'
+    }
+    "driver $(Get-DriverState), $($adapter.InstanceId), host interface OK, microphone unplugged, $now"
 }
 
 function Test-Tone {
@@ -465,15 +477,34 @@ foreach ($file in 'hostmic_driver.sys', 'hostmic_driver.inf', 'hostmic_driver.ca
 $os = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $sys = Get-Item (Join-Path $Dir 'hostmic_driver.sys')
 $hash = (Get-FileHash $sys.FullName -Algorithm SHA256).Hash.Substring(0, 16).ToLowerInvariant()
+# Driver Verifier's settings for the next boot (those of this one unless changed since without
+# a restart): its rule classes ("  9  - Security checks.", "  17 - Port/miniport interface
+# checking.") and the drivers it verifies, each listed in its own section. Whether it verifies
+# the driver now, `verifier /query` says once the driver is loaded (the install scenario).
+function Get-VerifierSection([string]$Text, [string]$Title) {
+    $inside = $false
+    foreach ($line in $Text -split "`r?`n") {
+        if ($line -match "^\s*$([regex]::Escape($Title)):\s*$") { $inside = $true; continue }
+        if (-not $inside) { continue }
+        if ($line -match '^\s*\S[^-]*:\s*$') { break }
+        if ($line.Trim()) { $line.Trim() }
+    }
+}
 $verifier = (verifier.exe /querysettings | Out-String)
 Set-Content -Path (Join-Path $LogDir '000-verifier.txt') -Value $verifier
-$verified = if ($verifier -match 'hostmic_driver\.sys') { 'on for hostmic_driver.sys' } else { 'off for hostmic_driver.sys' }
+$classes = @(Get-VerifierSection $verifier 'Active Rule Classes' | ForEach-Object { if ($_ -match '^(\d+)\s+-\s') { $Matches[1] } })
+$drivers = @(Get-VerifierSection $verifier 'Verified Drivers' | Where-Object { $_ -match '\.sys$' })
+$verified = if ($drivers -contains 'hostmic_driver.sys') {
+    "on, rule classes $($classes -join ' '), for $($drivers -join ' ')"
+} else {
+    'off for hostmic_driver.sys'
+}
 $guard = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction SilentlyContinue
 $integrity = if ($guard -and @($guard.SecurityServicesRunning) -contains 2) { 'running' } else { 'off' }
 
 "campaign   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $($env:COMPUTERNAME), Windows $($os.DisplayVersion) build $($os.CurrentBuild).$($os.UBR)"
 "package    $Dir, hostmic_driver.sys $($sys.Length) bytes, sha256 $hash..."
-"checks     driver verifier $verified; memory integrity $integrity"
+"checks     driver verifier for the next boot $verified (now: see install); memory integrity $integrity"
 "settings   $Seconds s recordings, $Kills kills; logs in $LogDir"
 ''
 
@@ -521,6 +552,10 @@ foreach ($name in $Scenarios) {
     $line
     $script:Results += [pscustomobject]@{ Name = $name; Passed = $passed }
 }
+
+# What Driver Verifier counted for the verified drivers (pool allocations, IRQL raises,
+# violations logged without a bug check).
+Set-Content -Path (Join-Path $LogDir '999-verifier-query.txt') -Value (verifier.exe /query | Out-String)
 
 $failed = @($script:Results | Where-Object { -not $_.Passed }).Count
 ''

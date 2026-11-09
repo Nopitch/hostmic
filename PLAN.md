@@ -655,9 +655,10 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     ad hoc scripts of M4 and M5, and runs on both the debug package and the release package
     (the one M7 submits for signing, built by CI).
   - **Driver Verifier** on `hostmic_driver.sys` ("Driver Verifier", "Driver Verifier
-    options", "Rules for audio drivers" on Microsoft Learn): the standard settings
-    (`/standard`: special pool, IRQL checking, pool tracking, I/O verification, deadlock
-    detection, security and miscellaneous checks, DDI compliance), port/miniport interface
+    options", "Rules for audio drivers" on Microsoft Learn): the standard rule classes (special
+    pool, IRQL checking, pool tracking, I/O verification, deadlock detection, security and
+    miscellaneous checks, DDI compliance; not DMA nor WDF verification, which do not apply to a
+    WDM driver without DMA) and the additional DDI compliance rules, port/miniport interface
     checking (`/rc 17`: PortCls's ten audio rules, `PcAllocateAndMapPages` and
     `PcUnmapAllocatedPages` among them) and code integrity checking (flag `0x02000000`:
     executable pool or mapping, writable and executable sections). The whole campaign passes
@@ -689,9 +690,10 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     statically, with the maintainer's agreement to download it.
   - **Endurance:** 4 hours of `measure load` under Driver Verifier, with the gaps'
     distribution.
-  - **Crash analysis:** complete memory dumps in the VM, read with WinDbg on the host
-    (`!analyze -v`, `!verifier`); a kernel debugger over the network (KDNET) only if a dump is
-    not enough, since it needs an external virtual switch on the maintainer's machine.
+  - **Crash analysis:** kernel memory dumps in the VM (`C:\Windows\MEMORY.DMP`), read in the
+    VM with the WDK's debugger (`kd -z`, `!analyze -v`, `!verifier`): `Copy-VMFile` copies
+    only from the host into the VM; a kernel debugger over the network (KDNET) only if a dump
+    is not enough, since it needs an external virtual switch on the maintainer's machine.
   - **Overflow checks in release** (`overflow-checks = true` in `[profile.release]`): the
     arithmetic already saturates or is checked; if one ever wraps, the release driver stops
     with a bug check that names the place instead of corrupting memory silently, as the debug
@@ -740,6 +742,34 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   bytes and gains two panic locations, `hostmic-driver-core`'s `packet.rs` and the driver's
   `com.rs` (reference counts). In the VM, the campaign passes 10 of 10 on this release package
   (latency median 10.8 ms, 0 crackle under load).
+  *Driver Verifier (2026-11-09):* `tools/vm/verifier.ps1` sets the profiles for the next boot
+  only (`/bootmode oneboot`) with a kernel dump: `standard` (`hostmic_driver.sys`, rule classes
+  1 2 4 5 6 9 12 17 18 20 26), `stack` (the same on `portcls.sys` and `ks.sys` too) and
+  `low-resources` (class 3); the campaign's `install` line shows the flags and drivers
+  `verifier /query` reports, as they are. The first run found a defect: under code integrity
+  checking every `ATTACH` was refused, so no host could play. `hostmic_map_user` mapped the
+  shared buffer into the host without `MdlMappingNoExecute`; Microsoft documents a user-mode
+  mapping as never executable and the flag as unnecessary, but Driver Verifier (and HVCI
+  alike) refuses the request ("specified an executable mapping") by raising a breakpoint, and
+  the wrapper's `__except (EXCEPTION_EXECUTE_HANDLER)` caught it and returned null, which the
+  driver reported as `STATUS_INSUFFICIENT_RESOURCES`. The wrapper now passes the flag, leaves
+  breakpoints and assertion failures to the system (a Driver Verifier violation stops it, as
+  intended) and returns the exception's status, which the refusal carries to the log and the
+  host. In the VM: `standard` and `stack` pass 10 of 10 on the debug and the release packages
+  (no bug check; latency median 10.4 to 10.9 ms, 0 crackle under load); `low-resources` (6 %
+  of the driver's allocations failing from 8 minutes after the boot, 5 failed deliberately
+  during the run) passes 9 of 10 with no bug check: in `kills`, a host's
+  `CM_Register_Notification` on its handle failed (`CONFIGRET 0x1f`) because the driver's
+  answer to `TargetDeviceRelation` could not be allocated, and `Player::follow` ended on that
+  error; the next scenarios attached and played. The driver failing a request on an
+  allocation failure is right; a player that ends on a transient failure is not (next: retry
+  the registration rather than end). Lessons: `Restart-VM` resets the VM (its default
+  `-Type`), and Driver Verifier then came back with an earlier profile's settings, so two
+  runs believed to be `stack` and `low-resources` were `standard` (found by `verifier /query`;
+  the VM restarts from Windows now); `/bootmode resetonbootfail` behaved the same way. The
+  independent review found the boot loop a persistent profile could cause, the campaign's
+  header showing the next boot's settings as the current ones, and assertion failures still
+  swallowed by the wrapper. The badge's `dynamic_analysis_unsafe` is met.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

@@ -668,11 +668,15 @@ impl HostLink {
             buffer.zero(buffer.size());
             // SAFETY: PASSIVE_LEVEL, in the host's process (the caller's contract); undone by
             // `release_host`, before the process ends (see the module documentation).
-            let Some(address) = (unsafe { buffer.map_user() }) else {
-                return Err(AttachError {
-                    status: STATUS_INSUFFICIENT_RESOURCES,
-                    reason: "the shared buffer could not be mapped",
-                });
+            let address = match unsafe { buffer.map_user() } {
+                Ok(address) => address,
+                // The memory manager's own status, so that the log and the host say why.
+                Err(status) => {
+                    return Err(AttachError {
+                        status,
+                        reason: "the shared buffer could not be mapped",
+                    });
+                }
             };
             // SAFETY: any IRQL; the current process, the host's.
             let process = unsafe { IoGetCurrentProcess() };
