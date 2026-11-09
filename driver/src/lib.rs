@@ -13,6 +13,7 @@
 //! - [`ks`]: Kernel Streaming descriptor and property helpers.
 //! - [`adapter`]: the PnP device and its subdevices.
 //! - [`host_device`]: the host interface's device object, a child of the adapter.
+//! - [`host_link`]: what the stream and the host interface share.
 //! - [`fast_io`]: the fast I/O table, kept away from the host interface.
 //! - [`topology`]: the topology miniport.
 //! - [`wave`]: the WaveRT miniport.
@@ -28,6 +29,7 @@ pub mod adapter;
 pub mod com;
 pub mod fast_io;
 pub mod host_device;
+pub mod host_link;
 pub mod ks;
 pub mod stream;
 pub mod topology;
