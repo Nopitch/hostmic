@@ -370,9 +370,14 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   position, stream no longer running) complete with `STATUS_DEVICE_NOT_READY`
   (`ERROR_NOT_READY`) and are not logged; others are logged at a bounded rate. `GET_STATS`
   and `tools/hostmic-ctl status` show the counters; `tools/test-host` plays the tone from an
-  MMCSS thread paced by the performance counter. New fuzz target: `read_packet`. In the VM:
-  `capture-check` records the host's tone for 30 s, 1000.00 Hz, -6.02 dBFS, 0 glitch, no
-  discontinuity, `PASS`, with the host's longest gap between two writes at 2.6 ms. Lessons:
+  MMCSS thread paced by the performance counter. New fuzz target: `read_packet`. In the VM,
+  with the final driver: `capture-check` records the host's tone for 30 s, 1000.00 Hz, -6.02
+  dBFS, 0 glitch, no discontinuity, `PASS`, with the host's longest gap between two writes at
+  2.6 ms, no packet skipped and no request refused; a host killed mid-capture leaves the
+  system up (the capture ends with `AUDCLNT_E_DEVICE_INVALIDATED`, the microphone shows
+  unplugged), and a new host right after passes again; `devcon remove` unloads the driver. One
+  of the six "killed, then a new host" captures reported `FAIL` with a clean level and no
+  glitch; its reason line was not kept and the next five passed: to watch for. Lessons:
   the first two runs failed on one discontinuity each, which the test host's own counters
   traced to itself: its real-time loop wrote its progress to a redirected file, and one write
   blocked for 45 ms, more than the 20 ms shared-mode buffer; printing moved to another thread.
