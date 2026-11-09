@@ -44,6 +44,9 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: none
+          # The default queries plus the security-extended suite, as microsoft/windows-drivers-rs
+          # runs it: more security queries, at the cost of a few more false positives.
+          queries: security-extended
 
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:

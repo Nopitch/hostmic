@@ -34,8 +34,10 @@ jobs:
       - name: Audit GitHub Actions workflows with zizmor
         run: |
           set -euo pipefail
-          VERSION="1.29.0"
-          SHA="dd96df044a6e8538d5f423790f453bdd03d49e5b2bcc38214acc41a2f1297839"
+          VERSION="1.32.0"
+          # The release asset's SHA-256 (GitHub release asset digest). 1.31 or later understands
+          # `cache-mode`, which the future release workflow sets to `none`.
+          SHA="bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b"
           curl -fsSL -o zizmor.tar.gz \
             "https://github.com/zizmorcore/zizmor/releases/download/v${VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
           # Verify the archive BEFORE extracting it: never run an unpinned binary.
@@ -82,6 +84,14 @@ jobs:
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: low
+          # Licenses a new or updated dependency may carry: permissive ones, compatible with
+          # the driver's MS-PL and the rest's MIT OR Apache-2.0, as SPDX identifiers; an
+          # expression passes when it can be satisfied (`MIT OR LGPL-2.1-or-later` passes
+          # through MIT). The list covers every dependency of both workspaces today; adding a
+          # license to it is a decision of its own (SECURITY.md, "Dependencies").
+          allow-licenses: >-
+            0BSD, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause,
+            BSL-1.0, CC0-1.0, ISC, MIT, NCSA, Unicode-3.0, Unlicense, Zlib
           # Writing a summary comment would need `pull-requests: write`; the job summary is
           # enough.
           comment-summary-in-pr: never
