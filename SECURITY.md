@@ -76,7 +76,9 @@ pinned by version. Dependabot raises alerts and update pull requests.
   14 days, medium within 30 days, low at the next release.
 - **License findings**: dependencies must be under licenses compatible with the project's
   (permissive OSI licenses such as MIT, Apache-2.0, BSD, ISC, Zlib, Unicode); any other license
-  is removed or replaced before merging.
+  is removed or replaced before merging. The `dependencies` check enforces it on every pull
+  request with an allow-list of SPDX identifiers (`.github/workflows/security.yml`); adding a
+  license to the list is a decision of its own, in its own pull request.
 - **Before any release**, there is no open dependency finding (vulnerability or license) above
   low severity, unless it is documented as not affecting hostmic.
 
