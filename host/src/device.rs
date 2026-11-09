@@ -372,6 +372,13 @@ impl Host {
         HANDLE(self.event.as_raw_handle())
     }
 
+    /// The handle to the host interface, for a removal notification registered on it
+    /// (`CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE`). Only the crate sees it: closing or duplicating
+    /// it would end the attachment under a writer.
+    pub(crate) fn file_handle(&self) -> HANDLE {
+        HANDLE(self.handle.as_raw_handle())
+    }
+
     /// Writes `frames` (interleaved samples in `stream`'s format, little-endian, whole frames)
     /// into the ring from stream position `from`, then advances the position past them
     /// (`ADVANCE`).
