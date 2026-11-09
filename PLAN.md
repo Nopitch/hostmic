@@ -635,6 +635,75 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   - open question: the PipeWire backend (below).
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's and M5's carried-over items (above).
+  *Design (2026-11-09):* the driver under the conditions it must survive before it is signed
+  (M7), with evidence anyone can reproduce in the test VM rather than one-off runs.
+  - **A test campaign in the repository** (`tools/vm/`, PowerShell, run in the VM): it
+    installs a package, runs every scenario and prints one `PASS` or `FAIL` line each, with the
+    reason. Scenarios: install and remove (the driver unloads); `capture-check` with
+    `test-host`; `measure latency` and `measure load`; a host killed mid-stream, N times at
+    random moments, each followed by a new host; `handle-check`'s modes; `devcon remove` while
+    a host plays, then reinstall (the host attaches again); disabling and enabling the adapter
+    and the host interface; restarting the audio service while a host plays. It replaces the
+    ad hoc scripts of M4 and M5, and runs on both the debug package and the release package
+    (the one M7 submits for signing, built by CI).
+  - **Driver Verifier** on `hostmic_driver.sys` ("Driver Verifier", "Driver Verifier
+    options", "Rules for audio drivers" on Microsoft Learn): the standard settings
+    (`/standard`: special pool, IRQL checking, pool tracking, I/O verification, deadlock
+    detection, security and miscellaneous checks, DDI compliance), port/miniport interface
+    checking (`/rc 17`: PortCls's ten audio rules, `PcAllocateAndMapPages` and
+    `PcUnmapAllocatedPages` among them) and code integrity checking (flag `0x02000000`:
+    executable pool or mapping, writable and executable sections). The whole campaign passes
+    with it on; pool tracking bug-checks an unload that leaks. A separate run with randomized
+    low-resources simulation (`/rc 3`): allocations that fail must fail requests, never the
+    system. `portcls.sys` and `ks.sys` are verified along with it in one run, for I/O
+    verification across the stack. This makes the badge's `dynamic_analysis_unsafe` met.
+  - **Device Fundamentals tests**, from the WDK (TAEF's `TE.exe`, WDTF, the `Devfund_*.dll`
+    under `Testing\Tests\Additional Tests\x64\DevFund`), run standalone in the VM ("Run
+    DevFund tests via the command line"): PnP (`PnPDTest`: disable and enable, remove,
+    cancelled remove, rebalance, surprise removal), reinstall, and IOCTL fuzzing of the host
+    interface in the kernel (`FuzzIoctlTest`), which `cargo-fuzz` cannot do: it fuzzes the
+    pure validation code only. WDTF's audio I/O plugin needs a render endpoint, which the VM
+    has none of, so the tests run with WDTF's generic I/O; `capture-check` covers the audio.
+  - **Power:** a Hyper-V guest offers neither S1-S3 nor modern standby; hibernation needs an
+    undocumented VM setting. The transition that matters on a real machine is the device's
+    own D0 → D3 → D0: PortCls's idle timer ("Audio Device Class Inactivity Timer
+    Implementation") is off by default (`ConservationIdleTime` and `PerformanceIdleTime` 0);
+    the INF sets it (`PowerSettings`, a few seconds, `IdlePowerState` 3), and the campaign
+    checks the device idles to D3 without a stream and streams again after. Adapter power
+    management (`IAdapterPowerManagement`, absent since M3) is added only if those tests need
+    it. Hibernation (`pwrtest /sleep /s:4`) is optional, if the maintainer enables it on the
+    VM.
+  - **HVCI:** Microsoft lists Secure Boot among VBS's requirements, and test signing needs it
+    off. The VM tries Memory Integrity anyway (registry, then `Win32_DeviceGuard`'s
+    `SecurityServicesRunning`); if it does not run, M6 relies on Driver Verifier's code
+    integrity checking, and the run with Memory Integrity on moves to M7, with a signed driver
+    and Secure Boot on. Microsoft's `hvciscan` (a separate download) checks the binary
+    statically, with the maintainer's agreement to download it.
+  - **Endurance:** 4 hours of `measure load` under Driver Verifier, with the gaps'
+    distribution.
+  - **Crash analysis:** complete memory dumps in the VM, read with WinDbg on the host
+    (`!analyze -v`, `!verifier`); a kernel debugger over the network (KDNET) only if a dump is
+    not enough, since it needs an external virtual switch on the maintainer's machine.
+  - **Overflow checks in release** (`overflow-checks = true` in `[profile.release]`): the
+    arithmetic already saturates or is checked; if one ever wraps, the release driver stops
+    with a bug check that names the place instead of corrupting memory silently, as the debug
+    build does.
+  - **Security review** against the rules above and `docs/security-assurance.md`'s weakness
+    table, one trust boundary at a time (Kernel Streaming, the host interface, the shared
+    memory, PnP and teardown), each by an independent review; each defect gets its own pull
+    request, and the assurance case is updated.
+  - **Carried over from M4 and M5:** Driver Verifier over attach, advance, detach and a host's
+    death, and with a crate host following a removal (the campaign); the gaps' tail over hours
+    (endurance); the isolated `capture-check` `FAIL`s (the campaign also runs right after a
+    checkpoint restore, where #51's appeared).
+  - **Not in M6:** HLK certification (WHCP), Static Driver Verifier (no Rust support), ARM64,
+    a real machine (M7).
+  Pull requests, one at a time: this design; the campaign (`tools/vm/`, `docs/test-vm.md`);
+  overflow checks in release; Driver Verifier and its fixes; Device Fundamentals; power; HVCI;
+  endurance; the security review (a pull request per defect); the closing notes. Done when the
+  campaign and the Device Fundamentals tests pass under Driver Verifier on the debug and
+  release packages, the device idles to D3 and streams again, 4 hours of load show 0 crackle,
+  and every security finding is fixed or recorded with its reason.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
