@@ -137,14 +137,47 @@ $j = Start-Job { Start-Sleep 8; C:\hostmic\devcon.exe remove root\hostmic; Start
 C:\hostmic\dbgviewcli64.exe --accepteula -k -v --no-banner -i *hostmic* --duration 35
 ```
 
-## 6. Remove the driver (VM, elevated)
+## 6. Check the host interface (VM, elevated)
+
+From milestone M4 the adapter has a child device, "hostmic host interface"
+(`HOSTMIC\Host\…`), which carries the host interface `{B2BFAFAE-4F0A-4295-B39B-E6B9F62EE08A}`.
+Build `tools/hostmic-ctl` on the host (`cargo build -p hostmic-ctl --release`), copy
+`target\release\hostmic-ctl.exe` to `C:\hostmic\`, then in the VM:
+
+```powershell
+Get-PnpDevice -PresentOnly | Where-Object InstanceId -like HOSTMIC*
+pnputil /enum-interfaces /class '{B2BFAFAE-4F0A-4295-B39B-E6B9F62EE08A}'
+C:\hostmic\hostmic-ctl.exe info
+```
+
+Expected: the device `OK` (no setup class: it is a raw device, started without a driver); the
+interface `Enabled`; `hostmic-ctl info` prints its path, ABI version 1, a maximum buffer of
+192000 bytes, 48000 Hz, 2 ch, int16, and exits with 0.
+
+The interface is open to the system, administrators and interactive users only. To check that
+anyone else is refused, run the tool as `NETWORK SERVICE` through a scheduled task:
+
+```powershell
+$a = New-ScheduledTaskAction -Execute cmd.exe -Argument '/c C:\hostmic\hostmic-ctl.exe info > C:\hostmic\ns.txt 2>&1'
+Register-ScheduledTask -TaskName hmicns -Action $a -User 'NT AUTHORITY\NETWORK SERVICE' -Force
+Start-ScheduledTask hmicns; Start-Sleep 4; Get-Content C:\hostmic\ns.txt
+Unregister-ScheduledTask hmicns -Confirm:$false
+```
+
+Expected: the interface is listed, and opening it fails with `Access is denied.
+(0x80070005)`. Disabling the child device (`Disable-PnpDevice`) makes the interface disappear
+(`hostmic-ctl info` exits with 1); enabling it again makes it answer again.
+
+## 7. Remove the driver (VM, elevated)
 
 ```powershell
 C:\hostmic\devcon.exe remove root\hostmic
 sc.exe query hostmic
 ```
 
-Expected: `1 device(s) were removed` and the service `STOPPED`: the driver is unloaded.
+Expected: `1 device(s) were removed` and the service `STOPPED`: the driver is unloaded, which
+also shows that the host interface's child device was deleted (a device object left behind
+would keep the driver loaded).
 
 The device is root-enumerated: `pnputil /add-driver` alone stages the package but creates no
 device node, hence `devcon`.

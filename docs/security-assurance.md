@@ -15,8 +15,8 @@ says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
   read or write kernel memory, or memory of another process.
 - **Only the attached host gets the buffer.** From M4, the client's audio buffer is mapped into
   one process only, the host that attached through the host interface, and unmapped when that
-  host detaches or dies. Opening the host interface is restricted to administrators and the
-  interactive user.
+  host detaches or dies. Opening the host interface is restricted to the system, administrators
+  and interactive users, enforced by the I/O manager on a device object of its own.
 - **Malformed input is rejected, not trusted.** Unsupported formats, pins, property sizes and
   values are refused with an error status; the driver accepts one exactly specified format.
 - **A stable system.** The driver does no allocation, takes no lock and does no I/O in its
@@ -67,8 +67,11 @@ of the build.
    client-supplied data format. Each handler checks instance and value sizes before reading or
    writing; data formats are parsed by `hostmic_driver_core::format`, pure Rust with no kernel
    call, unit-tested on every truncation of a valid format.
-2. **User mode → kernel, through the host interface** (M4): IOCTL input validation in pure Rust,
-   unit-tested and fuzzed (PLAN.md, M4); user buffers copied once, then validated.
+2. **User mode → kernel, through the host interface** (M4): a raw child device of the adapter
+   with its own security descriptor (`IoCreateDeviceSecure`, `FILE_DEVICE_SECURE_OPEN`); opens
+   relative to another handle refused; its requests, IRPs and fast I/O alike, never reach
+   PortCls. IOCTL input validation in pure Rust, unit-tested and fuzzed (PLAN.md, M4); user
+   buffers copied once (`METHOD_BUFFERED`), then validated.
 3. **Shared memory** (M4): the ring buffer mapped into the host; the driver never reads data back
    from it to make decisions.
 4. **PortCls → miniport**: COM-style calls, possibly concurrent; reference counting and the
