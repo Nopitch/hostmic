@@ -6,6 +6,8 @@ body:
     attributes:
       value: |
         Security vulnerabilities must be reported privately: see SECURITY.md.
+        Only the first fields are required; the others make most problems diagnosable without
+        a round trip. The driver must only run in a virtual machine (docs/test-vm.md).
   - type: textarea
     id: what
     attributes:
@@ -26,8 +28,39 @@ body:
       label: hostmic commit or version
     validations:
       required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host application
+      description: What fed the microphone (tools/test-host, another application), and its version.
+      placeholder: tools/test-host at the same commit
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of hostmic-ctl status
+      description: >
+        Run `hostmic-ctl status` while the problem shows (stream state, generation, counters,
+        last refused request and its reason).
+      render: text
+  - type: textarea
+    id: capture
+    attributes:
+      label: Output of capture-check, or of the host
+      description: >
+        For audio problems: the whole output of `capture-check` (its `engine:` line gives the
+        reason for a FAIL), and the host's own output (test-host's `playing` and `late` lines).
+      render: text
+  - type: textarea
+    id: crash
+    attributes:
+      label: Crash (blue screen)
+      description: >
+        The bug check code and its four parameters, or the output of `!analyze -v` on the dump.
+        In a Hyper-V VM the host logs them: Hyper-V-Worker-Admin, event 18590.
+      render: text
   - type: textarea
     id: logs
     attributes:
-      label: Logs, crash dump analysis, steps to reproduce
+      label: Driver messages, other logs, steps to reproduce
+      description: The driver's `hostmic:` lines from DebugView (docs/test-vm.md, section 5), and anything else.
       render: text

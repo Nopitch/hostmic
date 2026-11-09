@@ -33,6 +33,31 @@ first, since it is the source of truth for what is being built and in which orde
 CI enforces all of it on every pull request (`cargo fmt --all --check`,
 `cargo clippy --all-targets --locked -- -D warnings`, zizmor).
 
+## Maintainer availability
+
+hostmic has one maintainer, working on it in spare time ([GOVERNANCE.md](GOVERNANCE.md)). Expect a
+first answer to an issue or a pull request within **7 days**: an acknowledgement, a question, or
+a reason why it does not fit. A review can take longer; a pull request is never left without an
+answer. Security reports follow their own timeline ([SECURITY.md](SECURITY.md)).
+
+## What helps most now
+
+hostmic is experimental ([PLAN.md](PLAN.md) has the roadmap and what comes next). The most
+useful contributions today:
+
+- **Testing in a virtual machine** on Windows versions and hardware set-ups the maintainer does
+  not have, following [docs/test-vm.md](docs/test-vm.md), and reporting what you measured
+  (`hostmic-ctl status`, `capture-check`).
+- **Reviewing kernel code**: pull requests that touch the driver are read line by line, and a
+  second pair of eyes is welcome on any of them.
+- **Documentation**: what was unclear, wrong or missing when you set it up.
+- **Hosts**: applications that feed the microphone, and feedback on the host interface
+  (`hostmic-abi`) before the host library (M5) settles it.
+
+Issues labeled [`good first issue`](https://github.com/Nopitch/hostmic/labels/good%20first%20issue)
+are small and self-contained. Questions go to
+[Discussions](https://github.com/Nopitch/hostmic/discussions), bugs to issues.
+
 ## Workflow
 
 1. Open an issue to discuss anything non-trivial before writing code.
