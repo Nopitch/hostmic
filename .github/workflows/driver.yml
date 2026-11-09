@@ -138,6 +138,14 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-
 
+      # cargo-wdk creates its throwaway test certificate in the runner's certificate store only
+      # when `target/<profile>/WDRLocalTestCert.cer` is missing: a certificate file restored
+      # from the cache, without the store that went with it, makes signing fail. The cache must
+      # never carry it (removed before saving too).
+      - name: Remove a cached test certificate
+        shell: pwsh
+        run: Remove-Item -Force target\*\WDRLocalTestCert.cer -ErrorAction SilentlyContinue
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -201,6 +209,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "cargo clean -p $package failed" }
           }
           Remove-Item -Recurse -Force target\debug\hostmic_driver_package -ErrorAction SilentlyContinue
+          Remove-Item -Force target\*\WDRLocalTestCert.cer -ErrorAction SilentlyContinue
 
       - name: Save the Cargo cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
