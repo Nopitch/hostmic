@@ -5,22 +5,26 @@
 //! state is a plain struct in the driver's own part of the device extension, after the part
 //! PortCls reserves for itself.
 
-use core::{ffi::c_void, ptr};
+use core::{
+    ffi::c_void,
+    ptr::{self, NonNull},
+};
 
 use hostmic_sys::{
-    IPort, PPORT, PRESOURCELIST, PcAddAdapterDevice, PcDispatchIrp, PcNewPort,
-    PcRegisterPhysicalConnection, PcRegisterSubdevice, guid,
+    IPort, PPORT, PRESOURCELIST, PcAddAdapterDevice, PcDispatchIrp, PcGetPhysicalDeviceObject,
+    PcNewPort, PcRegisterPhysicalConnection, PcRegisterSubdevice, guid,
 };
 use wdk::println;
 use wdk_sys::{
-    DEVICE_OBJECT, DRIVER_OBJECT, GUID, IRP, IRP_MN_REMOVE_DEVICE, IRP_MN_STOP_DEVICE,
-    IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS, PDEVICE_OBJECT, PIRP,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG,
+    _DEVICE_RELATION_TYPE, DEVICE_OBJECT, DRIVER_OBJECT, GUID, IRP, IRP_MN_QUERY_DEVICE_RELATIONS,
+    IRP_MN_REMOVE_DEVICE, IRP_MN_STOP_DEVICE, IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS,
+    PDEVICE_OBJECT, PIRP, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    ULONG, ntddk::IoInvalidateDeviceRelations,
 };
 
 use crate::com::Unknown;
 use crate::ks::size_ulong;
-use crate::{topology, wave};
+use crate::{host_device, topology, wave};
 
 /// Bytes at the start of the device extension that belong to PortCls: `portcls.h`'s
 /// `PORT_CLASS_DEVICE_EXTENSION_SIZE`, `64 * sizeof(ULONG_PTR)`.
@@ -48,6 +52,9 @@ struct Adapter {
     /// The ports of the registered filters; dropping them releases the driver's references.
     topology_port: Option<Unknown>,
     wave_port: Option<Unknown>,
+    /// The host interface's PDO, created on the first start and reported in the bus
+    /// relations until the adapter is removed ([`host_device`]).
+    host: Option<NonNull<DEVICE_OBJECT>>,
 }
 
 /// The adapter of a device created by [`add_device`].
@@ -105,6 +112,20 @@ unsafe extern "C" fn start_device(
             let adapter = unsafe { adapter(device) };
             adapter.topology_port = Some(topology_port);
             adapter.wave_port = Some(wave_port);
+            if adapter.host.is_none() {
+                // SAFETY: `device` is the adapter's FDO, at PASSIVE_LEVEL.
+                match unsafe { host_device::create(device) } {
+                    Ok(host) => {
+                        adapter.host = Some(host);
+                        // SAFETY: as above.
+                        unsafe { enumerate_children(device) };
+                    }
+                    // The microphone works without its host interface; say why it is missing.
+                    Err(status) => {
+                        println!("hostmic: host interface not created: {status:#010x}");
+                    }
+                }
+            }
             STATUS_SUCCESS
         }
         Err(status) => status,
@@ -250,29 +271,68 @@ unsafe fn port_init(
     }
 }
 
-/// `IRP_MJ_PNP` dispatch: releases the driver's references to the ports when the device stops
-/// or goes away, then lets PortCls handle the request (Microsoft's `PnpHandler`).
+/// Asks the PnP manager to query the adapter's bus relations, which now include the host
+/// interface's PDO.
 ///
 /// # Safety
 ///
-/// Called by the I/O manager with a valid device object of this driver and a PnP IRP.
-pub unsafe extern "C" fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATUS {
+/// `device` is the adapter's FDO; `PASSIVE_LEVEL`.
+unsafe fn enumerate_children(device: PDEVICE_OBJECT) {
+    let mut physical: PDEVICE_OBJECT = ptr::null_mut();
+    // SAFETY: `device` is a PortCls FDO; `physical` is a writable out-parameter.
+    let status = unsafe { PcGetPhysicalDeviceObject(device, &raw mut physical) };
+    if !NT_SUCCESS(status) || physical.is_null() {
+        println!("hostmic: no physical device object: {status:#010x}");
+        return;
+    }
+    // SAFETY: the adapter's PDO, at PASSIVE_LEVEL.
+    unsafe { IoInvalidateDeviceRelations(physical, _DEVICE_RELATION_TYPE::BusRelations) };
+}
+
+/// `IRP_MJ_PNP` dispatch for the adapter's FDO: releases the driver's references to the ports
+/// when the device stops or goes away, reports the host interface's PDO as its child, then
+/// lets PortCls handle the request (Microsoft's `PnpHandler`).
+///
+/// # Safety
+///
+/// Called by the driver's dispatch routine with the adapter's FDO and a PnP IRP.
+pub unsafe fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATUS {
     // SAFETY: `irp` is a valid IRP being dispatched to this driver.
     let stack = unsafe { current_stack_location(irp) };
-    // SAFETY: an IRP being dispatched has a valid current stack location.
-    let minor = unsafe { (*stack).MinorFunction };
-    if matches!(
-        u32::from(minor),
-        IRP_MN_REMOVE_DEVICE | IRP_MN_SURPRISE_REMOVAL | IRP_MN_STOP_DEVICE
-    ) {
-        // SAFETY: `device` is the adapter's FDO (this driver creates no other device), in a
-        // PnP request.
-        let adapter = unsafe { adapter(device) };
-        let topology = adapter.topology_port.take();
-        let wave = adapter.wave_port.take();
-        if topology.is_some() || wave.is_some() {
-            println!("hostmic: device stopping (minor function {minor:#04x}), ports released");
+    // SAFETY: an IRP being dispatched has a valid current stack location for the call.
+    let stack = unsafe { &*stack };
+    let minor = stack.MinorFunction;
+    // SAFETY: `device` is the adapter's FDO (the driver's dispatch routine sends the host
+    // interface's requests elsewhere), in a PnP request.
+    let adapter = unsafe { adapter(device) };
+    match u32::from(minor) {
+        IRP_MN_REMOVE_DEVICE | IRP_MN_SURPRISE_REMOVAL | IRP_MN_STOP_DEVICE => {
+            let topology = adapter.topology_port.take();
+            let wave = adapter.wave_port.take();
+            if topology.is_some() || wave.is_some() {
+                println!("hostmic: device stopping (minor function {minor:#04x}), ports released");
+            }
+            if u32::from(minor) == IRP_MN_REMOVE_DEVICE
+                && let Some(host) = adapter.host.take()
+            {
+                // SAFETY: the live host interface PDO, in the adapter's removal.
+                unsafe { host_device::detach(host) };
+            }
         }
+        IRP_MN_QUERY_DEVICE_RELATIONS => {
+            // SAFETY: the parameters of a relations query.
+            let relation = unsafe { stack.Parameters.QueryDeviceRelations.Type };
+            if relation == _DEVICE_RELATION_TYPE::BusRelations
+                && let Some(host) = adapter.host
+            {
+                // SAFETY: the adapter's bus relations query, with its live child.
+                if let Err(status) = unsafe { host_device::report(irp, host) } {
+                    // The request goes down unchanged: the child is missing this time only.
+                    println!("hostmic: host interface not reported: {status:#010x}");
+                }
+            }
+        }
+        _ => {}
     }
     // SAFETY: forwards the request PortCls installed itself for.
     unsafe { PcDispatchIrp(device, irp) }
@@ -283,7 +343,7 @@ pub unsafe extern "C" fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP)
 /// # Safety
 ///
 /// `irp` is a valid IRP owned by the caller's driver for the duration of the call.
-unsafe fn current_stack_location(irp: *mut IRP) -> *mut wdk_sys::IO_STACK_LOCATION {
+pub(crate) unsafe fn current_stack_location(irp: *mut IRP) -> *mut wdk_sys::IO_STACK_LOCATION {
     // SAFETY: `irp` is valid (caller's contract); only the field's address is taken.
     let overlay = unsafe { &raw const (*irp).Tail.Overlay };
     // SAFETY: `overlay` points into the valid IRP; only the field's address is taken.
@@ -300,7 +360,7 @@ unsafe fn current_stack_location(irp: *mut IRP) -> *mut wdk_sys::IO_STACK_LOCATI
 }
 
 /// A NUL-terminated UTF-16 copy of the ASCII string `s`, at compile time.
-const fn wide<const N: usize>(s: &str) -> [u16; N] {
+pub(crate) const fn wide<const N: usize>(s: &str) -> [u16; N] {
     let bytes = s.as_bytes();
     assert!(
         bytes.len() + 1 == N,

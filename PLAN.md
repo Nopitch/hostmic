@@ -279,6 +279,19 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   `tools/capture-check` records cleanly from "Microphone (hostmic)", the microphone shows
   unplugged without a host, killing the host mid-capture leaves the system up, and fuzzing runs
   in CI.
+  *Child PDO and host interface done (2026-11-09):* `driver/src/host_device.rs` creates the
+  child (`HOSTMIC\Host`, "hostmic host interface") in the adapter's `StartDevice`, reports it
+  in `BusRelations` and answers its PnP and power requests as its bus driver; the interface
+  answers `GET_INFO`; `tools/hostmic-ctl info` prints it. The driver's dispatch routine wraps
+  all 28 major functions and PortCls's fast I/O table, so that nothing of the child ever
+  reaches PortCls; the child is recognized by address. Opens are refused before the child
+  starts, after it stops, and relative to another handle. In the VM: the child is `OK` (raw,
+  no setup class), the interface enabled, `NETWORK SERVICE` refused with `ACCESS_DENIED`,
+  disabling and enabling the child in Device Manager works, the tone still passes
+  `capture-check`, and `devcon remove` unloads the driver. Lessons: PortCls forwards the
+  adapter's `BusRelations` query down untouched, so adding the child before calling
+  `PcDispatchIrp` is enough; an independent review found that the first version forgot fast
+  I/O, relative opens and re-enabling, and could leak a child never enumerated.
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and

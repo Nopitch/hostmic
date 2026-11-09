@@ -1,5 +1,12 @@
 [workspace]
-members = ["abi", "driver", "driver-core", "hostmic-sys", "tools/capture-check"]
+members = [
+    "abi",
+    "driver",
+    "driver-core",
+    "hostmic-sys",
+    "tools/capture-check",
+    "tools/hostmic-ctl",
+]
 resolver = "3"
 # Fuzz targets: a workspace of their own, built with nightly by cargo-fuzz.
 exclude = ["fuzz"]

@@ -56,9 +56,13 @@ pub mod guid {
     include!(concat!(env!("OUT_DIR"), "/guids.rs"));
 }
 
-// The driver links PortCls; this crate's own test binary does not run in the kernel.
+// The driver links PortCls and `wdmsec.lib` (`WdmlibIoCreateDeviceSecure`, a static library);
+// this crate's own test binary does not run in the kernel.
 #[cfg(not(test))]
 #[link(name = "portcls")]
+unsafe extern "C" {}
+#[cfg(not(test))]
+#[link(name = "wdmsec")]
 unsafe extern "C" {}
 
 #[cfg(test)]

@@ -273,9 +273,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostmic-ctl"
+version = "0.1.0"
+dependencies = [
+ "hostmic-abi",
+ "windows",
+]
+
+[[package]]
 name = "hostmic-driver"
 version = "0.1.0"
 dependencies = [
+ "hostmic-abi",
  "hostmic-driver-core",
  "hostmic-sys",
  "wdk",
