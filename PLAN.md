@@ -230,20 +230,24 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     only the attached host's process may advance. Hosts are 64-bit processes: for a 32-bit
     one the buffer could be mapped out of reach. The validation of every request is pure Rust
     in `hostmic-driver-core`, unit-tested and fuzzed.
-  - **One buffer for the whole attachment.** WaveRT allocates a buffer per stream and frees it
+  - **One buffer for the adapter's life.** WaveRT allocates a buffer per stream and frees it
     when the stream closes; mapping that buffer into the host would mean taking it away while
-    the host writes. Instead the driver owns one buffer (1 s at most of the largest format),
-    reference-counted by the host and the stream, mapped once into the host on `ATTACH`;
-    `AllocateAudioBuffer` returns an MDL over it. The audio engine requires the actual size to
-    be at least the requested one, so a larger request fails. To check in the VM: that the
-    engine accepts an MDL the miniport built itself (the documentation describes the port's
-    allocators). The driver no longer writes audio: it zeroes the buffer and nothing else.
+    the host writes. Instead the adapter owns one buffer (1 s at most of the largest format,
+    rounded up to whole pages), allocated at its first start and reference-counted by the
+    adapter, each stream buffer and the host's mapping; a host that detaches and attaches again
+    while a stream runs finds the same pages (a buffer per attachment, the first idea, would
+    have left a running stream on the old one). `AllocateAudioBuffer` returns a partial MDL
+    over its start. The audio engine requires the actual size to be at least the requested
+    one, so a larger request fails. The driver no longer writes audio: it zeroes the buffer and
+    nothing else.
   - **Mapping into the host:** `MmMapLockedPagesSpecifyCache` in user mode raises an exception
     on failure and Rust cannot catch structured exceptions, so a C function of a few lines,
     compiled with `cc`, wraps it in `__try`/`__except`; user mappings are never executable. The
-    mapping is undone in the host's context, on detach or on the handle's cleanup, and a process
-    notification routine covers a host that dies while another process holds a duplicate of its
-    handle (to confirm in the documentation before writing it).
+    mapping is undone in the host's process: on `DETACH`, on the handle's cleanup or close (in
+    whatever process closes it last, attaching to the host's), and from a process notification
+    routine (`PsSetCreateProcessNotifyRoutineEx`, hence `/INTEGRITYCHECK`) when the host's
+    process exits while another process holds a duplicate of its handle; it runs in the dying
+    process before its address space goes, and attach and detach share a lock with it.
   - **The host advances the position, without a lock:** the stream's generation and position
     share one 64-bit word (an even generation accepts frames, an odd one does not; writers
     halt the generation before changing anything else), and `ADVANCE` moves it with one

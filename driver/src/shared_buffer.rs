@@ -164,12 +164,21 @@ impl BufferRef {
         BYTES
     }
 
-    /// Writes zeroes over the first `bytes` bytes (at most the whole buffer).
+    /// Writes zeroes over the first `bytes` bytes (at most the whole buffer), rounded down to
+    /// whole 32-bit words.
+    ///
+    /// The pages are shared memory: the host and the audio engine access them through their
+    /// own mappings, and the stream's timer may write the test tone meanwhile. Like a device's
+    /// memory, they are only ever written through volatile accesses of aligned words, never
+    /// through a Rust reference.
     pub fn zero(&self, bytes: usize) {
-        // SAFETY: the system mapping holds `BYTES` bytes, `bytes` is capped to it. The host and
-        // the audio engine access the same pages through their own mappings, outside Rust's
-        // memory model, like a device's DMA.
-        unsafe { self.system().write_bytes(0, bytes.min(BYTES)) };
+        #[allow(clippy::cast_ptr_alignment, reason = "the mapping is page-aligned")]
+        let words = self.system().cast::<u32>();
+        for index in 0..bytes.min(BYTES) / 4 {
+            let word = words.wrapping_add(index);
+            // SAFETY: within the system mapping (`BYTES` bytes), aligned (page-aligned base).
+            unsafe { word.write_volatile(0) };
+        }
     }
 
     /// A new MDL over the buffer's first `bytes` bytes, for a stream; freed with

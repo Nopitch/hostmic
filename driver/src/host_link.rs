@@ -16,7 +16,7 @@
 //! process ends: on `DETACH`, on the handle's cleanup or close (in whatever process closes it,
 //! attaching to the host's), and, for a host that dies while another process holds a duplicate
 //! of its handle, from the process notification routine ([`driver_init`]), which runs in the
-//! dying process before its address space goes. Attaching and detaching are serialized by a
+//! context of the dying process's last thread. Attaching and detaching are serialized by a
 //! guarded mutex, so that the notification routine returns only once the mapping is undone.
 //!
 //! The link lives in the adapter's device extension, whose memory outlives its holders: an
@@ -150,15 +150,33 @@ impl HostLink {
         })
     }
 
-    /// On the adapter's removal (`PASSIVE_LEVEL`): leaves the registry and releases the
-    /// adapter's reference to the shared buffer (streams and a host mapping keep theirs).
+    /// On the adapter's removal (`PASSIVE_LEVEL`): no host may attach any more, a host still
+    /// attached is detached (its mapping undone in its process), the link leaves the registry,
+    /// and the adapter's reference to the shared buffer is released (streams keep theirs).
     pub fn shutdown(&self) {
-        if self.registered.swap(false, Ordering::AcqRel) {
-            unregister(self);
+        // Never started (the start failed before `init`): nothing to undo, and the locks were
+        // never initialized. PnP requests for the adapter are serialized, so `init` cannot run
+        // meanwhile.
+        if self.cursor.load(Ordering::Acquire) == 0 {
+            return;
         }
-        let buffer = with_lock(&self.host_lock, || {
-            self.buffer.swap(ptr::null_mut(), Ordering::AcqRel)
+        let (detached, buffer) = with_lock(&self.host_lock, || {
+            // `attach` checks this under the same lock.
+            self.registered.store(false, Ordering::Release);
+            let attached = !self.host.load(Ordering::Acquire).is_null();
+            if attached {
+                println!("hostmic: adapter removed with a host attached");
+                self.release_host();
+            }
+            (
+                attached,
+                self.buffer.swap(ptr::null_mut(), Ordering::AcqRel),
+            )
         });
+        if detached {
+            self.jack_changed();
+        }
+        unregister(self);
         // SAFETY: the adapter's reference, taken out of the link above.
         drop(unsafe { BufferRef::from_raw(buffer) });
     }
@@ -462,8 +480,14 @@ impl HostLink {
     }
 
     /// The process notification routine saw `process` exit: detaches the host if it is that
-    /// process's. Runs in the exiting process, before its address space goes.
+    /// process's. Runs in the exiting process's last thread (see [`process_notify`]).
     fn process_exited(&self, process: PEPROCESS) {
+        // Every other process's exit returns here, without the lock: only a thread of the host's
+        // process stores it (`attach` requires the requestor to be the current process), and
+        // when this runs, no other thread of `process` is left to store it.
+        if self.process.load(Ordering::Acquire) != process {
+            return;
+        }
         let detached = with_lock(&self.host_lock, || {
             let host = self.process.load(Ordering::Acquire);
             if host.is_null() || host != process {
@@ -619,7 +643,20 @@ fn unregister(link: &HostLink) {
 }
 
 /// The process notification routine: when a process exits, any host it is the process of is
-/// detached, its mapping undone while the process's address space still exists.
+/// detached and its mapping undone.
+///
+/// The documentation says the routine runs "in the context of the last thread to exit from the
+/// process", at `PASSIVE_LEVEL` in a critical region, and is called "typically when the last
+/// thread within a process has terminated and the process address space is about to be
+/// deleted": the unmapping relies on the address space still being there, which the VM test
+/// observes (the host's mapping is undone without a crash); Driver Verifier is for M6.
+///
+/// Microsoft advises against synchronizing with other threads here. Every exit takes the
+/// registry's lock, held only briefly by an adapter's start and removal, and returns before any
+/// other lock unless the exiting process is the host's ([`HostLink::process_exited`]); the
+/// host's own exit then takes its link's lock, which another thread holds at most for one
+/// attach or detach (none of which waits on a process exit), and generates the jack event,
+/// which signals events without waiting.
 ///
 /// # Safety
 ///
