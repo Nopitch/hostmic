@@ -122,9 +122,9 @@ $h = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','70' -Pass
 C:\hostmic\capture-check.exe --seconds 60
 ```
 
-From milestone M4 the microphone is unplugged without a host, so a host (`tools/test-host`,
-section 6) runs in the background while recording. Expected (the driver's own tone, until the
-host feeds the audio): 1000.00 Hz, peak -6.02 dBFS, RMS -9.03 dBFS, identical channels, no
+From milestone M4 the microphone is unplugged without a host and the driver produces no
+audio: `tools/test-host` (section 6) plays the tone and runs in the background while
+recording. Expected: 1000.00 Hz, peak -6.02 dBFS, RMS -9.03 dBFS, identical channels, no
 discontinuity flag, no silent packet, no glitch, `PASS`.
 
 ## 5. Read the driver's messages (VM, elevated)
@@ -171,29 +171,35 @@ Expected: the interface is listed, and opening it fails with `Access is denied.
 (0x80070005)`. Disabling the child device (`Disable-PnpDevice`) makes the interface disappear
 (`hostmic-ctl info` exits with 1); enabling it again makes it answer again.
 
-`tools/test-host` attaches as the host and prints the capture stream's state each time the
-driver signals a change. Build it on the host (`cargo build -p hostmic-test-host --release`),
-copy `target\release\test-host.exe` to `C:\hostmic\`, then in the VM run it in the background
-while recording:
+`tools/test-host` attaches as the host and plays a 1 kHz tone at -6.02 dBFS: while the stream
+runs, a thread registered with MMCSS writes the frames due by the performance counter into the
+shared buffer and advances the position (`ADVANCE`) about once a millisecond. It prints the
+stream's state at each change, its progress once a second, and the driver's counters at the
+end. Build it on the host (`cargo build -p hostmic-test-host --release`), copy
+`target\release\test-host.exe` to `C:\hostmic\`, then in the VM run it in the background while
+recording:
 
 ```powershell
-$p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','12' -RedirectStandardOutput C:\hostmic\h.txt -PassThru -WindowStyle Hidden
+$p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','45' -RedirectStandardOutput C:\hostmic\h.txt -PassThru -WindowStyle Hidden
 Start-Sleep 2
 C:\hostmic\test-host.exe --seconds 1
-C:\hostmic\capture-check.exe --seconds 4
-$p | Wait-Process; Get-Content C:\hostmic\h.txt
+$c = Start-Job { C:\hostmic\capture-check.exe --seconds 30 }
+Start-Sleep 12; C:\hostmic\hostmic-ctl.exe status
+Receive-Job $c -Wait; $p | Wait-Process; Get-Content C:\hostmic\h.txt
 ```
 
 Expected: the second `test-host` fails with `ATTACH: The requested resource is in use.
-(0x800700AA)` (one host at a time); the first prints `attached` with the address of the shared
-buffer in its process (page-aligned, 192000 bytes), then one line per change with a growing
-generation: `stopped` (stream created, 48000 Hz 2 ch int16), `paused` with its buffer (960
-frames, packets of 480 in shared mode), `running`, `paused`, `stopped`, `no stream`, then
-`detached`. While the stream runs, it prints once a second the peak of the stream's part of
-the buffer, read through its own mapping: `-6.02 dBFS over 960 frames`, the driver's tone (the
-first reading, right after `running`, may still be silence). A host killed with
-`Stop-Process`, or one that exits without detaching (`--no-detach`), is detached when its
-handle closes: the next `test-host` attaches.
+(0x800700AA)` (one host at a time). `capture-check` passes as in section 4.
+`hostmic-ctl status` shows the stream `running` with its buffer (960 frames, packets of 480 in
+shared mode), its position, and the counters: frames advanced, packets completed, none
+skipped, no request refused. The first host prints `attached` with the address of the shared
+buffer in its process (page-aligned, 192000 bytes), `thread MMCSS Pro Audio`, one line per
+change with a growing generation (`stopped`, `paused`, `running`, `paused`, `stopped`, `no
+stream`), `playing` lines with `0 late` and a longest gap of a few milliseconds, the driver's
+counters, then `detached`. A `late` line means the host was not scheduled for more than a
+buffer (20 ms in shared mode): the engine loses those frames, and `capture-check` reports a
+discontinuity. A host killed with `Stop-Process`, or one that exits without detaching
+(`--no-detach`), is detached when its handle closes: the next `test-host` attaches.
 
 The host's mapping must never outlive it, whoever holds its handle. `--holder` starts a process
 (`ping`) that inherits the host's handle; `--close-own-handle` also closes the host's own:

@@ -253,19 +253,24 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     halt the generation before changing anything else), and `ADVANCE` moves it with one
     compare-and-exchange, so a request computed for an earlier stream or racing another one
     cannot win;
-    `GetPosition` and `GetReadPacket` only read. `ADVANCE` signals the engine's event when a
+    `GetPosition` and `GetReadPacket` take no lock. `ADVANCE` signals the engine's event when a
     packet completes; rundown protection (`EX_RUNDOWN_REF`, a non-blocking atomic count) keeps
-    the event and the stream alive while it runs, instead of the timer's `KeFlushQueuedDpcs`.
-    The timer and the tone leave the driver; the tone moves to a test host.
+    the event alive while it runs, instead of the timer's `KeFlushQueuedDpcs`. The timer and
+    the tone leave the driver; the tone moves to a test host. Each `ADVANCE` is still an IRP,
+    which the I/O manager allocates with its system buffer, about a thousand times a second: an
+    accepted cost of an IOCTL-driven position, outside the driver's own real-time code.
   - **Unplugged without a host:** the topology keeps its port's `IPortEvents`, reports
     `IsConnected` from the host's presence with `JACKDESC2_PRESENCE_DETECT_CAPABILITY`, and
     generates `KSEVENT_PINCAPS_JACKINFOCHANGE` on attach, detach and host death.
   - **Formats:** the ABI carries format ranges (rates, channels, sample types) from the start;
     M4 accepts 48 kHz, 16-bit, stereo only.
-  - **Counters and tools:** `GET_STATS` reports frames advanced, packets signaled, underflows,
-    overflows and rejected requests with the last reason, all atomic counters;
-    `tools/hostmic-ctl status` prints them, and the driver's rejection messages state the
-    operation, received and required sizes and the process, as Virtual Audio Cable's log does.
+  - **Counters and tools:** `GET_STATS` reports frames advanced, packets completed, packets
+    skipped (overwritten by the host before the engine read them: the overflow a capture
+    device can have; a host that stops advancing is not an underflow the driver can see, the
+    engine just gets no packet) and refused requests with the last reason, all atomic
+    counters; `tools/hostmic-ctl status` prints them, and the driver's rejection messages
+    state the operation, received and required sizes and the process, as Virtual Audio Cable's
+    log does.
   - **Fuzzing:** `fuzz/` (cargo-fuzz) with a target per request decoder and a target that
     replays sequences of attach, stream, advance and detach against the pure model; a CI job on
     a GitHub-hosted Linux runner with a pinned nightly (cargo-fuzz needs one; the repository's
@@ -349,9 +354,33 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   subtracted without saturation and bug-checked the VM (0x1E, a debug build's overflow
   panic): the frame arithmetic went back to `hostmic-driver-core` (`ring::tone_words`), where
   it is unit-tested. A second review found the link's "started" state inferred from a cursor
-  value of 0, which a wrapped generation can reproduce: it is now a flag of its own. Still
+  value of 0, which a wrapped generation can reproduce: it is now a flag of its own. (The
+  shared-pages tone and `ring::tone_words` left with the next pull request.) Still
   open: an adapter removed while a handle to the host interface stays open (forced detach,
   M6).
+  *The host advances the position (2026-11-09):* the driver produces no audio and keeps no
+  clock: its timer and tone are gone (`ring` and `tone` left `hostmic-driver-core`).
+  `ADVANCE` (`HostLink::advance`) accepts only the attached handle in the host's own process,
+  validates against the packed cursor and commits with a compare-and-exchange, then signals
+  the engine's event for each completed packet. `GetReadPacket` hands out the oldest complete
+  packet still intact (`packet::next_read`), counting the frames the host may already be
+  writing (the size of its last advance) as overwriting, with `MoreData` and the skipped
+  packets counted; its performance counter value is counted back from the last advance of the
+  current run (`clock::sampling_instant`). Refusals that are races (stale generation or
+  position, stream no longer running) complete with `STATUS_DEVICE_NOT_READY`
+  (`ERROR_NOT_READY`) and are not logged; others are logged at a bounded rate. `GET_STATS`
+  and `tools/hostmic-ctl status` show the counters; `tools/test-host` plays the tone from an
+  MMCSS thread paced by the performance counter. New fuzz target: `read_packet`. In the VM:
+  `capture-check` records the host's tone for 30 s, 1000.00 Hz, -6.02 dBFS, 0 glitch, no
+  discontinuity, `PASS`, with the host's longest gap between two writes at 2.6 ms. Lessons:
+  the first two runs failed on one discontinuity each, which the test host's own counters
+  traced to itself: its real-time loop wrote its progress to a redirected file, and one write
+  blocked for 45 ms, more than the 20 ms shared-mode buffer; printing moved to another thread.
+  The real-time rule applies to hosts as much as to the driver, and the host library (M5)
+  must enforce it. The independent reviews found the packet numbering able to survive a stop
+  that raced `GetReadPacket` (now a run epoch packed with the last packet read, moved by one
+  compare-and-exchange), packets dated from the wrong run, and the frames written ahead of an
+  advance ignored by the "intact" check.
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and

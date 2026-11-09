@@ -24,8 +24,9 @@ host application ──writes into the shared ring buffer──▶ [hostmic micr
 ## Status
 
 **Experimental, not usable yet.** The driver already exposes a working capture endpoint,
-"Microphone (hostmic)", which plays a built-in 1 kHz test tone (milestone M3, verified in a test
-VM); feeding it from a host application is the next milestone. See [PLAN.md](PLAN.md) for the
+"Microphone (hostmic)", fed by a host application through a buffer it shares with the Windows
+audio engine; the host sets the pace (milestone M4, verified in a test VM with the test host
+playing a 1 kHz tone). The host library is the next milestone. See [PLAN.md](PLAN.md) for the
 roadmap. There is no release. Until the driver is signed through Microsoft attestation, it can
 only be loaded with test signing enabled, which requires Secure Boot to be disabled: use a
 virtual machine, never your everyday machine ([docs/test-vm.md](docs/test-vm.md)).
@@ -75,9 +76,9 @@ hostmic is experimental: try it in a virtual machine only. In about an hour, fro
    ([docs/test-vm.md](docs/test-vm.md), section 3).
 4. **Use it**: without a host, "Microphone (hostmic)" shows as unplugged. Start the test host
    (`tools/test-host`): the microphone appears in Settings → System → Sound → Input. Record it
-   with any application, for example the Sound Recorder: you hear a steady 1 kHz tone (the
-   driver's built-in test signal, until the host feeds the audio). `tools/capture-check`
-   measures it ([docs/test-vm.md](docs/test-vm.md), sections 4 and 6).
+   with any application, for example the Sound Recorder: you hear the steady 1 kHz tone the
+   test host plays. `tools/capture-check` measures it, and `tools/hostmic-ctl status` shows the
+   stream and the driver's counters ([docs/test-vm.md](docs/test-vm.md), sections 4 and 6).
 5. **Remove it**: `devcon remove root\hostmic`.
 
 ## Licensing

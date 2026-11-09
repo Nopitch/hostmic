@@ -76,14 +76,22 @@ of the build.
    PortCls. IOCTL input validation in pure Rust, unit-tested and fuzzed (PLAN.md, M4); user
    buffers copied once (`METHOD_BUFFERED`), then validated. `ATTACH` references the host's
    event only for a user-mode request in the requesting process, with `EVENT_MODIFY_STATE`;
-   one host at a time; only the attached handle detaches; the interface refuses removal while
-   a handle to it is open, so no request reaches a deleted device.
+   one host at a time; only the attached handle detaches, and only the attached handle, in the
+   host's own process, advances the position (a duplicated handle in another process cannot);
+   `ADVANCE` is checked against the stream's packed generation and position and committed with
+   one compare-and-exchange, so a request computed for an earlier state cannot move the
+   position; the interface refuses removal while a handle to it is open, so no request reaches
+   a deleted device. Refused requests are counted (`GET_STATS`) and logged, at a bounded rate,
+   since any process allowed to open the interface can send them in a loop. `GET_STREAM` and
+   `GET_STATS` tell such a process whether, and how long, the microphone is in use, as the
+   Windows audio settings already do.
 3. **Shared memory** (M4): one buffer of whole pages, owned by the driver, from zeroed pages
    (`MmAllocatePagesForMdlEx`) and zeroed again for each host, so that neither kernel data nor
    a previous host's audio reaches a host. It is mapped into the attached host (readable and
    writable, never executable, through a C function of a few lines that catches the mapping's
    structured exception, which Rust cannot) and, through a partial MDL per stream, into the
-   audio engine; the driver never reads it. The pages are reference-counted by the adapter,
+   audio engine; the driver produces no audio and never reads it. The pages are
+   reference-counted by the adapter,
    each stream buffer and the host's mapping, so none is freed while mapped. A user mapping is
    undone in its own process: on `DETACH`, on the handle's last close from any process
    (attaching to the host's), and from a process notification routine when the host's process
