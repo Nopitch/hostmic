@@ -29,21 +29,59 @@ jobs:
       WDK_NUGET_VERSION: "10.0.26100.6584"
       CARGO_WDK_VERSION: "0.2.0"
       CARGO_TERM_COLOR: always
+      # No incremental compilation in CI: it is not reused across runs and would bloat the cache.
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Keep the token out of .git/config (zizmor's artipacked rule).
           persist-credentials: false
 
+      # Caches (PLAN.md, CI): restored by every run, written only by pushes to main, so a pull
+      # request can never write what another run restores (a pull request's own cache scope is
+      # never read outside it). Exact keys: the WDK version, cargo-wdk's version, the toolchain,
+      # LLVM and Cargo.lock. Never used by a release workflow.
+      - name: Restore the WDK
+        id: wdk-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\packages
+          key: wdk-nuget-${{ runner.os }}-${{ env.WDK_NUGET_VERSION }}
+
       - name: Install the WDK from NuGet
         shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.wdk-cache.outputs.cache-hit }}
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           $root = 'C:\packages'
-          nuget install Microsoft.Windows.WDK.x64 -Version $env:WDK_NUGET_VERSION -OutputDirectory $root -NonInteractive
-          if ($LASTEXITCODE -ne 0) { throw "nuget install failed ($LASTEXITCODE)" }
+          if ($env:CACHE_HIT -ne 'true') {
+            nuget install Microsoft.Windows.WDK.x64 -Version $env:WDK_NUGET_VERSION -OutputDirectory $root -NonInteractive
+            if ($LASTEXITCODE -ne 0) { throw "nuget install failed ($LASTEXITCODE)" }
+          }
+
+          # The packages, downloaded or restored, must be exactly these: SHA-512 as nuget.org
+          # publishes it (catalog entry, packageHash). Update them with WDK_NUGET_VERSION.
+          $expected = @{
+            'Microsoft.Windows.WDK.x64.10.0.26100.6584.nupkg' = 'jhddaBnhMDqt3GVr32RVTtaR0KHmZDjY0JCTMn10OQpk4+AShXCK9QA09vBazp8ni1Mju84qM5SGXfIfnyOJ+g=='
+            'Microsoft.Windows.SDK.CPP.10.0.26100.1.nupkg' = 'ZveRWpfQKpduSRyI9WxRFQ5BpU9XZ+K2BGQ6lZup//PiH+KPFIGFd/QqrvFjh+isrlOOiJ5cNF6IKuZDCh1E7w=='
+            'Microsoft.Windows.SDK.CPP.x64.10.0.26100.1.nupkg' = 'EhG+TCUZWAQr2U8CyFBPhIZedtUphVxpRl6fKOSOQvEQYelZ1FslrkmAbNBHqbp80eUOTb1Z7VkIEU/56c2Pdw=='
+          }
+          $found = @(Get-ChildItem $root -Recurse -Filter *.nupkg)
+          if ($found.Count -ne $expected.Count) {
+            $found | ForEach-Object Name
+            throw "Expected $($expected.Count) packages, found $($found.Count)"
+          }
+          foreach ($package in $found) {
+            if (-not $expected.ContainsKey($package.Name)) { throw "Unexpected package $($package.Name)" }
+            $sha = [System.Security.Cryptography.SHA512]::Create()
+            $stream = [System.IO.File]::OpenRead($package.FullName)
+            try { $hash = [Convert]::ToBase64String($sha.ComputeHash($stream)) } finally { $stream.Dispose() }
+            if ($hash -cne $expected[$package.Name]) { throw "SHA-512 mismatch for $($package.Name): $hash" }
+            Write-Host "verified $($package.Name)"
+          }
 
           # Same layout and variables as windows-drivers-rs' install-wdk action; wdk-build
           # reads them instead of looking for an installed WDK.
@@ -74,11 +112,31 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $llvm = 'C:\Program Files\LLVM\bin'
           if (-not (Test-Path "$llvm\libclang.dll")) { throw "libclang.dll not found in $llvm" }
-          & "$llvm\clang.exe" --version
+          $version = (& "$llvm\clang.exe" --version | Select-Object -First 1)
+          Write-Host $version
+          if ($version -notmatch 'clang version (\d+\.\d+\.\d+)') { throw "Unexpected clang version: $version" }
           "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+          # Part of the build cache's key: bindgen's output depends on libclang.
+          "LLVM_VERSION=$($Matches[1])" >> $env:GITHUB_ENV
 
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install
+
+      # Cargo's downloaded crates and the compiled dependencies (workspace crates are removed
+      # before saving, so the cache never holds this repository's own build). A partial match
+      # (an older Cargo.lock, same toolchain, WDK and LLVM) still saves most of the build.
+      - name: Restore the Cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -92,10 +150,65 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # cargo-wdk publishes no prebuilt binary: built once per version and toolchain.
+      - name: Restore cargo-wdk
+        id: cargo-wdk-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-wdk.exe
+          key: cargo-wdk-${{ runner.os }}-${{ env.CARGO_WDK_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+
       - name: Install cargo-wdk
+        if: steps.cargo-wdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: cargo install cargo-wdk --version $env:CARGO_WDK_VERSION --locked
+
+      - name: Check cargo-wdk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = cargo wdk --version
+          Write-Host $version
+          if ($version -notmatch [regex]::Escape($env:CARGO_WDK_VERSION)) { throw "Expected cargo-wdk $env:CARGO_WDK_VERSION, got: $version" }
 
       # Build, stampinf, inf2cat, infverif and test signing with a throwaway certificate.
       - name: Build and package the driver
         run: cargo wdk build --locked
+
+      # Saved by pushes to main only, and only what was not restored exactly.
+      - name: Save the WDK
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.wdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\packages
+          key: wdk-nuget-${{ runner.os }}-${{ env.WDK_NUGET_VERSION }}
+
+      - name: Save cargo-wdk
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-wdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-wdk.exe
+          key: cargo-wdk-${{ runner.os }}-${{ env.CARGO_WDK_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+
+      - name: Remove the workspace crates' build from the Cargo cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packages = (cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json).packages.name
+          foreach ($package in $packages) {
+            cargo clean --package $package --locked
+            if ($LASTEXITCODE -ne 0) { throw "cargo clean -p $package failed" }
+          }
+          Remove-Item -Recurse -Force target\debug\hostmic_driver_package -ErrorAction SilentlyContinue
+
+      - name: Save the Cargo cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml') }}
