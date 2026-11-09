@@ -34,6 +34,14 @@ jobs:
         # No build: CodeQL extracts Rust from the sources (the driver itself only builds on
         # Windows with the WDK, which the `driver` workflow covers).
         language: [actions, rust]
+    # Rust extractor options (rust/codeql-extractor.yml in github/codeql). It runs on Linux and
+    # cannot run the WDK build scripts, so it misses what they would set: the Windows target
+    # (the `windows` crate's macros, as in `tools/test-host`) and the `driver_model__driver_type`
+    # cfg that `wdk` gates `wdk::println!` behind (wdk 0.5.0, src/lib.rs). The bindings generated
+    # into `OUT_DIR` stay out of reach: no option runs a build script that needs the WDK.
+    env:
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_TARGET: x86_64-pc-windows-msvc
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: driver_model__driver_type=WDM
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
