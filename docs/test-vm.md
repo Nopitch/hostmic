@@ -79,7 +79,8 @@ Checkpoint-VM hostmic-test -SnapshotName 'clean-testsigning'
 
 ## 3. Install the driver and check it (VM, elevated)
 
-Copy the freshly built package into the VM (host), in a folder of its own per test so that
+Sections 3 to 7 are the manual procedures; the test campaign (section 8) runs all of them and
+prints one verdict per scenario. Copy the freshly built package into the VM (host), in a folder of its own per test so that
 older packages are not mixed in. The `driver` CI job also publishes the test-signed debug and
 release packages of every run as an artifact (`hostmic-driver-<commit>`, kept 14 days):
 `gh run download <run id> --repo Nopitch/hostmic` fetches them without a local build.
@@ -297,3 +298,46 @@ To go back to a clean state (host):
 ```powershell
 Restore-VMCheckpoint -VMName hostmic-test -Name clean-testsigning -Confirm:$false
 ```
+
+## 8. Run the test campaign
+
+`tools/vm/campaign.ps1` runs sections 3 to 7 in one go: it installs the package next to it,
+runs every scenario, prints one `PASS` or `FAIL` line per scenario (with the check that failed
+and the log to read), removes the driver, and exits with the number of failed scenarios. Each
+tool's output goes to a numbered file in a `log-<date>` folder next to the script.
+
+On the host, build the release tools and stage a package with `tools/vm/stage.ps1`, which
+copies the package, the tools, the WDK's `devcon.exe` and the campaign into
+`C:\hostmic\<name>\` in the VM (as a member of Hyper-V Administrators). The package is a
+local build or the `driver` CI job's artifact (section 3), debug or release:
+
+```powershell
+cargo build --release -p hostmic-test-host -p hostmic-capture-check -p hostmic-measure -p hostmic-handle-check -p hostmic-ctl
+.\tools\vm\stage.ps1 -Package target\debug\hostmic_driver_package -Name debug
+```
+
+In the VM, elevated (Windows PowerShell; the command has no quotes, so it can be typed with
+*Clipboard → Type clipboard text*):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
+```
+
+| Scenario | What passes |
+|---|---|
+| `install` | the test certificate trusted, `devcon install` succeeds, the host interface answers, the adapter and the host interface device are `OK`, the microphone is unplugged (`DeviceState` 8) |
+| `tone` | `test-host` plays; a second host is kept waiting; `capture-check` passes; the host ends with 0 late, no packet skipped, `detached`; the microphone is unplugged again |
+| `latency` | `measure latency` passes (every click due read, median near 10 ms) |
+| `load` | `measure load` with 16 spinning threads passes (0 crackle) |
+| `kills` | hosts killed at random moments (`-Kills`, default 10): the microphone is unplugged within 10 s after each; the next host plays and `capture-check` passes |
+| `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer |
+| `removal` | `devcon remove` while a host plays unloads the driver without a reboot; after the reinstall the host attaches again and `capture-check` passes |
+| `disable` | the host interface answers again after a disable and enable; with a host, disabling the host interface or the adapter makes it let go, and it attaches again (`capture-check` passes each time) |
+| `audiosrv` | the host keeps playing across a restart of the audio service (`capture-check` passes) |
+| `uninstall` | `devcon remove` unloads the driver (`STOPPED`), the host interface is gone |
+
+`-Only` runs a subset (in that order; without `install` the driver must already be installed,
+without `uninstall` it stays installed), `-Seconds` sets the recordings' length (default 30),
+`-Kills` the number of killed hosts. The header line `checks` says whether Driver Verifier
+verifies `hostmic_driver.sys` and whether Memory Integrity runs, so that a run's output says
+under which conditions it passed.
