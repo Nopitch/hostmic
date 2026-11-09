@@ -704,6 +704,25 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   campaign and the Device Fundamentals tests pass under Driver Verifier on the debug and
   release packages, the device idles to D3 and streams again, 4 hours of load show 0 crackle,
   and every security finding is fixed or recorded with its reason.
+  *The test campaign (2026-11-09):* `tools/vm/campaign.ps1` (Windows PowerShell 5.1, the VM's,
+  ASCII only) runs ten scenarios (`install`, `tone`, `latency`, `load`, `kills`, `handles`,
+  `removal`, `disable`, `audiosrv`, `uninstall`; docs/test-vm.md, section 8), prints one
+  `PASS` or `FAIL` line each with the failed check and its log, and exits with the number of
+  failures; its header says whether Driver Verifier verifies the driver and whether Memory
+  Integrity runs, so that a run's output states its conditions. `tools/vm/stage.ps1` copies a
+  package, the release tools, the WDK's `devcon` and the campaign into the VM. New checks
+  beside M3 to M5's procedures: ten hosts killed at random moments (the microphone unplugged
+  after each), disabling the adapter while a host plays, restarting the audio service. In the
+  VM, the final version: 10 of 10 on the local debug package (twice) and on the release
+  package of `main`'s CI run (latency median 9.4 ms, 0 crackle under load, 1000.00 Hz and 0
+  glitch in every recording), as earlier versions had on both. The independent review found
+  two checks that could pass without their behaviour (the last handle's unmapping without
+  first seeing the mapping last while the holder lived; a `devcon remove` that removed nothing
+  while the driver was already stopped), waits satisfied by the endpoint's stale state from
+  the previous host, and a failed `disable` able to leave a device disabled for the next runs.
+  Lesson from the fixes' first run: a removed endpoint is "not present" (`DeviceState` 4),
+  never "unplugged" (8); a scenario that fails between a removal and a reinstall now reinstalls
+  the driver, so that one failure does not fail every scenario after it.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
