@@ -178,13 +178,12 @@ pub enum Advance {
 /// unmaps the buffer and the microphone shows unplugged. The attachment belongs to this
 /// process; a `Host` may move to another thread, which is what a real-time loop does.
 ///
-/// The buffer's mapping is the driver's: it lasts until `DETACH` or the handle's cleanup,
-/// except when the microphone's adapter is removed while the host is attached (a surprise
-/// removal: an orderly one waits for the handle to close), where the driver undoes it at
-/// once. A [`write`](Self::write) racing that removal can then store into unmapped pages.
-/// Making the mapping last until the handle's cleanup in every case is a driver change
-/// (PLAN.md, M6's forced detach). After the driver refuses this handle once
-/// ([`Error::NotHost`]), the `Host` writes nothing more.
+/// The buffer's mapping is the driver's: it lasts until `DETACH`, the close of every handle to
+/// the host's file object, or this process's end. The driver does not undo it otherwise: a
+/// device removal waits for the handle to close. The handle is not inheritable; a process that
+/// duplicates it into another one (which takes `PROCESS_DUP_HANDLE` on this process) gives that
+/// process a way to end the attachment while this one writes. After the driver refuses this
+/// handle once ([`Error::NotHost`]), the `Host` writes nothing more.
 #[derive(Debug)]
 pub struct Host {
     /// Dropped first: closing it detaches and unmaps the buffer if `Drop`'s `DETACH` did not.
@@ -202,7 +201,7 @@ pub struct Host {
 }
 
 // SAFETY: the mapping is in this process's address space and valid from every thread for as
-// long as it lasts (see the type's documentation for when the driver undoes it). Nothing in
+// long as it lasts, which only this `Host` ends (see the type's documentation). Nothing in
 // `Host` is tied to the thread that attached.
 unsafe impl Send for Host {}
 
