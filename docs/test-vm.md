@@ -118,11 +118,14 @@ Build it on the host (`cargo build -p hostmic-capture-check --release`), copy
 `target\release\capture-check.exe` to `C:\hostmic\`, then in the VM:
 
 ```powershell
+$h = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','70' -PassThru -WindowStyle Hidden
 C:\hostmic\capture-check.exe --seconds 60
 ```
 
-Expected (milestone M3, the driver's own tone): 1000.00 Hz, peak -6.02 dBFS, RMS -9.03 dBFS,
-identical channels, no discontinuity flag, no silent packet, no glitch, `PASS`.
+From milestone M4 the microphone is unplugged without a host, so a host (`tools/test-host`,
+section 6) runs in the background while recording. Expected (the driver's own tone, until the
+host feeds the audio): 1000.00 Hz, peak -6.02 dBFS, RMS -9.03 dBFS, identical channels, no
+discontinuity flag, no silent packet, no glitch, `PASS`.
 
 ## 5. Read the driver's messages (VM, elevated)
 
@@ -187,6 +190,12 @@ a growing generation: `stopped` (stream created, 48000 Hz 2 ch int16), `paused` 
 (960 frames, packets of 480 in shared mode), `running`, `paused`, `stopped`, `no stream`, then
 `detached`. A host killed with `Stop-Process`, or one that exits without detaching
 (`--no-detach`), is detached when its handle closes: the next `test-host` attaches.
+
+The microphone's jack follows the host. The endpoint's state is in the registry, under
+`HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{…}` (the key whose
+`Properties` name `hostmic`), value `DeviceState`: 8 (unplugged) without a host, 1 (active)
+while `test-host` is attached, 8 again once it detaches or is killed; `capture-check` then
+finds no active "hostmic" endpoint.
 
 Removing the driver while a host is attached is refused (the host interface vetoes the
 removal: `devcon` answers "Removed on reboot" and the driver stays loaded until the VM

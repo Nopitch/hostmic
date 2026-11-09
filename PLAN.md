@@ -308,6 +308,20 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   host attached is "removed on reboot"; forcing a detach instead is for M6), and an `ATTACH`
   racing a `DETACH` on the same handle needed an "attaching" state not to leak the event.
   Open: the generation is 16 bits wide in the driver while the ABI carries 32.
+  *The jack follows the host (2026-11-09):* the topology's jack reports `IsConnected` from
+  `HostLink` (connected while a host is attached) with
+  `JACKDESC2_PRESENCE_DETECT_CAPABILITY`, and a filter-level `KSEVENT_PINCAPS_JACKINFOCHANGE`
+  event, as in Microsoft's sysvad: the miniport keeps a reference to its port's `IPortEvents`
+  for the event's enables, `HostLink` keeps another (rundown protection for its users, a
+  guarded mutex for its changes, which the topology's `Init` and `Drop` may make concurrently
+  across a restart) and generates the event on attach and detach. In the VM the endpoint's
+  `DeviceState` is 8 (unplugged) without a host, 1 (active) with `test-host` attached
+  (`capture-check` still `PASS`), 8 again after detach or a killed host; `devcon remove`
+  unloads the driver, so the counted `IPortEvents` makes no lasting cycle (PortCls releases the
+  miniport when the filters stop). Lessons: the endpoint builder honours `IsConnected` for an
+  integrated device; PortCls installs no fast I/O table (logged at load); the review moved the
+  event's enables to the miniport's own port, since an old miniport's enable must never land
+  in a newer port's list.
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
