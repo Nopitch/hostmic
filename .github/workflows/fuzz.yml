@@ -4,6 +4,9 @@ name: fuzz
 # cargo-fuzz and libFuzzer: a short run of every target on each pull request and push, a
 # longer one every week. The code under test is pure Rust without kernel calls, so a Linux
 # runner fuzzes it like the Windows driver will run it.
+#
+# One job per target, in parallel, and an aggregate job named `fuzz`, the required check of the
+# `Protect main` ruleset: it fails unless every other job succeeded.
 on:
   # No `paths-ignore`: `fuzz` is a required check of the `Protect main` ruleset.
   pull_request:
@@ -20,33 +23,66 @@ concurrency:
   group: fuzz-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # cargo-fuzz needs nightly for the sanitizer flags. A dated nightly, bumped on purpose like
+  # the repository's stable toolchain, so that a new nightly never breaks the check.
+  RUST_NIGHTLY: nightly-2026-10-26
+  CARGO_FUZZ_VERSION: "0.13.2"
+  CARGO_TERM_COLOR: always
+
 jobs:
   # Public repository: GitHub-hosted runners only, never self-hosted.
-  fuzz:
+
+  # The fuzz crate is a workspace of its own, outside the root workspace's checks: format and
+  # lint it with the repository's pinned stable toolchain (rust-toolchain.toml), and list its
+  # targets from its manifest, so that a new target is fuzzed without editing this file.
+  fuzz-targets:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      # cargo-fuzz needs nightly for the sanitizer flags. A dated nightly, bumped on purpose
-      # like the repository's stable toolchain, so that a new nightly never breaks the check.
-      RUST_NIGHTLY: nightly-2026-10-26
-      CARGO_FUZZ_VERSION: "0.13.2"
-      # Seconds per target: 60 on pull requests and pushes, 10 minutes on the schedule.
-      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 15
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Keep the token out of .git/config (zizmor's artipacked rule).
           persist-credentials: false
 
-      # The fuzz crate is a workspace of its own, outside the root workspace's checks: format
-      # and lint it here, with the repository's pinned stable toolchain (rust-toolchain.toml).
       - name: Check formatting and lint the fuzz targets
         run: |
           set -euo pipefail
           rustup toolchain install
           cargo fmt --manifest-path fuzz/Cargo.toml --check
           cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: List the fuzz targets
+        id: list
+        run: |
+          set -euo pipefail
+          targets=$(cargo metadata --manifest-path fuzz/Cargo.toml --no-deps --format-version 1 --locked \
+            | jq -c '[.packages[].targets[] | select(.kind | index("bin")) | .name] | sort')
+          echo "targets: $targets"
+          if [ "$(jq 'length' <<<"$targets")" -eq 0 ]; then
+            echo "::error::no fuzz target found"
+            exit 1
+          fi
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  fuzz-target:
+    needs: fuzz-targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.fuzz-targets.outputs.targets) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      # Seconds per target: 60 on pull requests and pushes, 10 minutes on the schedule.
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install the pinned nightly toolchain and cargo-fuzz
         run: |
@@ -55,13 +91,27 @@ jobs:
           cargo +"$RUST_NIGHTLY" install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
 
       # cargo-fuzz builds with debug assertions and overflow checks, under AddressSanitizer.
-      # cargo-fuzz has no --locked: the lint step above already fails if fuzz/Cargo.lock is stale.
-      # A failing input is printed in the log (libFuzzer's base64 line) to reproduce locally.
-      - name: Fuzz every target
+      # cargo-fuzz has no --locked: the fuzz-targets job already fails if fuzz/Cargo.lock is
+      # stale. A failing input is printed in the log (libFuzzer's base64 line) to reproduce
+      # locally.
+      - name: Fuzz the target
         run: |
           set -euo pipefail
-          for target in $(cargo +"$RUST_NIGHTLY" fuzz list); do
-            echo "::group::$target ($FUZZ_SECONDS s)"
-            cargo +"$RUST_NIGHTLY" fuzz run "$target" -- -max_total_time="$FUZZ_SECONDS"
-            echo "::endgroup::"
-          done
+          echo "$TARGET: $FUZZ_SECONDS s"
+          cargo +"$RUST_NIGHTLY" fuzz run "$TARGET" -- -max_total_time="$FUZZ_SECONDS"
+
+  # The required check. `if: always()`: a job whose dependency failed is skipped, and a skipped
+  # job counts as passing, so this one always runs and fails unless every job succeeded.
+  fuzz:
+    needs: [fuzz-targets, fuzz-target]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every fuzz job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null
