@@ -475,6 +475,27 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   when `capture-check` passes and the longest gap is below M4's 2.6 ms); device
   notifications (done when `devcon remove` unloads the driver while a host is attached, and the
   host attaches again after reinstallation); the measurements; the closing notes.
+  *The low layer done (2026-11-09):* crate `hostmic` (`host/`): `interfaces`, `Device` (read),
+  `Host` (attach, stream, stats, wait, event, write, detach; `Drop` sends `DETACH`). `attach`
+  reads `GET_INFO` first and refuses another ABI version or a range without a common format
+  itself: the driver tells refusals apart by status only (`STATUS_DEVICE_BUSY` for `Busy`,
+  `STATUS_DEVICE_NOT_READY` for a stale `ADVANCE`, `STATUS_INVALID_DEVICE_STATE` for
+  `NotHost`), so the design's `Refused(Reason)` became those errors. `write` copies frames
+  into the ring with volatile byte stores and sends `ADVANCE`, allocating nothing even on its
+  error paths (`windows` builds its errors without `ErrorInfo`); a stream that does not accept
+  frames and a stale request are outcomes (`Advance::NotRunning`, `Advance::Stale`), not
+  errors. `FormatRange::is_valid` and `intersect` moved from `hostmic-driver-core` to
+  `hostmic-abi`, so that a host checks a range as the driver does; `StreamState::generation`
+  documents its parity (even: frames accepted) as part of the contract. `tools/hostmic-ctl`
+  uses the crate and no `unsafe`. In the VM: `hostmic-ctl info` and `status` answer through it,
+  `test-host` (not yet on the crate) plays a tone that `capture-check` records cleanly (20 s,
+  1000.00 Hz, 0 glitch, no discontinuity, `PASS`, no request refused), and `hostmic-ctl info`
+  reports the missing driver after `devcon remove`, which unloads it. Lessons from the
+  independent review: dropping a `Host` must send `DETACH` (closing the handle detaches only
+  when no other process holds a duplicate); the review also found `DETACH` accepted from any
+  process holding the host's handle, which can unmap the buffer from under a live host (its
+  own pull request), and the host interface refusing every open after a disable and enable
+  in Device Manager (its own pull request).
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
