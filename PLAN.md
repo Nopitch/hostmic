@@ -104,6 +104,19 @@ A driver that maps memory into a user process is a classic source of vulnerabili
 - Host build machine: Visual Studio with the WDK (or the eWDK) and LLVM/Clang for bindgen, as
   required by windows-drivers-rs (re-read its README at M1 for exact versions).
 - Rust toolchain pinned in `rust-toolchain.toml`, bumped on purpose only.
+- **CI** (GitHub-hosted runners only; actions pinned by SHA; read-only tokens by default):
+  - caches only in pull-request and `main` CI, written by pushes to `main` only, keyed on
+    exact versions (the WDK, with its NuGet SHA-512 checked on every run; cargo-wdk; the
+    toolchain; LLVM; `Cargo.lock`), with the workspace's own crates removed before saving;
+    never in a release workflow (M7);
+  - required checks never filtered by path (a check that never reports blocks merging): a
+    job that has nothing to do succeeds quickly instead, and a fan-out (the fuzz targets, one
+    job each) reports through an aggregate job, named after the required check, that fails
+    unless every job succeeded;
+  - no third-party action where a few lines of shell do (change detection, aggregation): the
+    2025 compromise of `tj-actions/changed-files` is the reason;
+  - Driver Verifier, HLK and SDV need a machine that loads the driver and reboots: they run in
+    the test VM (M6), as open-source driver projects run them outside GitHub-hosted runners.
 
 ## Milestones (one notion per pull request)
 
@@ -430,6 +443,34 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   - no commercial focus (possible on request) and no political or controversial purpose.
   Fallback if refused: Microsoft attestation signing through a Partner Center hardware
   developer account, which requires an EV code-signing certificate (yearly cost).
+  **To re-check first:** Microsoft's "Driver signing offerings" page (dated 2026-03-23) now
+  titles attestation "Attestation signed drivers for testing scenarios" and says "For testing
+  purposes only, you can submit your drivers for attestation signing": whether attestation
+  still allows distribution to users decides between this path and WHCP (HLK testing).
+  *The release workflow's rules (2026-11-09, from a survey of open-source driver CI — windows-
+  drivers-rs, Windows-driver-samples, ovpn-dco-win, WinFsp, virtio-win — and of GitHub's,
+  zizmor's, SLSA's and Scorecard's guidance):*
+  - **No cache at all**: `cache-mode: none` at workflow level, no `actions/cache`, no setup
+    action with caching; the CI's caches (written by `main`, restored by pull requests) never
+    reach a release. Everything is rebuilt from pinned sources: the WDK from NuGet with its
+    SHA-512 checked, cargo-wdk `--locked`, the driver `--locked`. zizmor (1.31 or later)
+    checks the cache rule; SLSA Build L3 requires that a build's output not depend on a cache
+    another build could write.
+  - **Two jobs**: a build job with a read-only token and no secret; a publishing job that
+    downloads its artifact, attests and publishes, and alone holds `contents: write`,
+    `id-token: write` and `attestations: write`. Never an artifact or a cache from a pull
+    request.
+  - **A `release` environment**: deployment restricted to `v*` tags, a required reviewer (the
+    maintainer: a deliberate confirmation step, even alone), no administrator bypass; its
+    secrets are released only after approval.
+  - **What is built**: the release profile, packaged without test signing (`--sign-mode off`,
+    since Microsoft regenerates the catalog), with the `.pdb` that attestation submissions
+    require; the CI already builds and checks it on every pull request.
+  - **What is published**: the package, an SBOM and the provenance (`actions/attest`) as
+    release assets, the provenance also as an `*.intoto.jsonl` asset (Scorecard's
+    Signed-Releases check reads assets, not GitHub's attestation store); release notes; the
+    checksums.
+  - The badge requirements on releases (below, "OpenSSF Best Practices badge") apply as well.
 - **M8, Résonnance:** in Résonnance's repository, an output "Résonnance microphone (hostmic)"
   replacing the virtual cable.
 
