@@ -84,6 +84,19 @@ hostmic is experimental: try it in a virtual machine only. In about an hour, fro
    stream and the driver's counters ([docs/test-vm.md](docs/test-vm.md), sections 4 and 6).
 5. **Remove it**: `devcon remove root\hostmic`.
 
+## Contributing and support
+
+- **Questions**: [Discussions](https://github.com/Nopitch/hostmic/discussions).
+- **Bugs and feature requests**: [issues](https://github.com/Nopitch/hostmic/issues/new/choose),
+  through their forms.
+- **Security vulnerabilities**: privately, never in a public issue ([SECURITY.md](SECURITY.md)).
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md) says what helps most now, how to build
+  and test, and how pull requests are reviewed; everyone follows the
+  [code of conduct](CODE_OF_CONDUCT.md).
+
+hostmic has one maintainer, working on it in spare time: expect a first answer within 7 days.
+How the project is run is in [GOVERNANCE.md](GOVERNANCE.md).
+
 ## Licensing
 
 - The **driver** is a port of Microsoft's audio driver samples and is distributed under the

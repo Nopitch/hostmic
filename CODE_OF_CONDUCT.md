@@ -61,6 +61,9 @@ representative at an online or offline event.
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement at
 the project maintainer (@Nopitch) through a private report on this repository (Security tab, "Report a vulnerability"), titled "Code of Conduct".
+hostmic has a single maintainer: if your report concerns the maintainer, report it to GitHub
+instead (["Report abuse"](https://docs.github.com/en/communities/maintaining-your-safety-on-github/reporting-abuse-or-spam)),
+which applies GitHub's Community Guidelines.
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
