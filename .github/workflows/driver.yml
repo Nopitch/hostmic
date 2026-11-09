@@ -40,7 +40,7 @@ jobs:
       # Caches (PLAN.md, CI): restored by every run, written only by pushes to main, so a pull
       # request can never write what another run restores (a pull request's own cache scope is
       # never read outside it). Exact keys: the WDK version, cargo-wdk's version, the toolchain,
-      # LLVM and Cargo.lock. Never used by a release workflow.
+      # LLVM, Cargo.lock and this workflow (what it builds). Never used by a release workflow.
       - name: Restore the WDK
         id: wdk-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -134,7 +134,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml', '.github/workflows/driver.yml') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-
 
@@ -253,4 +253,4 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml', '.github/workflows/driver.yml') }}
