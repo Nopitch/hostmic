@@ -4,14 +4,18 @@
 //! test-host [--seconds N]
 //! ```
 //!
-//! Attaches to the first host interface and plays a 1 kHz tone at -6.02 dBFS for `N` seconds
-//! (default 30) with a [`hostmic::Player`]: a thread registered with MMCSS writes the frames
-//! due by the performance counter, about a millisecond per request, while the stream runs.
-//! The driver produces no audio and keeps no clock of its own: what `tools/capture-check`
-//! records is what this host wrote, at its pace. Once a second it prints the player's
-//! counters, and the stream (read through a second, read-only handle) whenever it changed; at
-//! the end, the driver's counters, then it detaches. The driver's handle rules (closing
-//! without `DETACH`, inherited and duplicated handles) are checked by `tools/handle-check`.
+//! Plays a 1 kHz tone at -6.02 dBFS for `N` seconds (default 30) with a
+//! [`hostmic::Player`] following the first hostmic microphone: it attaches as soon as the
+//! microphone is there, lets it go when Windows asks to remove it (so that `devcon remove` or
+//! a driver update goes through), and attaches again when it comes back. While attached and
+//! the stream runs, a thread registered with MMCSS writes the frames due by the performance
+//! counter, about a millisecond per request. The driver produces no audio and keeps no clock
+//! of its own: what `tools/capture-check` records is what this host wrote, at its pace.
+//!
+//! Once a second it prints the player's counters, and a line whenever the attachment or the
+//! stream's state changed; at the end, the driver's counters if still attached, then it
+//! detaches. It keeps no other handle to the microphone, which would hold its removal back.
+//! The driver's handle rules are checked by `tools/handle-check`.
 //!
 //! Exit status: 0 on success, 1 on failure, 2 on a usage error.
 
@@ -22,10 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hostmic::{
-    Block, Device, FormatRange, Host, Player, PlayerStats, SAMPLE_TYPES_ALL, SampleType, State,
-    StreamState,
-};
+use hostmic::{Block, FormatRange, Player, PlayerStats, SAMPLE_TYPES_ALL, State};
 
 const USAGE: &str = "usage: test-host [--seconds N]";
 
@@ -69,96 +70,65 @@ fn main() -> ExitCode {
 }
 
 fn run(options: &Options) -> Result<(), hostmic::Error> {
-    let path = hostmic::first_interface()?;
-    println!("interface  {path}");
     // Any format: the microphone offers what the driver streams.
-    let host = Host::attach(
-        &path,
-        FormatRange {
-            min_rate: 8_000,
-            max_rate: 384_000,
-            min_channels: 1,
-            max_channels: 32,
-            sample_types: SAMPLE_TYPES_ALL,
-        },
-    )?;
-    let formats = host.formats();
-    println!(
-        "attached   {} bytes mapped; offered {}..{} Hz, {}..{} ch, sample types {:#x}",
-        host.buffer_bytes(),
-        formats.min_rate,
-        formats.max_rate,
-        formats.min_channels,
-        formats.max_channels,
-        formats.sample_types
-    );
-
-    // The player owns the host: the stream is followed through a read-only handle.
-    let device = Device::open(&path)?;
-    let player = Player::start(host, tone)?;
+    let formats = FormatRange {
+        min_rate: 8_000,
+        max_rate: 384_000,
+        min_channels: 1,
+        max_channels: 32,
+        sample_types: SAMPLE_TYPES_ALL,
+    };
+    let player = Player::follow(formats, tone)?;
     let end = Instant::now() + Duration::from_secs(options.seconds);
-    let mut stream = None;
+    let mut seen = (false, None, 0);
     while Instant::now() < end {
         thread::sleep(Duration::from_secs(1));
-        let now = device.stream()?;
-        if stream != Some(now) {
-            print_stream(&now);
-            stream = Some(now);
-        }
         let counters = player.stats();
+        let now = (counters.attached, counters.state, counters.releases);
+        if now != seen {
+            println!(
+                "host       {}, stream {}  ({} attachments, {} releases)",
+                if counters.attached {
+                    "attached"
+                } else {
+                    "waiting for the microphone"
+                },
+                state_name(counters.state),
+                counters.attachments,
+                counters.releases
+            );
+            seen = now;
+        }
         print_stats(&counters);
         if counters.finished {
             break;
         }
     }
-    let host = player.stop()?;
-
-    let driver = host.stats()?;
-    println!(
-        "driver     {} frames advanced, {} packets completed, {} skipped, {} requests refused",
-        driver.frames_advanced,
-        driver.packets_completed,
-        driver.packets_skipped,
-        driver.requests_refused
-    );
-    host.detach()?;
-    println!("detached");
+    match player.stop()? {
+        Some(host) => {
+            let driver = host.stats()?;
+            println!(
+                "driver     {} frames advanced, {} packets completed, {} skipped, {} requests refused",
+                driver.frames_advanced,
+                driver.packets_completed,
+                driver.packets_skipped,
+                driver.requests_refused
+            );
+            host.detach()?;
+            println!("detached");
+        }
+        None => println!("not attached at the end"),
+    }
     Ok(())
 }
 
-/// One line per stream state, with units. Sampled once a second: a quick stop and start shows
-/// in the player's `stale` counter instead.
-fn print_stream(stream: &StreamState) {
-    let state = match State::from_code(stream.state) {
+fn state_name(state: Option<State>) -> &'static str {
+    match state {
         Some(State::Stopped) => "stopped",
         Some(State::Paused) => "paused",
         Some(State::Running) => "running",
-        None => "unknown",
-    };
-    let format = stream.format;
-    if format.rate == 0 {
-        println!(
-            "stream     gen {:>5}  {state:<8} no stream",
-            stream.generation
-        );
-        return;
+        None => "none",
     }
-    let sample = match SampleType::from_code(format.sample_type) {
-        Some(SampleType::Int16) => "int16",
-        Some(SampleType::Int24) => "int24",
-        Some(SampleType::Int32) => "int32",
-        Some(SampleType::Float32) => "float32",
-        None => "?",
-    };
-    println!(
-        "stream     gen {:>5}  {state:<8} {} Hz {} ch {sample}  buffer {} frames  packet {} frames  position {}",
-        stream.generation,
-        format.rate,
-        format.channels,
-        stream.buffer_frames,
-        stream.frames_per_packet,
-        stream.position
-    );
 }
 
 /// The player's callback: a 1 kHz sine at half of full scale (-6.02 dBFS) on every channel,

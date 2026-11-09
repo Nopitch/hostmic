@@ -173,34 +173,49 @@ Expected: the interface is listed, and opening it fails with `Access is denied.
 (0x80070005)`. Disabling the child device (`Disable-PnpDevice`) makes the interface disappear
 (`hostmic-ctl info` exits with 1); enabling it again makes it answer again.
 
-`tools/test-host` attaches as the host and plays a 1 kHz tone at -6.02 dBFS with the `hostmic`
-crate's reference loop (`hostmic::Player`): while the stream runs, a thread registered with
-MMCSS writes the frames due by the performance counter into the shared buffer, about a
-millisecond per `ADVANCE`. It prints the stream (through a second, read-only handle) when it
-changed since the last second, the player's counters once a second, and the driver's counters
-at the end. Build it on the host (`cargo build -p hostmic-test-host --release`), copy
+`tools/test-host` plays a 1 kHz tone at -6.02 dBFS with the `hostmic` crate's reference loop
+following the microphone (`hostmic::Player::follow`): it attaches as soon as the microphone is
+there, lets it go when Windows asks to remove it, and attaches again when it comes back. While
+the stream runs, a thread registered with MMCSS writes the frames due by the performance counter
+into the shared buffer, about a millisecond per `ADVANCE`. It prints a `host` line whenever the
+attachment or the stream's state changed, the player's counters once a second, and at the end
+the driver's counters. Build it on the host (`cargo build -p hostmic-test-host --release`), copy
 `target\release\test-host.exe` to `C:\hostmic\`, then in the VM run it in the background while
 recording:
 
 ```powershell
 $p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','45' -RedirectStandardOutput C:\hostmic\h.txt -PassThru -WindowStyle Hidden
 Start-Sleep 2
-C:\hostmic\test-host.exe --seconds 1
+C:\hostmic\test-host.exe --seconds 2
 $c = Start-Job { C:\hostmic\capture-check.exe --seconds 30 }
 Start-Sleep 12; C:\hostmic\hostmic-ctl.exe status
 Receive-Job $c -Wait; $p | Wait-Process; Get-Content C:\hostmic\h.txt
 ```
 
-Expected: the second `test-host` fails with `another host is attached to this microphone` (one
-host at a time). `capture-check` passes as in section 4. `hostmic-ctl status` shows the stream
-`running` with its buffer (960 frames, packets of 480 in shared mode), its position, and the
-counters: frames advanced, packets completed, none skipped, no request refused. The first host
-prints `attached` with the buffer's size (192000 bytes) and the formats offered, `stream` lines
-with a growing generation (`stopped`, `running`, `stopped`…), `playing` lines with `0 late`, a
-longest gap of a few milliseconds and no `(no MMCSS)`, the driver's counters, then `detached`.
-A nonzero `late` means the host was not scheduled for more than a buffer (20 ms in shared
-mode): the engine loses those frames, and `capture-check` reports a discontinuity. A host killed
-with `Stop-Process` is detached when its handle closes: the next `test-host` attaches.
+Expected: the second `test-host` waits (`waiting for the microphone`: one host at a time) and
+ends `not attached at the end`. `capture-check` passes as in section 4. `hostmic-ctl status`
+shows the stream `running` with its buffer (960 frames, packets of 480 in shared mode), its
+position, and the counters: frames advanced, packets completed, none skipped, no request
+refused. The first host prints `host attached` lines (`stopped`, `running`, `stopped`…),
+`playing` lines with `0 late`, a longest gap of a few milliseconds and no `(no MMCSS)`, the
+driver's counters, then `detached`. A nonzero `late` means the host was not scheduled for more
+than a buffer (20 ms in shared mode): the engine loses those frames, and `capture-check`
+reports a discontinuity. A host killed with `Stop-Process` is detached when its handle closes:
+the next `test-host` attaches.
+
+The host lets the microphone go when Windows asks to remove it. While `test-host` plays:
+
+```powershell
+C:\hostmic\devcon.exe remove root\hostmic; sc.exe query hostmic
+C:\hostmic\devcon.exe install C:\hostmic\pkg\hostmic_driver.inf root\hostmic
+$i = Get-PnpDevice -FriendlyName 'hostmic host interface' -PresentOnly
+Disable-PnpDevice -InstanceId $i.InstanceId -Confirm:$false; Enable-PnpDevice -InstanceId $i.InstanceId -Confirm:$false
+```
+
+Expected: `devcon remove` removes the device and the driver unloads (`STOPPED`), the host
+printing `waiting for the microphone`; after the reinstall it attaches again and
+`capture-check` passes; disabling and enabling the host interface makes it let go and attach
+again (`attachments` and `releases` grow by one each time).
 
 The driver's handle rules are checked with `tools/handle-check` (raw requests: the crate's
 `Host` always detaches on drop). Build it (`cargo build -p hostmic-handle-check --release`) and
@@ -237,9 +252,9 @@ The microphone's jack follows the host. The endpoint's state is in the registry,
 while `test-host` is attached, 8 again once it detaches or is killed; `capture-check` then
 finds no active "hostmic" endpoint.
 
-Removing the driver while a host is attached is refused (the host interface vetoes the
-removal: `devcon` answers "Removed on reboot" and the driver stays loaded until the VM
-restarts). Close the host first.
+A host that keeps its handle open (`handle-check`, an old test host, a `Device` kept open by a
+tool) still makes a removal wait: the host interface vetoes it while a handle is open, `devcon`
+answers "Removed on reboot" and the driver stays loaded until the VM restarts. Close it first.
 
 ## 7. Remove the driver (VM, elevated)
 

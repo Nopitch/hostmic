@@ -553,6 +553,29 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   is therefore not met reliably: a single maximum in a VM measures the hypervisor's scheduling
   as much as the loop (the 8.7 ms gap cost nothing: the shared-mode buffer is 20 ms). The
   measurements pull request reports the gap's distribution instead of one maximum.
+  *Device notifications (2026-11-09):* `Player::follow(formats, callback)` attaches by itself
+  and follows the first microphone, with `CM_Register_Notification` as Microsoft's "Registering
+  for Notification of Device Interface Arrival and Device Removal" describes: interface
+  arrivals, and the device behind the attached handle. On a removal request
+  (`DEVICEQUERYREMOVE`) the handle must be closed before the callback returns, but the player's
+  thread is the one writing into the mapping: the callback (a system thread) signals it and
+  waits, up to 2 s, while the thread detaches and closes its handle. Until the removal is
+  decided (cancelled, pending or complete) the thread does not attach again: its first version
+  reattached at once, before the driver's query-remove, and its new handle made the driver
+  refuse the removal (seen in the VM, "Removed on reboot", and found by the independent review
+  at the same time). The registration on the device is kept across reattachments (it stays
+  valid after its handle closes) and dropped, from the player's thread, once the device is
+  gone: unregistering waits for the callbacks in flight, so it never happens while one waits
+  for that thread. `Player::stop` now returns `Option<Host>`; `PlayerStats` gains `attached`,
+  `attachments`, `releases`. `tools/test-host` and the example follow the microphone; test-host
+  no longer keeps a read-only handle, which would hold a removal back. A kernel change first
+  planned with this one (enabling the interface after marking the device started) was dropped:
+  the PnP manager neither announces an interface nor lets it open before
+  `IRP_MN_START_DEVICE` completes (`IoSetDeviceInterfaceState`'s remarks). In the VM, while
+  `test-host` plays: `devcon remove` removes the device and unloads the driver; after the
+  reinstall the host attaches again and `capture-check` passes; disabling and enabling the
+  host interface makes it let go and attach again (`capture-check` `PASS`); 3 attachments, 2
+  releases, no packet skipped, no request refused.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
