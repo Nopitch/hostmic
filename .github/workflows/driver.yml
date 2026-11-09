@@ -36,6 +36,18 @@ jobs:
         with:
           # Keep the token out of .git/config (zizmor's artipacked rule).
           persist-credentials: false
+          # The pull request's merge commit and its first parent, the base: what it changes.
+          fetch-depth: 2
+
+      # A pull request that changes only documentation has nothing to build: every following
+      # step is skipped and the job, a required check, still succeeds. Fail-closed: any other
+      # event, any other file (workflows, manifests, code), an empty diff or an error builds.
+      - name: Decide what to check
+        id: scope
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: bash .github/scripts/needs-build.sh
 
       # Caches (PLAN.md, CI): restored by every run, written only by pushes to main, so a pull
       # request can never write what another run restores (a pull request's own cache scope is
@@ -43,12 +55,14 @@ jobs:
       # LLVM, Cargo.lock and this workflow (what it builds). Never used by a release workflow.
       - name: Restore the WDK
         id: wdk-cache
+        if: steps.scope.outputs.code == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: C:\packages
           key: wdk-nuget-${{ runner.os }}-${{ env.WDK_NUGET_VERSION }}
 
       - name: Install the WDK from NuGet
+        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         env:
           CACHE_HIT: ${{ steps.wdk-cache.outputs.cache-hit }}
@@ -107,6 +121,7 @@ jobs:
           }
 
       - name: Point bindgen at the runner's LLVM
+        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -120,6 +135,7 @@ jobs:
           "LLVM_VERSION=$($Matches[1])" >> $env:GITHUB_ENV
 
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        if: steps.scope.outputs.code == 'true'
         run: rustup toolchain install
 
       # Cargo's downloaded crates and the compiled dependencies (workspace crates are removed
@@ -127,6 +143,7 @@ jobs:
       # (an older Cargo.lock, same toolchain, WDK and LLVM) still saves most of the build.
       - name: Restore the Cargo cache
         id: cargo-cache
+        if: steps.scope.outputs.code == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -143,35 +160,41 @@ jobs:
       # from the cache, without the store that went with it, makes signing fail. The cache must
       # never carry it (removed before saving too).
       - name: Remove a cached test certificate
+        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         run: Remove-Item -Force target\*\WDRLocalTestCert.cer -ErrorAction SilentlyContinue
 
       - name: Check formatting
+        if: steps.scope.outputs.code == 'true'
         run: cargo fmt --all --check
 
       - name: Lint
+        if: steps.scope.outputs.code == 'true'
         run: cargo clippy --all-targets --locked -- -D warnings
 
       # hostmic-sys: Rust layouts and GUIDs checked against what MSVC computes from the WDK
       # headers. hostmic-abi: request layouts match their byte encodings. hostmic-driver-core:
       # the driver's pure logic (clock, packets, buffer geometry, host request validation).
       - name: Test
+        if: steps.scope.outputs.code == 'true'
         run: cargo test --locked
 
       # cargo-wdk publishes no prebuilt binary: built once per version and toolchain.
       - name: Restore cargo-wdk
         id: cargo-wdk-cache
+        if: steps.scope.outputs.code == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-wdk.exe
           key: cargo-wdk-${{ runner.os }}-${{ env.CARGO_WDK_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: Install cargo-wdk
-        if: steps.cargo-wdk-cache.outputs.cache-hit != 'true'
+        if: steps.scope.outputs.code == 'true' && steps.cargo-wdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: cargo install cargo-wdk --version $env:CARGO_WDK_VERSION --locked
 
       - name: Check cargo-wdk
+        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -183,14 +206,17 @@ jobs:
       # debug build (overflow checks, debug assertions) is the one tested in the VM; the release
       # build is what a release ships, as other driver projects build both.
       - name: Build and package the driver (debug)
+        if: steps.scope.outputs.code == 'true'
         run: cargo wdk build --locked
 
       - name: Build and package the driver (release)
+        if: steps.scope.outputs.code == 'true'
         run: cargo wdk build --locked --profile release
 
       # cargo-wdk runs InfVerif in universal mode (/u). Also check the stamped INFs as the
       # Hardware Dev Center does (/h: WHQL signature requirements) and for driver isolation (/w).
       - name: Check the INF for submission and driver isolation
+        if: steps.scope.outputs.code == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -207,6 +233,7 @@ jobs:
       # The test-signed packages, for the VM tests (docs/test-vm.md) without a local build. A
       # pull request's artifact is for looking at only: nothing privileged ever consumes it.
       - name: Upload the driver packages
+        if: steps.scope.outputs.code == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hostmic-driver-${{ github.sha }}
