@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "abi",
+    "host",
     "driver",
     "driver-core",
     "hostmic-sys",

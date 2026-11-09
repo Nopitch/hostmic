@@ -8,7 +8,9 @@
 //! padding, so that a host may pass a pointer to it directly; [`to_bytes`](Info::to_bytes) and
 //! `from_bytes` give the same layout without `unsafe`, and the tests check that both agree.
 //! The driver decodes inputs with `from_bytes`; what it accepts is decided by
-//! `hostmic-driver-core`, not here.
+//! `hostmic-driver-core`, not here, except the format range arithmetic
+//! ([`FormatRange::is_valid`], [`FormatRange::intersect`]) that a host also needs before it
+//! attaches.
 //!
 //! All requests use `METHOD_BUFFERED`: the I/O manager copies the input into a system buffer
 //! once, so the driver never reads the host's memory directly, and never twice.
@@ -279,6 +281,32 @@ impl FormatRange {
             sample_types: get_u32(bytes, 12),
         }
     }
+
+    /// Whether the range holds at least one format and only known sample types: what the
+    /// driver requires of [`AttachRequest::formats`].
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.min_rate != 0
+            && self.min_rate <= self.max_rate
+            && self.min_channels != 0
+            && self.min_channels <= self.max_channels
+            && self.sample_types != 0
+            && self.sample_types & !SAMPLE_TYPES_ALL == 0
+    }
+
+    /// The formats in both ranges, or `None` when there are none. Both must be valid
+    /// ([`is_valid`](Self::is_valid)); the result then is.
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        let range = Self {
+            min_rate: self.min_rate.max(other.min_rate),
+            max_rate: self.max_rate.min(other.max_rate),
+            min_channels: self.min_channels.max(other.min_channels),
+            max_channels: self.max_channels.min(other.max_channels),
+            sample_types: self.sample_types & other.sample_types,
+        };
+        range.is_valid().then_some(range)
+    }
 }
 
 /// Output of [`IOCTL_GET_INFO`]: what this driver offers.
@@ -443,8 +471,11 @@ impl State {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StreamState {
     /// Changes with every state change or new buffer of the stream; an [`AdvanceRequest`]
-    /// names the generation it was computed for, and the driver refuses any other. An opaque
-    /// value: compare it for equality only (the driver uses 16 bits of it, which wrap).
+    /// names the generation it was computed for, and the driver refuses any other. Compare it
+    /// for equality only (the driver uses 16 bits of it, which wrap), except for its parity:
+    /// the stream accepts frames only under an even generation. The driver may report
+    /// [`State::Running`] one step early, under the last odd generation; a host then waits for
+    /// the next change before writing.
     pub generation: u32,
     /// A [`State`] code.
     pub state: u32,
