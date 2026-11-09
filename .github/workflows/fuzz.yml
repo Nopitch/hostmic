@@ -41,13 +41,25 @@ jobs:
     timeout-minutes: 15
     outputs:
       targets: ${{ steps.list.outputs.targets }}
+      code: ${{ steps.scope.outputs.code }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Keep the token out of .git/config (zizmor's artipacked rule).
           persist-credentials: false
+          # The pull request's merge commit and its first parent, the base: what it changes.
+          fetch-depth: 2
+
+      # A pull request that changes only documentation has nothing to fuzz: the targets are not
+      # run and the aggregate check still succeeds. Fail-closed (see the script).
+      - name: Decide what to check
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: bash .github/scripts/needs-build.sh
 
       - name: Check formatting and lint the fuzz targets
+        if: steps.scope.outputs.code == 'true'
         run: |
           set -euo pipefail
           rustup toolchain install
@@ -55,6 +67,7 @@ jobs:
           cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: List the fuzz targets
+        if: steps.scope.outputs.code == 'true'
         id: list
         run: |
           set -euo pipefail
@@ -69,6 +82,7 @@ jobs:
 
   fuzz-target:
     needs: fuzz-targets
+    if: needs.fuzz-targets.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -101,7 +115,9 @@ jobs:
           cargo +"$RUST_NIGHTLY" fuzz run "$TARGET" -- -max_total_time="$FUZZ_SECONDS"
 
   # The required check. `if: always()`: a job whose dependency failed is skipped, and a skipped
-  # job counts as passing, so this one always runs and fails unless every job succeeded.
+  # job counts as passing, so this one always runs and fails unless every job succeeded. The
+  # one exception: the target jobs skipped because fuzz-targets, which succeeded, found only
+  # documentation changed.
   fuzz:
     needs: [fuzz-targets, fuzz-target]
     if: always()
@@ -114,4 +130,9 @@ jobs:
         run: |
           set -euo pipefail
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
-          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null
+          jq -e '
+            .["fuzz-targets"].result == "success"
+            and (
+              .["fuzz-target"].result == "success"
+              or (.["fuzz-targets"].outputs.code == "false" and .["fuzz-target"].result == "skipped")
+            )' <<<"$NEEDS" >/dev/null
