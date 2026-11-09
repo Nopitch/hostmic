@@ -770,6 +770,25 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   independent review found the boot loop a persistent profile could cause, the campaign's
   header showing the next boot's settings as the current ones, and assertion failures still
   swallowed by the wrapper. The badge's `dynamic_analysis_unsafe` is met.
+  *A following player registers before it attaches (2026-11-10):* `Player::follow` ended when
+  its registration for the microphone's removal requests failed (Driver Verifier's
+  low-resources run above). It now registers first, on a handle of its own opened without
+  `ATTACH` and closed at once (a registration on a device outlives its handle), and attaches
+  only once registered: a failure leaves the microphone alone (no attach and detach, no jack
+  change) and is retried a second later, counted in `PlayerStats::registration_failures`
+  (printed by `test-host` and `measure`); 60 failures in a row (a minute) end the loop with the
+  error, so that a lasting defect still shows. A removal requested while registering is not
+  followed by an attach. In the VM, under `low-resources` with 40 killed hosts, no bug check in
+  any run: 10 of 10 (before: 9 of 10), several hosts registering at their second try, 46
+  allocations failed deliberately; a second run of the final version, 59 failed: 7 of 10, the
+  failures not the host's (`capture-check`'s stream refused, "insufficient system resources";
+  after disabling and enabling the adapter, no host interface came back, so `disable` and
+  `audiosrv` found no microphone to attach to, with no registration failure). To examine with
+  the security review: whether the adapter should fail its start when it cannot create the host
+  interface's device, so that the PnP manager tries again, rather than run without it until the
+  next restart. The independent review found that a first version, which
+  retried after attaching, made the jack flap every second under lasting pressure and
+  swallowed every registration error.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

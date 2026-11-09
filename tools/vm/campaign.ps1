@@ -220,10 +220,10 @@ function Assert-Capture([int]$Seconds, [string]$What) {
     "$frequency, $((Find-Line $capture.Text '^glitches:') -replace '^glitches:\s*', '') glitch"
 }
 
-# "(N attachments, M releases)" from a test host's last "host" line.
+# "(N attachments, M releases, ...)" from a test host's last "host" line.
 function Get-Attachments([string]$Text) {
     $line = Find-Line $Text '^host\s'
-    if ($line -match '\((\d+) attachments, (\d+) releases\)') {
+    if ($line -match '\((\d+) attachments, (\d+) releases') {
         return @([int]$Matches[1], [int]$Matches[2])
     }
     return @(0, 0)

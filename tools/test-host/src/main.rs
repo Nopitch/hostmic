@@ -80,14 +80,19 @@ fn run(options: &Options) -> Result<(), hostmic::Error> {
     };
     let player = Player::follow(formats, tone)?;
     let end = Instant::now() + Duration::from_secs(options.seconds);
-    let mut seen = (false, None, 0);
+    let mut seen = (false, None, 0, 0);
     while Instant::now() < end {
         thread::sleep(Duration::from_secs(1));
         let counters = player.stats();
-        let now = (counters.attached, counters.state, counters.releases);
+        let now = (
+            counters.attached,
+            counters.state,
+            counters.releases,
+            counters.registration_failures,
+        );
         if now != seen {
             println!(
-                "host       {}, stream {}  ({} attachments, {} releases)",
+                "host       {}, stream {}  ({} attachments, {} releases, {} registration failures)",
                 if counters.attached {
                     "attached"
                 } else {
@@ -95,7 +100,8 @@ fn run(options: &Options) -> Result<(), hostmic::Error> {
                 },
                 state_name(counters.state),
                 counters.attachments,
-                counters.releases
+                counters.releases,
+                counters.registration_failures
             );
             seen = now;
         }
