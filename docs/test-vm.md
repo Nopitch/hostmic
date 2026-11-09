@@ -80,7 +80,9 @@ Checkpoint-VM hostmic-test -SnapshotName 'clean-testsigning'
 ## 3. Install the driver and check it (VM, elevated)
 
 Copy the freshly built package into the VM (host), in a folder of its own per test so that
-older packages are not mixed in:
+older packages are not mixed in. The `driver` CI job also publishes the test-signed debug and
+release packages of every run as an artifact (`hostmic-driver-<commit>`, kept 14 days):
+`gh run download <run id> --repo Nopitch/hostmic` fetches them without a local build.
 
 ```powershell
 $src = 'target\debug\hostmic_driver_package'

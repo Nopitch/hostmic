@@ -40,7 +40,7 @@ jobs:
       # Caches (PLAN.md, CI): restored by every run, written only by pushes to main, so a pull
       # request can never write what another run restores (a pull request's own cache scope is
       # never read outside it). Exact keys: the WDK version, cargo-wdk's version, the toolchain,
-      # LLVM and Cargo.lock. Never used by a release workflow.
+      # LLVM, Cargo.lock and this workflow (what it builds). Never used by a release workflow.
       - name: Restore the WDK
         id: wdk-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -134,7 +134,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml', '.github/workflows/driver.yml') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-
 
@@ -179,9 +179,42 @@ jobs:
           Write-Host $version
           if ($version -notmatch [regex]::Escape($env:CARGO_WDK_VERSION)) { throw "Expected cargo-wdk $env:CARGO_WDK_VERSION, got: $version" }
 
-      # Build, stampinf, inf2cat, infverif and test signing with a throwaway certificate.
-      - name: Build and package the driver
+      # Build, stampinf, inf2cat, infverif and test signing with a throwaway certificate. The
+      # debug build (overflow checks, debug assertions) is the one tested in the VM; the release
+      # build is what a release ships, as other driver projects build both.
+      - name: Build and package the driver (debug)
         run: cargo wdk build --locked
+
+      - name: Build and package the driver (release)
+        run: cargo wdk build --locked --profile release
+
+      # cargo-wdk runs InfVerif in universal mode (/u). Also check the stamped INFs as the
+      # Hardware Dev Center does (/h: WHQL signature requirements) and for driver isolation (/w).
+      - name: Check the INF for submission and driver isolation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $infverif = Join-Path $env:WDKToolRoot 'x64\infverif.exe'
+          if (-not (Test-Path $infverif)) { throw "infverif.exe not found at $infverif" }
+          foreach ($buildProfile in 'debug', 'release') {
+            $inf = "target\$buildProfile\hostmic_driver_package\hostmic_driver.inf"
+            foreach ($mode in '/h', '/w') {
+              & $infverif /v $mode $inf
+              if ($LASTEXITCODE -ne 0) { throw "infverif $mode failed on the $buildProfile INF ($LASTEXITCODE)" }
+            }
+          }
+
+      # The test-signed packages, for the VM tests (docs/test-vm.md) without a local build. A
+      # pull request's artifact is for looking at only: nothing privileged ever consumes it.
+      - name: Upload the driver packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hostmic-driver-${{ github.sha }}
+          path: |
+            target/debug/hostmic_driver_package/
+            target/release/hostmic_driver_package/
+          if-no-files-found: error
+          retention-days: 14
 
       # Saved by pushes to main only, and only what was not restored exactly.
       - name: Save the WDK
@@ -208,7 +241,7 @@ jobs:
             cargo clean --package $package --locked
             if ($LASTEXITCODE -ne 0) { throw "cargo clean -p $package failed" }
           }
-          Remove-Item -Recurse -Force target\debug\hostmic_driver_package -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force target\debug\hostmic_driver_package, target\release\hostmic_driver_package -ErrorAction SilentlyContinue
           Remove-Item -Force target\*\WDRLocalTestCert.cer -ErrorAction SilentlyContinue
 
       - name: Save the Cargo cache
@@ -220,4 +253,4 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-wdk-${{ env.WDK_NUGET_VERSION }}-llvm-${{ env.LLVM_VERSION }}-${{ hashFiles('Cargo.lock', '.cargo/config.toml', '.github/workflows/driver.yml') }}
