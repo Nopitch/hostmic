@@ -519,6 +519,15 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   packet skipped) and `FAIL` once, on the first run, 15 s after restoring the VM's checkpoint
   (15 discontinuities, 17 packets skipped: the host got more than a buffer ahead of the engine),
   with the same binaries; like M4's isolated `FAIL`, to watch with M5's measurements.
+  *The host interface opens again after a disable and enable (2026-11-09):* disabling it in
+  Device Manager sends an accepted query-remove, then a removal (the PDO is kept, the adapter
+  still reports it); enabling it sends a start, with no cancellation in between. The
+  `remove_pending` flag the query sets was cleared only by a cancellation (since #32), so after
+  the restart every open failed with `STATUS_DELETE_PENDING` (`ERROR_ACCESS_DENIED` in user
+  mode) until the adapter's removal; the start now clears it, next to `removed`. In the VM,
+  with `Disable-PnpDevice` and `Enable-PnpDevice`: `main`'s driver refuses `hostmic-ctl info`
+  after the enable (access denied), the fixed one answers, and `test-host` attaches and
+  detaches; `devcon remove` unloads both.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
