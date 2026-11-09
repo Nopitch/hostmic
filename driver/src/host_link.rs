@@ -1,5 +1,5 @@
 //! What the capture stream and the host interface share: the stream's state as the host sees
-//! it, and the attached host (PLAN.md, M4).
+//! it, the shared buffer, and the attached host (PLAN.md, M4).
 //!
 //! The adapter owns one [`HostLink`], in its device extension. The capture stream (one at a
 //! time) publishes its state, format and buffer geometry here; the host interface reads them for
@@ -11,36 +11,48 @@
 //! here are the stream's state changes and buffer allocations (`PASSIVE_LEVEL`, serialized by
 //! PortCls); `ADVANCE` will join them with its compare-and-exchange.
 //!
+//! The link holds the adapter's reference to the shared buffer ([`crate::shared_buffer`]), and
+//! the attached host's mapping of it. A user mapping must be undone in its process before the
+//! process ends: on `DETACH`, on the handle's cleanup or close (in whatever process closes it,
+//! attaching to the host's), and, for a host that dies while another process holds a duplicate
+//! of its handle, from the process notification routine ([`driver_init`]), which runs in the
+//! context of the dying process's last thread. Attaching and detaching are serialized by a
+//! guarded mutex, so that the notification routine returns only once the mapping is undone.
+//!
 //! The link lives in the adapter's device extension, whose memory outlives its holders: an
 //! open pin keeps the adapter's device object alive until the stream is released; the host
 //! interface's device refuses removal while a handle to it is open, so the PnP manager cannot
-//! remove (and PortCls delete) the adapter before every request to the interface is over.
+//! remove (and PortCls delete) the adapter before every request to the interface is over; the
+//! process notification routine reaches links through a registry that the adapter's removal
+//! leaves under the same lock.
 
 use core::{
     cell::UnsafeCell,
-    ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    ffi::c_void,
+    mem::MaybeUninit,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
 use crate::com::Unknown;
+use crate::shared_buffer::BufferRef;
 use crate::topology::PIN_MICROPHONE;
 use hostmic_abi::{Format, State, StreamState};
 use hostmic_driver_core::host::Cursor;
 use hostmic_sys::{IPortEvents, IPortEventsVtbl, KSEVENT_PINCAPS_CHANGENOTIFICATIONS, guid};
 use wdk::println;
 use wdk_sys::{
-    EX_RUNDOWN_REF, FILE_OBJECT, KEVENT, KGUARDED_MUTEX,
+    _KPROCESS, EX_RUNDOWN_REF, FILE_OBJECT, HANDLE, KAPC_STATE, KEVENT, KGUARDED_MUTEX, NT_SUCCESS,
+    NTSTATUS, PEPROCESS, PPS_CREATE_NOTIFY_INFO, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_SUCCESS,
     ntddk::{
         ExAcquireRundownProtection, ExReInitializeRundownProtection, ExReleaseRundownProtection,
-        ExWaitForRundownProtectionRelease, KeAcquireGuardedMutex, KeInitializeGuardedMutex,
-        KeReleaseGuardedMutex, KeSetEvent, ObfDereferenceObject,
+        ExWaitForRundownProtectionRelease, IoGetCurrentProcess, KeAcquireGuardedMutex,
+        KeInitializeGuardedMutex, KeReleaseGuardedMutex, KeSetEvent, KeStackAttachProcess,
+        KeUnstackDetachProcess, ObfDereferenceObject, ObfReferenceObject,
+        PsSetCreateProcessNotifyRoutineEx,
     },
 };
-
-/// `HostLink::host` while a detachment is in progress: no file object has this address.
-const DETACHING: *mut FILE_OBJECT = core::ptr::dangling_mut();
-/// `HostLink::host` while an attachment is in progress, likewise.
-const ATTACHING: *mut FILE_OBJECT = DETACHING.wrapping_add(1);
 
 /// Shared between the capture stream and the host interface. All zeroes is its initial state
 /// (as in a fresh device extension) until [`HostLink::init`].
@@ -56,13 +68,32 @@ pub struct HostLink {
     buffer_frames: AtomicU32,
     /// Frames per packet in event-driven mode, 0 in polling mode.
     frames_per_packet: AtomicU32,
-    /// The attached host's file object, compared by address only; null without a host.
+    /// The attached host's file object, compared by address only; null without a host. Changed
+    /// under `host_lock` only, with the fields below up to `mapped`.
     host: AtomicPtr<FILE_OBJECT>,
     /// The attached host's event, referenced; null without a host.
     event: AtomicPtr<KEVENT>,
     /// Keeps `event` alive while [`HostLink::notify`] signals it. All zeroes is an initialized
     /// rundown reference.
     rundown: UnsafeCell<EX_RUNDOWN_REF>,
+    /// The attached host's process, referenced; null without a host.
+    process: AtomicPtr<_KPROCESS>,
+    /// The shared buffer's address in the host's process; null without a host.
+    mapping: AtomicPtr<c_void>,
+    /// The reference to the shared buffer that the host's mapping holds (a raw [`BufferRef`]).
+    mapped: AtomicPtr<c_void>,
+    /// Serializes attaching and detaching; initialized by [`HostLink::init`].
+    host_lock: UnsafeCell<KGUARDED_MUTEX>,
+    /// The adapter's reference to the shared buffer (a raw [`BufferRef`]); null before the first
+    /// start and after the removal. Changed under `host_lock`.
+    buffer: AtomicPtr<c_void>,
+    /// Whether the link is in the registry the process notification routine reads, and hosts
+    /// may attach; cleared (under `host_lock`) by the adapter's removal.
+    registered: AtomicBool,
+    /// Whether [`HostLink::init`] has run once: the cursor, the locks and the registration are
+    /// set up. Not derived from the cursor, whose packed value may be 0 again once the
+    /// generation wraps.
+    started: AtomicBool,
     /// The topology port's `IPortEvents`, to report jack changes: one reference, owned by the
     /// link; null while no topology miniport is initialized. As in Microsoft's sysvad sample,
     /// which keeps one in its topology miniport: PortCls releases the port's miniport when the
@@ -75,27 +106,93 @@ pub struct HostLink {
     jack_lock: UnsafeCell<KGUARDED_MUTEX>,
 }
 
-// SAFETY: every field is atomic except the rundown reference, which the kernel's rundown
-// routines manipulate atomically.
+// SAFETY: every field is atomic except the rundown references, which the kernel's rundown
+// routines manipulate atomically, and the guarded mutexes, which the kernel's mutex routines
+// manipulate.
 unsafe impl Sync for HostLink {}
 
+/// Why `ATTACH` failed after its input was accepted.
+pub struct AttachError {
+    /// The status the request completes with.
+    pub status: NTSTATUS,
+    /// Why, for the log.
+    pub reason: &'static str,
+}
+
 impl HostLink {
-    /// On the adapter's first start (`PASSIVE_LEVEL`, before any filter exists): the initial
-    /// cursor (a stopped stream, odd generation) and the jack lock.
-    pub fn init(&self) {
-        if self
-            .cursor
-            .compare_exchange(
-                0,
-                Cursor::STOPPED.pack(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            // SAFETY: the first start: nothing uses the lock yet.
+    /// On each start of the adapter (`PASSIVE_LEVEL`, before any filter exists). The first time:
+    /// the initial cursor (a stopped stream, odd generation), the locks and the registration
+    /// for the process notification routine. Every time: the shared buffer, unless the link has
+    /// it already.
+    ///
+    /// # Errors
+    ///
+    /// `STATUS_INSUFFICIENT_RESOURCES` when the shared buffer cannot be allocated.
+    pub fn init(&self) -> Result<(), NTSTATUS> {
+        // PnP requests for the adapter are serialized: no other start or removal runs meanwhile.
+        if !self.started.load(Ordering::Acquire) {
+            // No filter, hence no stream, exists before the first start.
+            self.cursor.store(Cursor::STOPPED.pack(), Ordering::Release);
+            // SAFETY: the first start: nothing uses the locks yet.
             unsafe { KeInitializeGuardedMutex(self.jack_lock.get()) };
+            // SAFETY: as above.
+            unsafe { KeInitializeGuardedMutex(self.host_lock.get()) };
+            self.registered.store(register(self), Ordering::Release);
+            self.started.store(true, Ordering::Release);
         }
+        with_lock(&self.host_lock, || {
+            if self.buffer.load(Ordering::Acquire).is_null() {
+                let buffer = BufferRef::allocate().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+                println!("hostmic: shared buffer, {} bytes", buffer.size());
+                self.buffer.store(buffer.into_raw(), Ordering::Release);
+            }
+            Ok(())
+        })
+    }
+
+    /// On the adapter's removal (`PASSIVE_LEVEL`): no host may attach any more, a host still
+    /// attached is detached (its mapping undone in its process), the link leaves the registry,
+    /// and the adapter's reference to the shared buffer is released (streams keep theirs).
+    pub fn shutdown(&self) {
+        // Never started (the start failed before `init`): nothing to undo, and the locks were
+        // never initialized. PnP requests for the adapter are serialized, so `init` cannot run
+        // meanwhile.
+        if !self.started.load(Ordering::Acquire) {
+            return;
+        }
+        let (detached, buffer) = with_lock(&self.host_lock, || {
+            // `attach` checks this under the same lock.
+            self.registered.store(false, Ordering::Release);
+            let attached = !self.host.load(Ordering::Acquire).is_null();
+            if attached {
+                println!("hostmic: adapter removed with a host attached");
+                self.release_host();
+            }
+            (
+                attached,
+                self.buffer.swap(ptr::null_mut(), Ordering::AcqRel),
+            )
+        });
+        if detached {
+            self.jack_changed();
+        }
+        unregister(self);
+        // SAFETY: the adapter's reference, taken out of the link above.
+        drop(unsafe { BufferRef::from_raw(buffer) });
+    }
+
+    /// A new reference to the shared buffer, for a stream; `None` before the first start or
+    /// after the removal. `PASSIVE_LEVEL`.
+    pub fn buffer(&self) -> Option<BufferRef> {
+        with_lock(&self.host_lock, || {
+            let raw = self.buffer.load(Ordering::Acquire);
+            // SAFETY: the adapter's reference, which cannot be released while the lock is held;
+            // borrowed to clone it, then given back.
+            let adapter = unsafe { BufferRef::from_raw(raw) }?;
+            let clone = adapter.clone();
+            let _ = adapter.into_raw();
+            Some(clone)
+        })
     }
 
     /// Moves the cursor with `change`, which must move the generation.
@@ -184,8 +281,7 @@ impl HostLink {
 
     /// Whether a host is attached: the microphone's jack is connected.
     pub fn is_attached(&self) -> bool {
-        let host = self.host.load(Ordering::Acquire);
-        !host.is_null() && host != ATTACHING && host != DETACHING
+        !self.host.load(Ordering::Acquire).is_null()
     }
 
     /// The topology miniport was initialized: the link keeps `events`, a reference to its
@@ -193,7 +289,7 @@ impl HostLink {
     /// `PASSIVE_LEVEL`.
     pub fn set_jack_events(&self, events: Unknown) {
         let events = events.into_raw().cast::<IPortEvents>();
-        self.with_jack_lock(|| {
+        with_lock(&self.jack_lock, || {
             let old = self.jack_events.swap(events, Ordering::AcqRel);
             self.release_jack_events(old);
         });
@@ -205,31 +301,15 @@ impl HostLink {
         if events.is_null() {
             return;
         }
-        self.with_jack_lock(|| {
+        with_lock(&self.jack_lock, || {
             if self
                 .jack_events
-                .compare_exchange(
-                    events,
-                    core::ptr::null_mut(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(events, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 self.release_jack_events(events);
             }
         });
-    }
-
-    /// Runs `f` holding the lock that serializes `set_jack_events` and `clear_jack_events`
-    /// (a topology miniport's `Init` and another's `drop` may overlap across an adapter
-    /// restart). A control path: never per audio period.
-    fn with_jack_lock(&self, f: impl FnOnce()) {
-        // SAFETY: initialized by `init` before any topology miniport exists; PASSIVE_LEVEL.
-        unsafe { KeAcquireGuardedMutex(self.jack_lock.get()) };
-        f();
-        // SAFETY: acquired above by this thread.
-        unsafe { KeReleaseGuardedMutex(self.jack_lock.get()) };
     }
 
     /// Releases a reference `jack_events` no longer holds, once no jack event uses it.
@@ -298,74 +378,309 @@ impl HostLink {
         let event = self.event.load(Ordering::Acquire);
         if !event.is_null() {
             // SAFETY: a referenced event, kept alive by the rundown protection held here
-            // (`detach` waits for it before dereferencing). No wait follows.
+            // (`release_host` waits for it before dereferencing). No wait follows.
             unsafe { KeSetEvent(event, 0, 0) };
         }
         // SAFETY: acquired above.
         unsafe { ExReleaseRundownProtection(self.rundown.get()) };
     }
 
-    /// Attaches the host behind `file`, which gave `event` (one reference, owned by the link
-    /// on success). `PASSIVE_LEVEL`.
+    /// Attaches the host behind `file`, which gave `event` (one reference, which the link owns
+    /// from now on, and releases on failure), and maps the shared buffer into its process.
+    /// Returns the buffer's address in the host's process.
     ///
     /// # Errors
     ///
-    /// `event`, given back, when another host is attached; the caller dereferences it.
-    pub fn attach(&self, file: *mut FILE_OBJECT, event: *mut KEVENT) -> Result<(), *mut KEVENT> {
-        // Claim the slot, store the event, then publish the file object: a `DETACH` or a
-        // cleanup racing on the same handle cannot see `file` before the event is in place
-        // (it fails, and the handle's close detaches it once this request is over).
-        if file.is_null()
-            || self
-                .host
-                .compare_exchange(
-                    core::ptr::null_mut(),
-                    ATTACHING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-        {
-            return Err(event);
+    /// Another host is attached, the process notification routine is not registered, or the
+    /// buffer cannot be mapped.
+    ///
+    /// # Safety
+    ///
+    /// `PASSIVE_LEVEL`, in the context of the process that becomes the host (the requestor).
+    pub unsafe fn attach(
+        &self,
+        file: *mut FILE_OBJECT,
+        event: *mut KEVENT,
+    ) -> Result<NonNull<c_void>, AttachError> {
+        let result = with_lock(&self.host_lock, || {
+            if !self.host.load(Ordering::Acquire).is_null() {
+                return Err(AttachError {
+                    status: STATUS_DEVICE_BUSY,
+                    reason: "another host is attached",
+                });
+            }
+            let raw = self.buffer.load(Ordering::Acquire);
+            // SAFETY: the adapter's reference, kept while the lock is held; borrowed to clone.
+            let Some(adapter) = (unsafe { BufferRef::from_raw(raw) }) else {
+                return Err(AttachError {
+                    status: STATUS_INSUFFICIENT_RESOURCES,
+                    reason: "no shared buffer: the adapter is not started",
+                });
+            };
+            if file.is_null() || !self.registered.load(Ordering::Acquire) {
+                let _ = adapter.into_raw();
+                return Err(AttachError {
+                    status: STATUS_INSUFFICIENT_RESOURCES,
+                    reason: "no process notification: the mapping could outlive the host",
+                });
+            }
+            let buffer = adapter.clone();
+            let _ = adapter.into_raw();
+            // What a previous host wrote is not this host's business.
+            buffer.zero(buffer.size());
+            // SAFETY: PASSIVE_LEVEL, in the host's process (the caller's contract); undone by
+            // `release_host`, before the process ends (see the module documentation).
+            let Some(address) = (unsafe { buffer.map_user() }) else {
+                return Err(AttachError {
+                    status: STATUS_INSUFFICIENT_RESOURCES,
+                    reason: "the shared buffer could not be mapped",
+                });
+            };
+            // SAFETY: any IRQL; the current process, the host's.
+            let process = unsafe { IoGetCurrentProcess() };
+            // SAFETY: a live process object; the reference is released by `release_host`.
+            unsafe { ObfReferenceObject(process.cast()) };
+            self.process.store(process, Ordering::Release);
+            self.mapping.store(address.as_ptr(), Ordering::Release);
+            self.mapped.store(buffer.into_raw(), Ordering::Release);
+            self.event.store(event, Ordering::Release);
+            self.host.store(file, Ordering::Release);
+            Ok(address)
+        });
+        match result {
+            Ok(address) => {
+                println!("hostmic: host attached, buffer mapped at {address:p}");
+                // The microphone is plugged in.
+                self.jack_changed();
+                // The host reads the stream's state as it is now.
+                self.notify();
+            }
+            Err(_) => {
+                // SAFETY: the reference the caller gave, which the link did not keep.
+                unsafe { ObfDereferenceObject(event.cast()) };
+            }
         }
-        self.event.store(event, Ordering::Release);
-        self.host.store(file, Ordering::Release);
-        println!("hostmic: host attached");
-        // The microphone is plugged in.
-        self.jack_changed();
-        // The host reads the stream's state as it is now.
-        self.notify();
-        Ok(())
+        result
     }
 
     /// Detaches the host behind `file`, if it is the attached one; returns whether it was.
-    /// `PASSIVE_LEVEL`: waits for a signal in flight before releasing the event.
+    /// `PASSIVE_LEVEL`, in any process: the mapping is undone in the host's.
     pub fn detach(&self, file: *mut FILE_OBJECT) -> bool {
-        // Claim the detachment: a concurrent `DETACH` and handle cleanup on the same file
-        // object cannot both get past this, and no host can attach until it is over.
-        if file.is_null()
-            || self
-                .host
-                .compare_exchange(file, DETACHING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return false;
+        let detached = with_lock(&self.host_lock, || {
+            if file.is_null() || self.host.load(Ordering::Acquire) != file {
+                return false;
+            }
+            self.release_host();
+            true
+        });
+        if detached {
+            // The microphone is unplugged.
+            self.jack_changed();
         }
-        let event = self.event.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        detached
+    }
+
+    /// The process notification routine saw `process` exit: detaches the host if it is that
+    /// process's. Runs in the exiting process's last thread (see [`process_notify`]).
+    fn process_exited(&self, process: PEPROCESS) {
+        // Every other process's exit returns here, without the lock: only a thread of the host's
+        // process stores it (`attach` requires the requestor to be the current process), and
+        // when this runs, no other thread of `process` is left to store it.
+        if self.process.load(Ordering::Acquire) != process {
+            return;
+        }
+        let detached = with_lock(&self.host_lock, || {
+            let host = self.process.load(Ordering::Acquire);
+            if host.is_null() || host != process {
+                return false;
+            }
+            println!("hostmic: the host's process exited with its handle still open elsewhere");
+            self.release_host();
+            true
+        });
+        if detached {
+            self.jack_changed();
+        }
+    }
+
+    /// Releases everything the attached host holds: its event, once no signal is in flight,
+    /// its mapping, in its process, and its process. Holding `host_lock`, at `PASSIVE_LEVEL`.
+    fn release_host(&self) {
+        let event = self.event.swap(ptr::null_mut(), Ordering::AcqRel);
         // SAFETY: PASSIVE_LEVEL; waits for `notify` calls holding the protection.
         unsafe { ExWaitForRundownProtectionRelease(self.rundown.get()) };
-        // SAFETY: the rundown completed and nobody holds it.
+        // SAFETY: the rundown completed and nobody holds it; the lock keeps another wait away.
         unsafe { ExReInitializeRundownProtection(self.rundown.get()) };
         if !event.is_null() {
             // SAFETY: the reference `attach` took ownership of; nobody uses the event any more.
             unsafe { ObfDereferenceObject(event.cast()) };
         }
-        self.host.store(core::ptr::null_mut(), Ordering::Release);
+        let process = self.process.swap(ptr::null_mut(), Ordering::AcqRel);
+        let mapping = self.mapping.swap(ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: the mapping's reference, taken out of the link.
+        let buffer =
+            unsafe { BufferRef::from_raw(self.mapped.swap(ptr::null_mut(), Ordering::AcqRel)) };
+        if let (Some(buffer), Some(mapping)) = (&buffer, NonNull::new(mapping))
+            && !process.is_null()
+        {
+            // SAFETY: a mapping `attach` made in `process`, which is referenced and has not
+            // ended: its end runs `process_exited`, which needs the lock held here.
+            unsafe { unmap_in(process, buffer, mapping) };
+        }
+        drop(buffer);
+        if !process.is_null() {
+            // SAFETY: the reference `attach` took.
+            unsafe { ObfDereferenceObject(process.cast()) };
+        }
+        self.host.store(ptr::null_mut(), Ordering::Release);
         println!("hostmic: host detached");
-        // The microphone is unplugged.
-        self.jack_changed();
-        true
     }
+}
+
+/// Undoes the host's mapping of `buffer` at `mapping`, in `process`'s context.
+///
+/// # Safety
+///
+/// `mapping` came from `buffer.map_user()` in `process`, which is referenced and still has its
+/// address space; `PASSIVE_LEVEL`.
+unsafe fn unmap_in(process: PEPROCESS, buffer: &BufferRef, mapping: NonNull<c_void>) {
+    // SAFETY: any IRQL.
+    if unsafe { IoGetCurrentProcess() } == process {
+        // SAFETY: the caller's contract, in the mapping's process.
+        unsafe { buffer.unmap_user(mapping) };
+        return;
+    }
+    let mut apc = MaybeUninit::<KAPC_STATE>::uninit();
+    // SAFETY: below DISPATCH_LEVEL; a referenced process; the state lives on this thread's
+    // stack until the matching `KeUnstackDetachProcess`.
+    unsafe { KeStackAttachProcess(process, apc.as_mut_ptr()) };
+    // SAFETY: the caller's contract, attached to the mapping's process. Nothing else runs
+    // between the attach and the detach.
+    unsafe { buffer.unmap_user(mapping) };
+    // SAFETY: the matching detach, with the state the attach filled.
+    unsafe { KeUnstackDetachProcess(apc.as_mut_ptr()) };
+}
+
+/// Runs `f` holding `lock`, a guarded mutex. `PASSIVE_LEVEL` or `APC_LEVEL`; a control path,
+/// never per audio period.
+fn with_lock<R>(lock: &UnsafeCell<KGUARDED_MUTEX>, f: impl FnOnce() -> R) -> R {
+    // SAFETY: an initialized guarded mutex (`init`, `driver_init`), at IRQL <= APC_LEVEL.
+    unsafe { KeAcquireGuardedMutex(lock.get()) };
+    let result = f();
+    // SAFETY: acquired above by this thread.
+    unsafe { KeReleaseGuardedMutex(lock.get()) };
+    result
+}
+
+/// The links the process notification routine looks at, one per started adapter.
+static LINKS: [AtomicPtr<HostLink>; 4] = [const { AtomicPtr::new(ptr::null_mut()) }; 4];
+
+/// A guarded mutex in a static.
+struct StaticMutex(UnsafeCell<KGUARDED_MUTEX>);
+
+// SAFETY: the kernel's guarded mutex routines are what touch it.
+unsafe impl Sync for StaticMutex {}
+
+/// Serializes the registry's changes with the notification routine's reads, so that a link
+/// leaves the registry only when no notification uses it. Initialized by [`driver_init`].
+static REGISTRY_LOCK: StaticMutex = StaticMutex(UnsafeCell::new(
+    // SAFETY: plain data, all zeroes until `KeInitializeGuardedMutex`.
+    unsafe { MaybeUninit::zeroed().assume_init() },
+));
+
+/// Whether [`process_notify`] is registered.
+static NOTIFY_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// In `DriverEntry`, before any adapter starts: the registry's lock and the process
+/// notification routine. Without the routine the driver still loads, but refuses to map the
+/// buffer into a host (`ATTACH` fails).
+pub fn driver_init() {
+    // SAFETY: before any adapter: nothing uses the lock yet.
+    unsafe { KeInitializeGuardedMutex(REGISTRY_LOCK.0.get()) };
+    // SAFETY: PASSIVE_LEVEL; a routine of this image, removed by `driver_exit` before unload.
+    // The image is linked with /INTEGRITYCHECK, which the `Ex` routine requires.
+    let status = unsafe { PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 0) };
+    NOTIFY_REGISTERED.store(NT_SUCCESS(status), Ordering::Release);
+    if status != STATUS_SUCCESS {
+        println!("hostmic: process notification not registered: {status:#010x}");
+    }
+}
+
+/// In the driver's unload routine: removes the process notification routine, which waits for
+/// the calls in flight ("the system also waits for all in-flight callback routines to complete
+/// before returning").
+pub fn driver_exit() {
+    if NOTIFY_REGISTERED.swap(false, Ordering::AcqRel) {
+        // SAFETY: PASSIVE_LEVEL; the routine registered by `driver_init`.
+        let _ = unsafe { PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1) };
+    }
+}
+
+/// Adds `link` to the registry; returns whether there was room and the notification routine
+/// is registered (otherwise no host can attach to it).
+fn register(link: &HostLink) -> bool {
+    if !NOTIFY_REGISTERED.load(Ordering::Acquire) {
+        return false;
+    }
+    let link = ptr::from_ref(link).cast_mut();
+    with_lock(&REGISTRY_LOCK.0, || {
+        LINKS.iter().any(|slot| {
+            slot.compare_exchange(ptr::null_mut(), link, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+    })
+}
+
+/// Removes `link` from the registry; once this returns, the notification routine no longer
+/// uses it.
+fn unregister(link: &HostLink) {
+    let link = ptr::from_ref(link).cast_mut();
+    with_lock(&REGISTRY_LOCK.0, || {
+        for slot in &LINKS {
+            let _ =
+                slot.compare_exchange(link, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire);
+        }
+    });
+}
+
+/// The process notification routine: when a process exits, any host it is the process of is
+/// detached and its mapping undone.
+///
+/// The documentation says the routine runs "in the context of the last thread to exit from the
+/// process", at `PASSIVE_LEVEL` in a critical region, and is called "typically when the last
+/// thread within a process has terminated and the process address space is about to be
+/// deleted": the unmapping relies on the address space still being there, which the VM test
+/// observes (the host's mapping is undone without a crash); Driver Verifier is for M6.
+///
+/// Microsoft advises against synchronizing with other threads here. Every exit takes the
+/// registry's lock, held only briefly by an adapter's start and removal, and returns before any
+/// other lock unless the exiting process is the host's ([`HostLink::process_exited`]); the
+/// host's own exit then takes its link's lock, which another thread holds at most for one
+/// attach or detach (none of which waits on a process exit), and generates the jack event,
+/// which signals events without waiting.
+///
+/// # Safety
+///
+/// Called by the kernel at `PASSIVE_LEVEL`, for an exiting process in its last thread's
+/// context (`create_info` null) or for a process being created.
+unsafe extern "C" fn process_notify(
+    process: PEPROCESS,
+    _process_id: HANDLE,
+    create_info: PPS_CREATE_NOTIFY_INFO,
+) {
+    if !create_info.is_null() {
+        return;
+    }
+    with_lock(&REGISTRY_LOCK.0, || {
+        for slot in &LINKS {
+            let link = slot.load(Ordering::Acquire);
+            if !link.is_null() {
+                // SAFETY: a registered link, which stays alive while it is in the registry and
+                // the registry's lock is held.
+                unsafe { &*link }.process_exited(process);
+            }
+        }
+    });
 }
 
 /// A pointer to the adapter's [`HostLink`], held by the objects that the link outlives: the

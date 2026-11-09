@@ -185,11 +185,35 @@ $p | Wait-Process; Get-Content C:\hostmic\h.txt
 ```
 
 Expected: the second `test-host` fails with `ATTACH: The requested resource is in use.
-(0x800700AA)` (one host at a time); the first prints `attached`, then one line per change with
-a growing generation: `stopped` (stream created, 48000 Hz 2 ch int16), `paused` with its buffer
-(960 frames, packets of 480 in shared mode), `running`, `paused`, `stopped`, `no stream`, then
-`detached`. A host killed with `Stop-Process`, or one that exits without detaching
-(`--no-detach`), is detached when its handle closes: the next `test-host` attaches.
+(0x800700AA)` (one host at a time); the first prints `attached` with the address of the shared
+buffer in its process (page-aligned, 192000 bytes), then one line per change with a growing
+generation: `stopped` (stream created, 48000 Hz 2 ch int16), `paused` with its buffer (960
+frames, packets of 480 in shared mode), `running`, `paused`, `stopped`, `no stream`, then
+`detached`. While the stream runs, it prints once a second the peak of the stream's part of
+the buffer, read through its own mapping: `-6.02 dBFS over 960 frames`, the driver's tone (the
+first reading, right after `running`, may still be silence). A host killed with
+`Stop-Process`, or one that exits without detaching (`--no-detach`), is detached when its
+handle closes: the next `test-host` attaches.
+
+The host's mapping must never outlive it, whoever holds its handle. `--holder` starts a process
+(`ping`) that inherits the host's handle; `--close-own-handle` also closes the host's own:
+
+```powershell
+# The host dies, the holder keeps the handle: the host is detached at its exit.
+$p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','60','--holder' -RedirectStandardOutput C:\hostmic\a.txt -PassThru -WindowStyle Hidden
+Start-Sleep 3; Stop-Process $p -Force; Start-Sleep 2
+C:\hostmic\test-host.exe --seconds 1
+Get-Process ping | Stop-Process -Force
+# The holder closes the last handle while the host lives: the host's mapping goes.
+$p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','8','--holder','--close-own-handle' -RedirectStandardOutput C:\hostmic\b.txt -PassThru -WindowStyle Hidden
+Start-Sleep 3; Get-Process ping | Stop-Process -Force; $p | Wait-Process; Get-Content C:\hostmic\b.txt
+```
+
+Expected: after the first kill, the driver logs `the host's process exited with its handle
+still open elsewhere` and `host detached`, the microphone is unplugged, and the next
+`test-host` attaches; in the second case `b.txt` shows the mapping `mapped`, then `unmapped`
+once the holder is killed, while the host still runs. A holder left running keeps a handle to
+the interface open, which makes `devcon remove` answer "Removed on reboot" (below).
 
 The microphone's jack follows the host. The endpoint's state is in the registry, under
 `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{…}` (the key whose

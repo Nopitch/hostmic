@@ -230,20 +230,24 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     only the attached host's process may advance. Hosts are 64-bit processes: for a 32-bit
     one the buffer could be mapped out of reach. The validation of every request is pure Rust
     in `hostmic-driver-core`, unit-tested and fuzzed.
-  - **One buffer for the whole attachment.** WaveRT allocates a buffer per stream and frees it
+  - **One buffer for the adapter's life.** WaveRT allocates a buffer per stream and frees it
     when the stream closes; mapping that buffer into the host would mean taking it away while
-    the host writes. Instead the driver owns one buffer (1 s at most of the largest format),
-    reference-counted by the host and the stream, mapped once into the host on `ATTACH`;
-    `AllocateAudioBuffer` returns an MDL over it. The audio engine requires the actual size to
-    be at least the requested one, so a larger request fails. To check in the VM: that the
-    engine accepts an MDL the miniport built itself (the documentation describes the port's
-    allocators). The driver no longer writes audio: it zeroes the buffer and nothing else.
+    the host writes. Instead the adapter owns one buffer (1 s at most of the largest format,
+    rounded up to whole pages), allocated at its first start and reference-counted by the
+    adapter, each stream buffer and the host's mapping; a host that detaches and attaches again
+    while a stream runs finds the same pages (a buffer per attachment, the first idea, would
+    have left a running stream on the old one). `AllocateAudioBuffer` returns a partial MDL
+    over its start. The audio engine requires the actual size to be at least the requested
+    one, so a larger request fails. The driver no longer writes audio: it zeroes the buffer and
+    nothing else.
   - **Mapping into the host:** `MmMapLockedPagesSpecifyCache` in user mode raises an exception
     on failure and Rust cannot catch structured exceptions, so a C function of a few lines,
     compiled with `cc`, wraps it in `__try`/`__except`; user mappings are never executable. The
-    mapping is undone in the host's context, on detach or on the handle's cleanup, and a process
-    notification routine covers a host that dies while another process holds a duplicate of its
-    handle (to confirm in the documentation before writing it).
+    mapping is undone in the host's process: on `DETACH`, on the handle's cleanup or close (in
+    whatever process closes it last, attaching to the host's), and from a process notification
+    routine (`PsSetCreateProcessNotifyRoutineEx`, hence `/INTEGRITYCHECK`) when the host's
+    process exits while another process holds a duplicate of its handle; it runs in the dying
+    process before its address space goes, and attach and detach share a lock with it.
   - **The host advances the position, without a lock:** the stream's generation and position
     share one 64-bit word (an even generation accepts frames, an odd one does not; writers
     halt the generation before changing anything else), and `ADVANCE` moves it with one
@@ -322,6 +326,32 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   integrated device; PortCls installs no fast I/O table (logged at load); the review moved the
   event's enables to the miniport's own port, since an old miniport's enable must never land
   in a newer port's list.
+  *The shared buffer and its mapping (2026-11-09):* `driver/src/shared_buffer.rs` allocates the
+  buffer at the adapter's first start (192512 bytes, 47 zeroed pages); each stream's
+  `AllocateAudioBuffer` returns a partial MDL over its start, sized up by
+  `buffer::geometry` (an exclusive-mode request beyond one second fails); `ATTACH` zeroes it,
+  maps it into the requesting process (`hostmic-sys/c/map_user.c`, the driver's only C) and
+  returns its address. `HostLink` undoes the mapping on detach, cleanup and close, attaching
+  to the host's process when another one closes the handle, and from
+  `PsSetCreateProcessNotifyRoutineEx` when the host's process exits; the driver is linked with
+  `/INTEGRITYCHECK`, which that routine requires. The driver still writes its tone, now into
+  the shared pages: `tools/test-host` reads it through its own mapping. In the VM: the audio
+  engine accepts the miniport's own partial MDL (`capture-check` `PASS`, 0 glitch); the host
+  reads peaks of -6.02 dBFS while the stream runs; a host killed while another process holds
+  a duplicate of its handle is detached by the process notification, and the next host
+  attaches; when that other process closes the last handle while the host lives, the host's
+  mapping disappears (`VirtualQuery`); `devcon remove` unloads the driver. Lessons: the
+  independent review found that removing an adapter that never started would wait forever on
+  an uninitialized mutex, and that a removal with a host attached left its mapping behind
+  (now detached at removal); the driver writes the shared pages only as aligned 32-bit atomic
+  stores, never through a non-atomic Rust access, since the host, the audio engine, the timer
+  and `ATTACH` share them. A first version of that change, written inline in the driver,
+  subtracted without saturation and bug-checked the VM (0x1E, a debug build's overflow
+  panic): the frame arithmetic went back to `hostmic-driver-core` (`ring::tone_words`), where
+  it is unit-tested. A second review found the link's "started" state inferred from a cursor
+  value of 0, which a wrapped generation can reproduce: it is now a flag of its own. Still
+  open: an adapter removed while a handle to the host interface stays open (forced detach,
+  M6).
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and

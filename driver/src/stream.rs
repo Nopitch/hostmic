@@ -14,31 +14,35 @@
 //!   by PortCls; before they take away something the timer uses (the running state, the
 //!   buffer, the event), they wait for any timer callback in flight to finish
 //!   (`KeFlushQueuedDpcs`).
+//!
+//! The stream's buffer is the start of the adapter's shared buffer (PLAN.md, M4,
+//! [`crate::shared_buffer`]): `AllocateAudioBuffer` returns a partial MDL over it, sized up from
+//! the request (`hostmic_driver_core::buffer::geometry`), and holds a reference to the shared
+//! buffer until `FreeAudioBuffer`.
 
 use core::{
     ffi::c_void,
     ptr::{self, NonNull},
-    slice,
     sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use hostmic_abi::{Format, SampleType, State};
 use hostmic_driver_core::{
-    clock,
+    buffer, clock,
     format::{CHANNELS, FRAME_BYTES, SAMPLE_RATE},
+    host::MAX_BUFFER_BYTES,
     packet, ring,
 };
 use hostmic_sys::{
-    BOOL, IMiniportWaveRTInputStreamVtbl, IMiniportWaveRTStreamNotificationVtbl, IPortWaveRTStream,
-    KSAUDIO_POSITION, KSRTAUDIO_HWLATENCY, KSRTAUDIO_HWREGISTER, KSSTATE, PKSAUDIO_POSITION,
-    PKSDATAFORMAT, PPORTWAVERTSTREAM, guid,
+    BOOL, IMiniportWaveRTInputStreamVtbl, IMiniportWaveRTStreamNotificationVtbl, KSAUDIO_POSITION,
+    KSRTAUDIO_HWLATENCY, KSRTAUDIO_HWREGISTER, KSSTATE, PKSAUDIO_POSITION, PKSDATAFORMAT, guid,
 };
 use wdk_sys::{
-    _MEMORY_CACHING_TYPE, DWORD, EX_TIMER_HIGH_RESOLUTION, FALSE, LARGE_INTEGER,
-    MEMORY_CACHING_TYPE, NTSTATUS, PEX_TIMER, PHYSICAL_ADDRESS, PKEVENT, PMDL, PVOID,
-    STATUS_DEVICE_NOT_READY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_STATE,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
-    STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG, ULONG64,
+    _MEMORY_CACHING_TYPE, DWORD, EX_TIMER_HIGH_RESOLUTION, FALSE, LARGE_INTEGER, MDL,
+    MEMORY_CACHING_TYPE, NTSTATUS, PEX_TIMER, PKEVENT, PMDL, PVOID, STATUS_DEVICE_NOT_READY,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
+    STATUS_UNSUCCESSFUL, ULONG, ULONG64,
     ntddk::{
         ExAllocateTimer, ExCancelTimer, ExDeleteTimer, ExSetTimer, KeFlushQueuedDpcs,
         KeQueryPerformanceCounter, KeSetEvent,
@@ -47,6 +51,7 @@ use wdk_sys::{
 
 use crate::com::{self, ComObject, Unknown};
 use crate::host_link::LinkRef;
+use crate::shared_buffer::BufferRef;
 
 /// Timer period: 1 ms, in 100 ns units (the sample's).
 const TIMER_PERIOD: i64 = 10_000;
@@ -57,6 +62,10 @@ const LEAD_FRAMES: u64 = 2 * SAMPLE_RATE as u64 / 1_000;
 
 /// No packet read yet.
 const NO_PACKET: u64 = u64::MAX;
+
+/// [`FRAME_BYTES`] as the `u32` the buffer geometry takes.
+#[allow(clippy::cast_possible_truncation, reason = "a frame is a few bytes")]
+const FRAME_BYTES_U32: u32 = FRAME_BYTES as u32;
 
 /// `TRUE` and `FALSE` as the kernel's one-byte `BOOLEAN`.
 const BOOLEAN_TRUE: u8 = 1;
@@ -71,8 +80,6 @@ pub struct Stream {
     /// `IMiniportWaveRTInputStream` (`GetReadPacket`).
     input: &'static IMiniportWaveRTInputStreamVtbl,
     references: AtomicU32,
-    /// The port's stream, which allocates the buffer. Not counted: it owns this stream.
-    port: AtomicPtr<IPortWaveRTStream>,
     /// The timer, allocated right after the object (it needs the object's address).
     timer: AtomicPtr<wdk_sys::_EX_TIMER>,
     /// Performance counter ticks per second.
@@ -93,6 +100,10 @@ pub struct Stream {
     /// The buffer, mapped in system space, and its size in bytes (whole frames).
     buffer: AtomicPtr<u8>,
     buffer_bytes: AtomicUsize,
+    /// The stream's reference to the shared buffer (a raw [`BufferRef`]) and its MDL over it,
+    /// while the stream has a buffer.
+    shared: AtomicPtr<c_void>,
+    mdl: AtomicPtr<MDL>,
     /// Frames per packet in event-driven mode, 0 in polling mode.
     frames_per_packet: AtomicU64,
     /// The notification event of event-driven mode.
@@ -130,16 +141,14 @@ impl Drop for Stream {
         }
         // SAFETY: PASSIVE_LEVEL; waits for any DPC still queued.
         unsafe { KeFlushQueuedDpcs() };
+        // A buffer PortCls did not free (it always does, before the last release).
+        self.release_buffer();
         self.link.get().stream_closed();
     }
 }
 
-/// Creates a capture stream bound to `port_stream`, or `None` when the pool is exhausted.
-///
-/// # Safety
-///
-/// `port_stream` is the port's stream for the new stream, valid for its whole life.
-pub unsafe fn new(port_stream: PPORTWAVERTSTREAM, link: LinkRef) -> Option<Unknown> {
+/// Creates a capture stream, or `None` when the pool is exhausted.
+pub fn new(link: LinkRef) -> Option<Unknown> {
     let mut frequency = LARGE_INTEGER::default();
     // SAFETY: any IRQL; `frequency` is a valid out-parameter.
     unsafe { KeQueryPerformanceCounter(&raw mut frequency) };
@@ -150,7 +159,6 @@ pub unsafe fn new(port_stream: PPORTWAVERTSTREAM, link: LinkRef) -> Option<Unkno
         notification: &NOTIFICATION_VTABLE,
         input: &INPUT_VTABLE,
         references: AtomicU32::new(1),
-        port: AtomicPtr::new(port_stream),
         timer: AtomicPtr::new(ptr::null_mut()),
         qpc_frequency: AtomicU64::new(frequency),
         state: AtomicI32::new(KSSTATE::KSSTATE_STOP),
@@ -161,6 +169,8 @@ pub unsafe fn new(port_stream: PPORTWAVERTSTREAM, link: LinkRef) -> Option<Unkno
         last_read_packet: AtomicU64::new(NO_PACKET),
         buffer: AtomicPtr::new(ptr::null_mut()),
         buffer_bytes: AtomicUsize::new(0),
+        shared: AtomicPtr::new(ptr::null_mut()),
+        mdl: AtomicPtr::new(ptr::null_mut()),
         frames_per_packet: AtomicU64::new(0),
         event: AtomicPtr::new(ptr::null_mut()),
         link,
@@ -239,52 +249,42 @@ impl Stream {
         {
             return STATUS_INVALID_PARAMETER;
         }
-        let frames = usize::try_from(requested).unwrap_or(0) / FRAME_BYTES;
-        if frames == 0 || !self.buffer.load(Ordering::Acquire).is_null() {
+        if !self.buffer.load(Ordering::Acquire).is_null() {
             return STATUS_UNSUCCESSFUL;
         }
-        let bytes = frames * FRAME_BYTES;
-        let Ok(bytes_ulong) = ULONG::try_from(bytes) else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let port_stream = self.port.load(Ordering::Relaxed);
-        // Below 4 GiB, as in the sample; nothing does DMA to it.
-        let high = PHYSICAL_ADDRESS {
-            QuadPart: 0xFFFF_FFFF,
-        };
-        // SAFETY: `port_stream` is the live port stream (`new`'s contract).
-        let Some(mdl) = (unsafe { port_stream_call::allocate_pages(port_stream, high, bytes) })
+        // At least the requested size (the audio engine refuses less), in whole packets of
+        // whole frames, within the shared buffer: an exclusive-mode request beyond one second
+        // fails here.
+        let Some(geometry) =
+            buffer::geometry(requested, packets, FRAME_BYTES_U32, MAX_BUFFER_BYTES)
         else {
+            wdk::println!("hostmic: {requested} bytes in {packets} packets do not fit the buffer");
             return STATUS_INSUFFICIENT_RESOURCES;
         };
-        // SAFETY: `mdl` was just allocated by this port stream.
-        let base = unsafe { port_stream_call::map(port_stream, mdl) };
-        let Some(base) = NonNull::new(base.cast::<u8>()) else {
-            // SAFETY: `mdl` was allocated above and is not mapped.
-            unsafe { port_stream_call::free_pages(port_stream, mdl) };
+        let Some(shared) = self.link.get().buffer() else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let Some(mdl) = shared.stream_mdl(geometry.bytes) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
-        // SAFETY: `base` maps `bytes` bytes, not shared with the audio engine yet.
-        unsafe { base.write_bytes(0, bytes) };
+        // Not shared with the audio engine yet; the host has not seen this buffer either.
+        shared.zero(geometry.bytes as usize);
+        let base = shared.system();
 
-        self.frames_per_packet.store(
-            if packets == 0 {
-                0
-            } else {
-                u64::try_from(frames).unwrap_or(0) / u64::from(packets)
-            },
-            Ordering::Relaxed,
-        );
-        self.buffer_bytes.store(bytes, Ordering::Relaxed);
-        self.buffer.store(base.as_ptr(), Ordering::Release);
-        self.link.get().set_buffer(
-            u32::try_from(frames).unwrap_or(u32::MAX),
-            u32::try_from(self.frames_per_packet.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
-        );
+        self.frames_per_packet
+            .store(u64::from(geometry.frames_per_packet), Ordering::Relaxed);
+        self.buffer_bytes
+            .store(geometry.bytes as usize, Ordering::Relaxed);
+        self.mdl.store(mdl.as_ptr(), Ordering::Relaxed);
+        self.shared.store(shared.into_raw(), Ordering::Release);
+        self.buffer.store(base, Ordering::Release);
+        self.link
+            .get()
+            .set_buffer(geometry.frames, geometry.frames_per_packet);
         // SAFETY: the out-parameters are writable (checked not null above).
-        unsafe { mdl_out.write(mdl) };
+        unsafe { mdl_out.write(mdl.as_ptr()) };
         // SAFETY: as above.
-        unsafe { actual_out.write(bytes_ulong) };
+        unsafe { actual_out.write(geometry.bytes) };
         // SAFETY: as above.
         unsafe { offset_out.write(0) };
         // SAFETY: as above.
@@ -292,24 +292,37 @@ impl Stream {
         STATUS_SUCCESS
     }
 
-    /// Unmaps and frees the buffer. `PASSIVE_LEVEL`, stream stopped.
+    /// `FreeAudioBuffer`: PortCls gives back `mdl`, the one `allocate` returned, no longer
+    /// mapped into the audio engine. `PASSIVE_LEVEL`, stream stopped.
     fn free(&self, mdl: PMDL) {
+        if mdl != self.mdl.load(Ordering::Acquire) {
+            wdk::println!("hostmic: FreeAudioBuffer with an MDL this stream did not allocate");
+        }
+        self.release_buffer();
+    }
+
+    /// Lets the buffer go: the timer stops using it, then the MDL and the reference to the
+    /// shared buffer are released. `PASSIVE_LEVEL`.
+    fn release_buffer(&self) {
         let base = self.buffer.swap(ptr::null_mut(), Ordering::AcqRel);
         self.buffer_bytes.store(0, Ordering::Relaxed);
         self.frames_per_packet.store(0, Ordering::Relaxed);
+        if base.is_null() {
+            return;
+        }
         // The timer may no longer touch the buffer.
         self.stop_timer();
         self.link.get().set_buffer(0, 0);
-        if mdl.is_null() {
-            return;
+        let mdl = self.mdl.swap(ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: the reference `allocate` stored, taken out once.
+        let shared =
+            unsafe { BufferRef::from_raw(self.shared.swap(ptr::null_mut(), Ordering::AcqRel)) };
+        if let (Some(shared), Some(mdl)) = (&shared, NonNull::new(mdl)) {
+            // SAFETY: the MDL `allocate` built on this buffer; PortCls no longer maps it (it
+            // gave it back, or released the stream).
+            unsafe { shared.free_stream_mdl(mdl) };
         }
-        let port_stream = self.port.load(Ordering::Relaxed);
-        if !base.is_null() {
-            // SAFETY: `base` is the mapping of `mdl` made in `allocate`.
-            unsafe { port_stream_call::unmap(port_stream, base.cast(), mdl) };
-        }
-        // SAFETY: `mdl` was allocated by this port stream and is no longer mapped.
-        unsafe { port_stream_call::free_pages(port_stream, mdl) };
+        drop(shared);
     }
 
     /// `SetState`. `PASSIVE_LEVEL`, serialized by PortCls.
@@ -391,12 +404,18 @@ unsafe extern "C" fn tick(_timer: PEX_TIMER, context: PVOID) {
     let written = stream.written.load(Ordering::Relaxed);
     let target = elapsed.saturating_add(LEAD_FRAMES);
     if target > written {
-        // SAFETY: `base` maps `bytes` bytes until `free`, which clears `buffer` and waits for
-        // this callback before unmapping. This callback is the only writer; the audio engine
-        // reads the same pages through its own mapping, outside Rust's memory model, like a
-        // device's DMA.
-        let ring = unsafe { slice::from_raw_parts_mut(base, bytes) };
-        ring::write_tone(ring, written, target);
+        for (index, value) in ring::tone_words(written, target, bytes / FRAME_BYTES) {
+            #[allow(clippy::cast_ptr_alignment, reason = "the buffer is page-aligned")]
+            let word = base.cast::<u32>().wrapping_add(index);
+            // SAFETY: `base` maps the shared buffer, at least `bytes` bytes, while `buffer` is
+            // set: `release_buffer` clears it and waits for this callback before letting the
+            // buffer go. `index` is a frame within those bytes (below `bytes / FRAME_BYTES`); a
+            // frame is one aligned word (page-aligned base). The pages are shared memory: the
+            // audio engine and the host access them through their own mappings, and `ATTACH`
+            // may zero them meanwhile: the driver accesses these words atomically only.
+            let word = unsafe { AtomicU32::from_ptr(word) };
+            word.store(value, Ordering::Relaxed);
+        }
         stream.written.store(target, Ordering::Release);
     }
 
@@ -630,89 +649,4 @@ unsafe extern "C" fn get_read_packet(
     // SAFETY: as above. The driver keeps no data beyond the buffer.
     unsafe { more_data.write(FALSE.cast_signed()) };
     STATUS_SUCCESS
-}
-
-/// Calls into `IPortWaveRTStream`.
-mod port_stream_call {
-    use core::ffi::c_void;
-
-    use hostmic_sys::IPortWaveRTStream;
-    use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL, PVOID};
-
-    /// The vtable of a live port stream.
-    ///
-    /// # Safety
-    ///
-    /// `port_stream` is a live port stream.
-    unsafe fn vtable<'a>(
-        port_stream: *mut IPortWaveRTStream,
-    ) -> &'a hostmic_sys::IPortWaveRTStreamVtbl {
-        // SAFETY: the caller's contract.
-        let vtable = unsafe { (*port_stream).lpVtbl };
-        // SAFETY: an interface's vtable is valid for the interface's lifetime.
-        unsafe { &*vtable }
-    }
-
-    /// `AllocatePagesForMdl`.
-    ///
-    /// # Safety
-    ///
-    /// `port_stream` is a live port stream; `PASSIVE_LEVEL`.
-    pub unsafe fn allocate_pages(
-        port_stream: *mut IPortWaveRTStream,
-        high: PHYSICAL_ADDRESS,
-        bytes: usize,
-    ) -> Option<PMDL> {
-        // SAFETY: the caller's contract.
-        let allocate = unsafe { vtable(port_stream) }.AllocatePagesForMdl?;
-        // SAFETY: valid port stream and arguments.
-        let mdl = unsafe { allocate(port_stream.cast::<c_void>(), high, bytes as u64) };
-        (!mdl.is_null()).then_some(mdl)
-    }
-
-    /// `MapAllocatedPages`, cached.
-    ///
-    /// # Safety
-    ///
-    /// `port_stream` is a live port stream and `mdl` one of its allocations; `PASSIVE_LEVEL`.
-    pub unsafe fn map(port_stream: *mut IPortWaveRTStream, mdl: PMDL) -> PVOID {
-        // SAFETY: the caller's contract.
-        let Some(map) = unsafe { vtable(port_stream) }.MapAllocatedPages else {
-            return core::ptr::null_mut();
-        };
-        // SAFETY: valid port stream and MDL.
-        unsafe {
-            map(
-                port_stream.cast::<c_void>(),
-                mdl,
-                _MEMORY_CACHING_TYPE::MmCached,
-            )
-        }
-    }
-
-    /// `UnmapAllocatedPages`.
-    ///
-    /// # Safety
-    ///
-    /// `base` is the mapping of `mdl` by this port stream; `PASSIVE_LEVEL`.
-    pub unsafe fn unmap(port_stream: *mut IPortWaveRTStream, base: PVOID, mdl: PMDL) {
-        // SAFETY: the caller's contract.
-        if let Some(unmap) = unsafe { vtable(port_stream) }.UnmapAllocatedPages {
-            // SAFETY: valid port stream, mapping and MDL.
-            unsafe { unmap(port_stream.cast::<c_void>(), base, mdl) };
-        }
-    }
-
-    /// `FreePagesFromMdl`.
-    ///
-    /// # Safety
-    ///
-    /// `mdl` is an unmapped allocation of this port stream; `PASSIVE_LEVEL`.
-    pub unsafe fn free_pages(port_stream: *mut IPortWaveRTStream, mdl: PMDL) {
-        // SAFETY: the caller's contract.
-        if let Some(free) = unsafe { vtable(port_stream) }.FreePagesFromMdl {
-            // SAFETY: valid port stream and MDL.
-            unsafe { free(port_stream.cast::<c_void>(), mdl) };
-        }
-    }
 }

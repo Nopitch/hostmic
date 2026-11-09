@@ -13,10 +13,13 @@ says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
 - **No path from user mode to kernel memory.** No input reachable from user mode (Kernel
   Streaming property requests and data formats today, the host's IOCTLs from M4) lets a process
   read or write kernel memory, or memory of another process.
-- **Only the attached host gets the buffer.** From M4, the client's audio buffer is mapped into
-  one process only, the host that attached through the host interface, and unmapped when that
-  host detaches or dies. Opening the host interface is restricted to the system, administrators
-  and interactive users, enforced by the I/O manager on a device object of its own.
+- **Only the attached host gets the buffer.** From M4, the audio buffer, which the driver owns,
+  is mapped into one process only besides the audio engine: the host that attached through the
+  host interface. The mapping is undone when that host detaches, when its handle is closed by
+  whichever process holds it last, and when the host's process ends, even while another process
+  holds a duplicate of its handle. Opening the host interface is restricted to the system,
+  administrators and interactive users, enforced by the I/O manager on a device object of its
+  own.
 - **Malformed input is rejected, not trusted.** Unsupported formats, pins, property sizes and
   values are refused with an error status; the driver accepts one exactly specified format.
 - **A stable system.** The driver does no allocation, takes no lock and does no I/O in its
@@ -75,8 +78,17 @@ of the build.
    event only for a user-mode request in the requesting process, with `EVENT_MODIFY_STATE`;
    one host at a time; only the attached handle detaches; the interface refuses removal while
    a handle to it is open, so no request reaches a deleted device.
-3. **Shared memory** (M4): the ring buffer mapped into the host; the driver never reads data back
-   from it to make decisions.
+3. **Shared memory** (M4): one buffer of whole pages, owned by the driver, from zeroed pages
+   (`MmAllocatePagesForMdlEx`) and zeroed again for each host, so that neither kernel data nor
+   a previous host's audio reaches a host. It is mapped into the attached host (readable and
+   writable, never executable, through a C function of a few lines that catches the mapping's
+   structured exception, which Rust cannot) and, through a partial MDL per stream, into the
+   audio engine; the driver never reads it. The pages are reference-counted by the adapter,
+   each stream buffer and the host's mapping, so none is freed while mapped. A user mapping is
+   undone in its own process: on `DETACH`, on the handle's last close from any process
+   (attaching to the host's), and from a process notification routine when the host's process
+   exits; attaching and detaching are serialized, so the notification returns only once the
+   mapping is gone.
 4. **PortCls → miniport**: COM-style calls, possibly concurrent; reference counting and the
    real-time design below.
 5. **Supply chain**: repository, CI, dependencies, and later the release signing.
@@ -106,10 +118,10 @@ of the build.
 | Improper input validation (CWE-20) | Allowlist checks of formats and sizes in pure, unit-tested Rust (`format::is_supported`); IOCTL validation the same way; both fuzzed |
 | Out-of-bounds read or write (CWE-125, CWE-787) | Size checks before every access to a caller's buffer; ring writes through bounded slices; unaligned-safe reads and writes |
 | Integer overflow (CWE-190) | 128-bit intermediates for clock arithmetic, saturating and checked operations; overflow checks in tests and debug builds |
-| Use after free (CWE-416) | Atomic reference counting with `Arc`-like orderings; timers deleted and DPCs flushed before a stream is freed; the notification event dropped and callbacks flushed before unregistration returns |
+| Use after free (CWE-416) | Atomic reference counting with `Arc`-like orderings, including the shared buffer's pages (the adapter, each stream buffer and the host's mapping hold one); timers deleted and DPCs flushed before a stream is freed; the notification event dropped and callbacks flushed before unregistration returns |
 | Race conditions (CWE-362) | One writer per stream (its timer), positions published with release/acquire atomics, state changes serialized by PortCls |
 | Double fetch, TOCTOU on user memory (CWE-367) | User input copied once, then validated (M4) |
-| Kernel memory disclosure (CWE-200) | Buffers zeroed when allocated; no uninitialized structure returned |
+| Kernel memory disclosure (CWE-200) | Buffers zeroed when allocated; the shared buffer made of whole zeroed pages, zeroed again for each host; no uninitialized structure returned |
 | Denial of service by a crash (CWE-248, CWE-400) | No panic on any input in the core logic; allocation only when a stream is created, never per period |
 | Hard-coded or leaked credentials (CWE-798) | No secrets in CI; secret scanning in CI, in pre-commit and with GitHub push protection |
 | Vulnerable or malicious dependencies (CWE-1395) | Pinned dependencies, required dependency review, Dependabot, actions pinned by commit SHA |

@@ -65,6 +65,24 @@ unsafe extern "C" {}
 #[link(name = "wdmsec")]
 unsafe extern "C" {}
 
+#[cfg(not(test))]
+#[link(name = "hostmic_sys_c", kind = "static")]
+unsafe extern "C" {
+    /// Maps the pages of `mdl` into the current process with `cache` (`c/map_user.c`):
+    /// `MmMapLockedPagesSpecifyCache` in user mode, whose failure, a structured exception, is
+    /// caught and returned as null. The mapping is readable, writable and never executable.
+    ///
+    /// # Safety
+    ///
+    /// `mdl` describes locked pages (for instance from `MmAllocatePagesForMdlEx`); IRQL <=
+    /// `APC_LEVEL`, in the context of the process that gets the mapping, which must be unmapped
+    /// (`MmUnmapLockedPages`, in that process's context) before the process ends.
+    pub fn hostmic_map_user(
+        mdl: wdk_sys::PMDL,
+        cache: wdk_sys::MEMORY_CACHING_TYPE,
+    ) -> wdk_sys::PVOID;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

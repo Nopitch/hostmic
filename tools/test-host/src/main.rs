@@ -1,15 +1,25 @@
 //! `test-host`: a test host for the hostmic driver.
 //!
 //! ```text
-//! test-host [--seconds N] [--no-detach]
+//! test-host [--seconds N] [--no-detach] [--holder [--close-own-handle]]
 //! ```
 //!
 //! Attaches to the first host interface, then prints the capture stream's state each time the
 //! driver signals a change, for `N` seconds (default 30), and detaches. With `--no-detach` it
 //! exits without detaching, to check that closing the handle detaches the host.
 //!
-//! It plays no audio yet: the shared buffer and the host-advanced position come with later
-//! pull requests (PLAN.md, M4). Exit status: 0 on success, 1 on failure, 2 on a usage error.
+//! Two options check that the host's mapping never outlives it, whoever holds its handle:
+//! `--holder` starts a process that inherits the host's handle (`ping -n 3600 127.0.0.1`) and
+//! prints its id, then goes on as usual (kill the host: the driver must undo the mapping while
+//! the holder keeps the handle open); `--close-own-handle` also closes the host's own handle,
+//! so that the holder's is the last one, then watches its mapping without touching it (kill the
+//! holder: the driver must undo the mapping in this process, from the holder's).
+//!
+//! The driver maps its shared buffer into the host on attach. While the stream runs, the host
+//! prints once a second the peak of what the stream's part of the buffer holds: until the host
+//! advances the position (a later pull request, PLAN.md, M4), the driver writes its test tone
+//! there, so the peak shows that the host sees the audio engine's pages. Exit status: 0 on
+//! success, 1 on failure, 2 on a usage error.
 
 use std::{
     env,
@@ -27,31 +37,42 @@ use windows::{
             CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
             CM_Get_Device_Interface_ListW, CR_SUCCESS,
         },
-        Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0},
+        Foundation::{
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
+            SetHandleInformation, WAIT_OBJECT_0,
+        },
         Storage::FileSystem::{
             CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
             OPEN_EXISTING,
         },
         System::{
             IO::DeviceIoControl,
-            Threading::{CreateEventW, WaitForSingleObject},
+            Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery},
+            Threading::{
+                CREATE_NO_WINDOW, CreateEventW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+                WaitForSingleObject,
+            },
         },
     },
-    core::{GUID, HSTRING, PCWSTR},
+    core::{GUID, HSTRING, PCWSTR, PWSTR},
 };
 
-const USAGE: &str = "usage: test-host [--seconds N] [--no-detach]";
+const USAGE: &str = "usage: test-host [--seconds N] [--no-detach] [--holder [--close-own-handle]]";
 
 /// Command-line options.
 struct Options {
     seconds: u64,
     detach: bool,
+    holder: bool,
+    close_own_handle: bool,
 }
 
 fn parse() -> Result<Options, String> {
     let mut options = Options {
         seconds: 30,
         detach: true,
+        holder: false,
+        close_own_handle: false,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -63,8 +84,13 @@ fn parse() -> Result<Options, String> {
                     .map_err(|_| format!("--seconds: not a number: {value}"))?;
             }
             "--no-detach" => options.detach = false,
+            "--holder" => options.holder = true,
+            "--close-own-handle" => options.close_own_handle = true,
             _ => return Err(format!("unknown argument: {arg}")),
         }
+    }
+    if options.close_own_handle && !options.holder {
+        return Err("--close-own-handle needs --holder".to_owned());
     }
     Ok(options)
 }
@@ -121,18 +147,50 @@ fn run(options: &Options) -> Result<(), String> {
         reply.buffer, reply.buffer_bytes
     );
 
+    if reply.buffer == 0 || !reply.buffer.is_multiple_of(4096) {
+        return Err(format!(
+            "ATTACH: unusable buffer address {:#x}",
+            reply.buffer
+        ));
+    }
+    if options.holder {
+        let holder = spawn_holder(&device)?;
+        println!("holder     pid {holder} inherited the host's handle");
+        if options.close_own_handle {
+            drop(device);
+            println!("host       closed its own handle: the holder's is the last");
+            watch_mapping(&reply, options.seconds);
+            return Ok(());
+        }
+    }
+
     let end = Instant::now() + Duration::from_secs(options.seconds);
+    let mut stream = StreamState::default();
+    let mut next_peak = Instant::now();
     while Instant::now() < end {
         // SAFETY: an event handle this process owns.
         let wait = unsafe { WaitForSingleObject(event.0, 250) };
-        if wait != WAIT_OBJECT_0 {
-            continue;
+        if wait == WAIT_OBJECT_0 {
+            let mut state = [0u8; StreamState::SIZE];
+            device
+                .control(IOCTL_GET_STREAM, &[], &mut state)
+                .map_err(|e| format!("GET_STREAM: {e}"))?;
+            stream = StreamState::from_bytes(&state);
+            print_state(&stream);
         }
-        let mut state = [0u8; StreamState::SIZE];
-        device
-            .control(IOCTL_GET_STREAM, &[], &mut state)
-            .map_err(|e| format!("GET_STREAM: {e}"))?;
-        print_state(&StreamState::from_bytes(&state));
+        if State::from_code(stream.state) == Some(State::Running) && Instant::now() >= next_peak {
+            next_peak = Instant::now() + Duration::from_secs(1);
+            // SAFETY: the driver mapped `buffer_bytes` bytes at `buffer` into this process
+            // until DETACH, which comes after the loop.
+            match unsafe { peak(&reply, &stream) } {
+                Some(peak) => println!(
+                    "buffer     peak {} over {} frames",
+                    dbfs(peak),
+                    stream.buffer_frames
+                ),
+                None => println!("buffer     the stream's buffer does not fit the mapping"),
+            }
+        }
     }
 
     if options.detach {
@@ -144,6 +202,108 @@ fn run(options: &Options) -> Result<(), String> {
         println!("exiting without DETACH: closing the handle detaches");
     }
     Ok(())
+}
+
+/// Starts a process that inherits `device`'s handle and lives for an hour; returns its id.
+fn spawn_holder(device: &Handle) -> Result<u32, String> {
+    // SAFETY: an open handle this process owns.
+    unsafe { SetHandleInformation(device.0, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+        .map_err(|e| format!("SetHandleInformation: {e}"))?;
+    let mut command: Vec<u16> = "ping.exe -n 3600 127.0.0.1\0".encode_utf16().collect();
+    let startup = STARTUPINFOW {
+        cb: u32::try_from(size_of::<STARTUPINFOW>()).unwrap_or(0),
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: a writable NUL-terminated command line; startup and process information valid
+    // for the call; handles inherited on purpose.
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(command.as_mut_ptr())),
+            None,
+            None,
+            true,
+            CREATE_NO_WINDOW,
+            None,
+            PCWSTR::null(),
+            &raw const startup,
+            &raw mut process,
+        )
+    }
+    .map_err(|e| format!("CreateProcessW: {e}"))?;
+    // The holder runs on its own; its handles here are not needed.
+    drop(Handle(process.hThread));
+    drop(Handle(process.hProcess));
+    Ok(process.dwProcessId)
+}
+
+/// Prints whether the shared buffer is still mapped at the address `ATTACH` returned, each time
+/// that changes, for `seconds` seconds. Only queries the address, never reads it.
+fn watch_mapping(reply: &AttachReply, seconds: u64) {
+    let Ok(address) = usize::try_from(reply.buffer) else {
+        return;
+    };
+    let end = Instant::now() + Duration::from_secs(seconds);
+    let mut last = None;
+    while Instant::now() < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries this process's address space; `info` is writable.
+        let written = unsafe {
+            VirtualQuery(
+                Some(address as *const core::ffi::c_void),
+                &raw mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let mapped = written != 0 && info.State == MEM_COMMIT;
+        if last != Some(mapped) {
+            println!(
+                "mapping    {:#x}: {}",
+                reply.buffer,
+                if mapped { "mapped" } else { "unmapped" }
+            );
+            last = Some(mapped);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The largest absolute 16-bit sample in the stream's part of the shared buffer, or `None` when
+/// the stream's format is not 16-bit or its buffer exceeds the mapping.
+///
+/// # Safety
+///
+/// `reply` describes a live mapping of the shared buffer in this process.
+unsafe fn peak(reply: &AttachReply, stream: &StreamState) -> Option<u16> {
+    if SampleType::from_code(stream.format.sample_type) != Some(SampleType::Int16) {
+        return None;
+    }
+    let samples = usize::try_from(stream.buffer_frames)
+        .ok()?
+        .checked_mul(usize::from(stream.format.channels))?;
+    if samples.checked_mul(2)? > reply.buffer_bytes as usize {
+        return None;
+    }
+    let base = usize::try_from(reply.buffer).ok()? as *const i16;
+    let mut peak = 0u16;
+    for index in 0..samples {
+        // Within the mapping (checked above), 2-byte aligned (page-aligned base).
+        let sample = base.wrapping_add(index);
+        // SAFETY: as above. The driver writes the same pages concurrently: a volatile read of
+        // each sample, which may be old or new, never torn (an aligned 16-bit read).
+        let sample = unsafe { sample.read_volatile() };
+        peak = peak.max(sample.unsigned_abs());
+    }
+    Some(peak)
+}
+
+/// A 16-bit peak in dBFS, two decimals.
+fn dbfs(peak: u16) -> String {
+    if peak == 0 {
+        return "-inf dBFS (silence)".to_owned();
+    }
+    format!("{:.2} dBFS", 20.0 * (f64::from(peak) / 32768.0).log10())
 }
 
 /// One line per state, with units.

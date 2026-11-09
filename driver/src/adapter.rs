@@ -132,7 +132,10 @@ unsafe extern "C" fn start_device(
 ) -> NTSTATUS {
     // SAFETY: `device` is the adapter's FDO.
     let link = unsafe { link(device) };
-    link.get().init();
+    if let Err(status) = link.get().init() {
+        println!("hostmic: StartDevice returned {status:#010x}: no shared buffer");
+        return status;
+    }
     // SAFETY: `device`, `irp` and `resources` come from PortCls for this start request.
     let status = match unsafe { install_filters(device, irp, resources, link) } {
         Ok((topology_port, wave_port)) => {
@@ -346,6 +349,10 @@ pub unsafe fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATU
             {
                 // SAFETY: the live host interface PDO, in the adapter's removal.
                 unsafe { host_device::detach(host) };
+            }
+            if u32::from(minor) == IRP_MN_REMOVE_DEVICE {
+                // SAFETY: `device` is the adapter's FDO, still alive in its removal.
+                unsafe { link(device) }.get().shutdown();
             }
         }
         IRP_MN_QUERY_DEVICE_RELATIONS => {
