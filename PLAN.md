@@ -443,10 +443,23 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   - no commercial focus (possible on request) and no political or controversial purpose.
   Fallback if refused: Microsoft attestation signing through a Partner Center hardware
   developer account, which requires an EV code-signing certificate (yearly cost).
-  **To re-check first:** Microsoft's "Driver signing offerings" page (dated 2026-03-23) now
-  titles attestation "Attestation signed drivers for testing scenarios" and says "For testing
-  purposes only, you can submit your drivers for attestation signing": whether attestation
-  still allows distribution to users decides between this path and WHCP (HLK testing).
+  *Microsoft's pages, read 2026-11-09 ("Driver signing options" and "Attestation sign Windows
+  drivers", both updated 2026-04-14; "Register for the Microsoft Windows Hardware Developer
+  Program", updated 2026-08-13):*
+  - attestation is still titled "for testing scenarios" ("For testing purposes only, you can
+    submit your drivers for attestation signing"), but none of the restrictions listed blocks
+    hostmic: no Windows Update for retail audiences (hostmic is a root-enumerated device
+    installed from GitHub releases); Windows 10 Desktop and later only (Windows Server 2016 and
+    later loads only HLK-tested drivers); not Windows Certified, yet "Windows trusts the
+    driver", so it loads with Secure Boot on;
+  - registration requires an organization: an EV certificate (to register only, not to sign the
+    driver), a Microsoft Entra ID global administrator, company details (D-U-N-S number or
+    manual entry), a legal contact with authority to sign agreements, then a questionnaire about
+    the business. An EV certificate is issued to a legal entity, so this path needs one (a sole
+    proprietorship, if the certificate authority accepts it for EV);
+  - **still to read**: the Code Signing Agreement accepted at registration, which decides
+    whether attestation-signed drivers may be distributed to users. If not, WHCP (HLK testing)
+    is the only path.
   *The release workflow's rules (2026-11-09, from a survey of open-source driver CI — windows-
   drivers-rs, Windows-driver-samples, ovpn-dco-win, WinFsp, virtio-win — and of GitHub's,
   zizmor's, SLSA's and Scorecard's guidance):*
