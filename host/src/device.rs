@@ -178,12 +178,13 @@ pub enum Advance {
 /// unmaps the buffer and the microphone shows unplugged. The attachment belongs to this
 /// process; a `Host` may move to another thread, which is what a real-time loop does.
 ///
-/// The buffer's mapping is the driver's: it lasts until `DETACH`, the close of every handle to
-/// the host's file object, or this process's end. The driver does not undo it otherwise: a
-/// device removal waits for the handle to close. The handle is not inheritable; a process that
-/// duplicates it into another one (which takes `PROCESS_DUP_HANDLE` on this process) gives that
-/// process a way to end the attachment while this one writes. After the driver refuses this
-/// handle once ([`Error::NotHost`]), the `Host` writes nothing more.
+/// The buffer's mapping is the driver's: it lasts until this process's `DETACH`, the close of
+/// every handle to the host's file object, or this process's end
+/// ([`AttachReply::buffer`](hostmic_abi::AttachReply::buffer)). The driver does not undo it
+/// otherwise: a device removal waits for the handle to close, and it refuses `DETACH` from
+/// another process. The handle is not inheritable; only a process with `PROCESS_DUP_HANDLE`
+/// on this one could close it from outside. After the driver refuses this handle once
+/// ([`Error::NotHost`]), the `Host` writes nothing more.
 #[derive(Debug)]
 pub struct Host {
     /// Dropped first: closing it detaches and unmaps the buffer if `Drop`'s `DETACH` did not.
