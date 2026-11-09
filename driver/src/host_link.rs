@@ -22,18 +22,18 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
+use crate::com::Unknown;
 use crate::topology::PIN_MICROPHONE;
 use hostmic_abi::{Format, State, StreamState};
 use hostmic_driver_core::host::Cursor;
-use hostmic_sys::{
-    IPortEvents, IPortEventsVtbl, KSEVENT_PINCAPS_CHANGENOTIFICATIONS, PKSEVENT_ENTRY, guid,
-};
+use hostmic_sys::{IPortEvents, IPortEventsVtbl, KSEVENT_PINCAPS_CHANGENOTIFICATIONS, guid};
 use wdk::println;
 use wdk_sys::{
-    EX_RUNDOWN_REF, FILE_OBJECT, KEVENT,
+    EX_RUNDOWN_REF, FILE_OBJECT, KEVENT, KGUARDED_MUTEX,
     ntddk::{
         ExAcquireRundownProtection, ExReInitializeRundownProtection, ExReleaseRundownProtection,
-        ExWaitForRundownProtectionRelease, KeSetEvent, ObfDereferenceObject,
+        ExWaitForRundownProtectionRelease, KeAcquireGuardedMutex, KeInitializeGuardedMutex,
+        KeReleaseGuardedMutex, KeSetEvent, ObfDereferenceObject,
     },
 };
 
@@ -63,12 +63,16 @@ pub struct HostLink {
     /// Keeps `event` alive while [`HostLink::notify`] signals it. All zeroes is an initialized
     /// rundown reference.
     rundown: UnsafeCell<EX_RUNDOWN_REF>,
-    /// The topology port's `IPortEvents`, to report jack changes; null while the topology
-    /// miniport is not initialized. Not counted: a reference would make a cycle (the port holds
-    /// the miniport), and the topology miniport clears it before its port goes away.
+    /// The topology port's `IPortEvents`, to report jack changes: one reference, owned by the
+    /// link; null while no topology miniport is initialized. As in Microsoft's sysvad sample,
+    /// which keeps one in its topology miniport: PortCls releases the port's miniport when the
+    /// filters stop, which drops the miniport and with it this reference, so there is no lasting
+    /// cycle.
     jack_events: AtomicPtr<IPortEvents>,
-    /// Keeps `jack_events` usable while a jack event is added or generated.
+    /// Keeps `jack_events` usable while a jack event is generated.
     jack_rundown: UnsafeCell<EX_RUNDOWN_REF>,
+    /// Serializes the changes of `jack_events`; initialized by [`HostLink::init`].
+    jack_lock: UnsafeCell<KGUARDED_MUTEX>,
 }
 
 // SAFETY: every field is atomic except the rundown reference, which the kernel's rundown
@@ -76,14 +80,22 @@ pub struct HostLink {
 unsafe impl Sync for HostLink {}
 
 impl HostLink {
-    /// Sets the initial cursor (a stopped stream, odd generation) on the adapter's first start.
+    /// On the adapter's first start (`PASSIVE_LEVEL`, before any filter exists): the initial
+    /// cursor (a stopped stream, odd generation) and the jack lock.
     pub fn init(&self) {
-        let _ = self.cursor.compare_exchange(
-            0,
-            Cursor::STOPPED.pack(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .cursor
+            .compare_exchange(
+                0,
+                Cursor::STOPPED.pack(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // SAFETY: the first start: nothing uses the lock yet.
+            unsafe { KeInitializeGuardedMutex(self.jack_lock.get()) };
+        }
     }
 
     /// Moves the cursor with `change`, which must move the generation.
@@ -176,22 +188,25 @@ impl HostLink {
         !host.is_null() && host != ATTACHING && host != DETACHING
     }
 
-    /// The topology miniport was initialized: `events` is its port's `IPortEvents`, valid
-    /// until [`HostLink::clear_jack_events`].
-    ///
-    /// # Safety
-    ///
-    /// `events` is a live `IPortEvents` of the topology port, which the topology miniport
-    /// clears with [`HostLink::clear_jack_events`] before that port goes away.
-    pub unsafe fn set_jack_events(&self, events: *mut IPortEvents) {
-        self.jack_events.store(events, Ordering::Release);
+    /// The topology miniport was initialized: the link keeps `events`, a reference to its
+    /// port's `IPortEvents`, to report jack changes, and releases the previous one, if any.
+    /// `PASSIVE_LEVEL`.
+    pub fn set_jack_events(&self, events: Unknown) {
+        let events = events.into_raw().cast::<IPortEvents>();
+        self.with_jack_lock(|| {
+            let old = self.jack_events.swap(events, Ordering::AcqRel);
+            self.release_jack_events(old);
+        });
     }
 
-    /// The topology miniport that set `events` goes away: no more jack events through it (a
-    /// newer miniport's are left alone). `PASSIVE_LEVEL`: waits for a jack event in flight.
+    /// The topology miniport that gave `events` goes away: the link releases it, unless a
+    /// newer miniport's replaced it already. `PASSIVE_LEVEL`: waits for a jack event in flight.
     pub fn clear_jack_events(&self, events: *mut IPortEvents) {
-        if events.is_null()
-            || self
+        if events.is_null() {
+            return;
+        }
+        self.with_jack_lock(|| {
+            if self
                 .jack_events
                 .compare_exchange(
                     events,
@@ -199,18 +214,41 @@ impl HostLink {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_err()
-        {
-            return;
-        }
-        // SAFETY: PASSIVE_LEVEL; waits for the callers of `with_jack_events`.
-        unsafe { ExWaitForRundownProtectionRelease(self.jack_rundown.get()) };
-        // SAFETY: the rundown completed and nobody holds it.
-        unsafe { ExReInitializeRundownProtection(self.jack_rundown.get()) };
+                .is_ok()
+            {
+                self.release_jack_events(events);
+            }
+        });
     }
 
-    /// Calls `f` with the topology port's events interface, if there is one, while it cannot
-    /// be cleared.
+    /// Runs `f` holding the lock that serializes `set_jack_events` and `clear_jack_events`
+    /// (a topology miniport's `Init` and another's `drop` may overlap across an adapter
+    /// restart). A control path: never per audio period.
+    fn with_jack_lock(&self, f: impl FnOnce()) {
+        // SAFETY: initialized by `init` before any topology miniport exists; PASSIVE_LEVEL.
+        unsafe { KeAcquireGuardedMutex(self.jack_lock.get()) };
+        f();
+        // SAFETY: acquired above by this thread.
+        unsafe { KeReleaseGuardedMutex(self.jack_lock.get()) };
+    }
+
+    /// Releases a reference `jack_events` no longer holds, once no jack event uses it.
+    /// Holding the jack lock, at `PASSIVE_LEVEL`.
+    fn release_jack_events(&self, old: *mut IPortEvents) {
+        if old.is_null() {
+            return;
+        }
+        // SAFETY: PASSIVE_LEVEL; waits for the callers of `with_jack_events`, which may still
+        // use `old`.
+        unsafe { ExWaitForRundownProtectionRelease(self.jack_rundown.get()) };
+        // SAFETY: the rundown completed; the jack lock keeps another wait from overlapping.
+        unsafe { ExReInitializeRundownProtection(self.jack_rundown.get()) };
+        // SAFETY: the reference `set_jack_events` took ownership of, used by nobody now.
+        drop(unsafe { Unknown::from_raw(old.cast()) });
+    }
+
+    /// Calls `f` with the topology port's events interface, if there is one, while the link's
+    /// reference to it cannot be released.
     fn with_jack_events(&self, f: impl FnOnce(*mut IPortEvents, &IPortEventsVtbl)) {
         // SAFETY: a valid, initialized rundown reference (zeroed or reinitialized).
         if unsafe { ExAcquireRundownProtection(self.jack_rundown.get()) } == 0 {
@@ -218,29 +256,14 @@ impl HostLink {
         }
         let events = self.jack_events.load(Ordering::Acquire);
         if !events.is_null() {
-            // SAFETY: a live `IPortEvents` (`set_jack_events`' contract), kept by the rundown
-            // protection held here: `clear_jack_events` waits for it.
+            // SAFETY: a referenced interface, which `release_jack_events` only releases after
+            // the rundown protection held here.
             let vtable = unsafe { (*events).lpVtbl };
             // SAFETY: an interface's vtable is valid for its lifetime.
             f(events, unsafe { &*vtable });
         }
         // SAFETY: acquired above.
         unsafe { ExReleaseRundownProtection(self.jack_rundown.get()) };
-    }
-
-    /// Adds an event entry that a client enabled on the jack (`KSEVENT_PINCAPS_JACKINFOCHANGE`)
-    /// to the port's list, so that [`HostLink::jack_changed`] signals it.
-    ///
-    /// # Safety
-    ///
-    /// `entry` is the event entry of a `PCEVENT_VERB_ADD` request that PortCls passed.
-    pub unsafe fn add_jack_event(&self, entry: PKSEVENT_ENTRY) {
-        self.with_jack_events(|events, vtable| {
-            if let Some(add) = vtable.AddEventToEventList {
-                // SAFETY: a live interface; the entry comes from PortCls's event request.
-                unsafe { add(events.cast(), entry) };
-            }
-        });
     }
 
     /// Tells the clients (the audio endpoint builder) that the microphone's jack changed.

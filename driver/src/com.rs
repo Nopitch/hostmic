@@ -214,6 +214,20 @@ pub struct Unknown(NonNull<IUnknown>);
 // thread; a reference can move to another thread.
 unsafe impl Send for Unknown {}
 
+/// `QueryInterface` on an interface pointer the caller only borrows (no reference taken or
+/// released on it): a new reference to the interface `iid`, or `None`.
+///
+/// # Safety
+///
+/// `raw` is null or a valid interface pointer, alive for the call.
+#[must_use]
+pub unsafe fn query_borrowed(raw: *mut IUnknown, iid: &GUID) -> Option<Unknown> {
+    // Not dropped: the borrowed reference is not ours to release.
+    // SAFETY: the caller's contract; `ManuallyDrop` keeps `from_raw`'s ownership unused.
+    let borrowed = core::mem::ManuallyDrop::new(unsafe { Unknown::from_raw(raw) }?);
+    borrowed.query(iid)
+}
+
 impl Unknown {
     /// Takes ownership of one reference.
     ///

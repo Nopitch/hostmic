@@ -16,7 +16,6 @@
 
 use core::{
     ffi::c_void,
-    mem::ManuallyDrop,
     ptr,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
@@ -34,7 +33,7 @@ use hostmic_sys::{
 };
 use wdk_sys::{
     NTSTATUS, PULONG, PVOID, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS, ULONG,
+    STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG,
 };
 
 use wdk::println;
@@ -56,17 +55,19 @@ pub struct TopologyMiniport {
     references: AtomicU32,
     /// The adapter's host link: whether a host is attached, and where jack events go.
     link: LinkRef,
-    /// The port's `IPortEvents` this miniport gave the link, to take it back in `drop`.
+    /// The port's `IPortEvents`: one reference, owned by the miniport, for the jack event's
+    /// enables; null until `Init`.
     events: AtomicPtr<IPortEvents>,
 }
 
 impl Drop for TopologyMiniport {
-    /// Runs at `PASSIVE_LEVEL`, from the port's last `Release`, while the port still exists:
-    /// its events interface must not be used afterwards.
+    /// Runs at `PASSIVE_LEVEL`, when PortCls releases the miniport (the filters stop or the
+    /// device goes away): the link lets go of this port's events, and so does the miniport.
     fn drop(&mut self) {
-        self.link
-            .get()
-            .clear_jack_events(self.events.load(Ordering::Acquire));
+        let events = self.events.swap(ptr::null_mut(), Ordering::AcqRel);
+        self.link.get().clear_jack_events(events);
+        // SAFETY: the reference `init` stored, owned by this miniport (or null).
+        drop(unsafe { Unknown::from_raw(events.cast()) });
     }
 }
 
@@ -138,23 +139,24 @@ unsafe extern "C" fn init(
     _resource_list: PRESOURCELIST,
     port: PPORTTOPOLOGY,
 ) -> NTSTATUS {
-    // SAFETY: PortCls passes its live port, borrowed: the miniport does not take a reference.
-    let Some(port) = (unsafe { Unknown::from_raw(port.cast()) }).map(ManuallyDrop::new) else {
-        return STATUS_INVALID_PARAMETER;
-    };
-    let Some(events) = port.query(&guid::IID_IPortEvents) else {
+    // Two references to the port's `IPortEvents`: the miniport's own, for the jack event's
+    // enables, and the link's, for jack changes.
+    // SAFETY: PortCls passes its live port for the call.
+    let own = unsafe { com::query_borrowed(port.cast(), &guid::IID_IPortEvents) };
+    // SAFETY: as above.
+    let shared = unsafe { com::query_borrowed(port.cast(), &guid::IID_IPortEvents) };
+    let (Some(own), Some(shared)) = (own, shared) else {
         println!("hostmic: the topology port has no IPortEvents: no jack events");
         return STATUS_SUCCESS;
     };
-    // Not counted (see `HostLink::set_jack_events`): the reference `query` took goes back now;
-    // the port, which owns this miniport, outlives it.
-    let events = events.as_ptr().cast::<IPortEvents>();
     // SAFETY: called through the miniport's vtable, at offset 0.
     let miniport = unsafe { com::object::<TopologyMiniport, 0>(this) };
-    // SAFETY: the port's live `IPortEvents`; the miniport clears it in `drop`, before the port
-    // releasing it goes away.
-    unsafe { miniport.link.get().set_jack_events(events) };
-    miniport.events.store(events, Ordering::Release);
+    let old = miniport
+        .events
+        .swap(own.into_raw().cast(), Ordering::AcqRel);
+    // SAFETY: a reference a previous `Init` stored, owned by this miniport (or null).
+    drop(unsafe { Unknown::from_raw(old.cast()) });
+    miniport.link.get().set_jack_events(shared);
     STATUS_SUCCESS
 }
 
@@ -292,12 +294,27 @@ unsafe extern "C" fn jack_event(request: PPCEVENT_REQUEST) -> NTSTATUS {
     let Some(request) = (unsafe { request.as_ref() }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    if request.Verb == PCEVENT_VERB_ADD {
-        // SAFETY: for a filter event, `MajorTarget` is the miniport's `IUnknown`, at offset 0.
-        let miniport = unsafe { com::object::<TopologyMiniport, 0>(request.MajorTarget.cast()) };
-        // SAFETY: the entry of this `PCEVENT_VERB_ADD` request.
-        unsafe { miniport.link.get().add_jack_event(request.EventEntry) };
+    if request.Verb != PCEVENT_VERB_ADD {
+        return STATUS_SUCCESS;
     }
+    // SAFETY: for a filter event, `MajorTarget` is the miniport's `IUnknown`, at offset 0;
+    // PortCls holds the miniport for the request.
+    let miniport = unsafe { com::object::<TopologyMiniport, 0>(request.MajorTarget.cast()) };
+    let events = miniport.events.load(Ordering::Acquire);
+    if events.is_null() {
+        // Nothing added: PortCls must not believe the entry is in a list.
+        return STATUS_UNSUCCESSFUL;
+    }
+    // SAFETY: the miniport's own reference to its port's `IPortEvents`, alive with the
+    // miniport.
+    let vtable = unsafe { (*events).lpVtbl };
+    // SAFETY: an interface's vtable is valid for its lifetime.
+    let Some(add) = (unsafe { &*vtable }).AddEventToEventList else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    // SAFETY: a live interface and the entry of this `PCEVENT_VERB_ADD` request: it goes to
+    // the list of this miniport's own port.
+    unsafe { add(events.cast(), request.EventEntry) };
     STATUS_SUCCESS
 }
 
