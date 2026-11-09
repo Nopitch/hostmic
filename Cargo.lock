@@ -317,6 +317,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostmic-measure"
+version = "0.1.0"
+dependencies = [
+ "hostmic",
+ "windows",
+]
+
+[[package]]
 name = "hostmic-sys"
 version = "0.1.0"
 dependencies = [

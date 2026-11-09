@@ -77,7 +77,7 @@ pub use hostmic_abi::{
     ABI_VERSION, Format, FormatRange, Info, Reason, SAMPLE_TYPES_ALL, SampleType, State, Stats,
     StreamState,
 };
-pub use player::{Block, Player, PlayerStats};
+pub use player::{Block, GAP_EDGES_US, Player, PlayerStats};
 
 /// The name of a request by its control code's function number (as
 /// [`Stats::last_request`] reports it), or `None` for an unknown one.

@@ -41,6 +41,20 @@ pub fn part_start(frames: u32, parts: u32, index: u32) -> u32 {
     u32::try_from(start).unwrap_or(frames)
 }
 
+/// The bucket of a gap of `ticks` performance counter ticks at `frequency` per second, against
+/// ascending bucket edges in microseconds: `0` below the first edge, `edges.len()` from the
+/// last one on. Compared in ticks, without rounding.
+#[must_use]
+pub fn gap_bucket(ticks: u64, frequency: i64, edges_us: &[u32]) -> usize {
+    let frequency = u128::from(u64::try_from(frequency).unwrap_or(0));
+    // ticks / frequency >= edge / 10^6  <=>  ticks × 10^6 >= edge × frequency
+    let scaled = u128::from(ticks) * 1_000_000;
+    edges_us
+        .iter()
+        .take_while(|&&edge| scaled >= u128::from(edge) * frequency)
+        .count()
+}
+
 /// Where the clock starts: a performance counter value and the stream position it stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Anchor {
@@ -137,6 +151,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn gap_buckets() {
+        let edges = [1_000, 2_000, 5_000, 20_000];
+        assert_eq!(gap_bucket(0, QPC, &edges), 0);
+        assert_eq!(gap_bucket(9_999, QPC, &edges), 0, "just under 1 ms");
+        assert_eq!(
+            gap_bucket(10_000, QPC, &edges),
+            1,
+            "1 ms is the second bucket"
+        );
+        assert_eq!(gap_bucket(14_999, QPC, &[1_500]), 0, "just under 1.5 ms");
+        assert_eq!(gap_bucket(15_000, QPC, &[1_500]), 1);
+        assert_eq!(gap_bucket(49_999, QPC, &edges), 2);
+        assert_eq!(gap_bucket(50_000, QPC, &edges), 3);
+        assert_eq!(
+            gap_bucket(200_000, QPC, &edges),
+            4,
+            "the last bucket is open"
+        );
+        assert_eq!(gap_bucket(u64::MAX, QPC, &edges), 4);
+        assert_eq!(
+            gap_bucket(5, 0, &edges),
+            4,
+            "a zero frequency puts every gap last"
+        );
     }
 
     #[test]

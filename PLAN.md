@@ -576,6 +576,27 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   reinstall the host attaches again and `capture-check` passes; disabling and enabling the
   host interface makes it let go and attach again (`capture-check` `PASS`); 3 attachments, 2
   releases, no packet skipped, no request refused.
+  *The measurements (2026-11-09):* `tools/measure`, after Résonnance's `tag_micro` (its
+  measuring method only: nothing of Thin Audio Gateway's API). One process plays into the
+  microphone with `Player::follow` and records it as a communication application does
+  (shared-mode, event-driven WASAPI on an MMCSS thread, float). `measure latency`: a 1 ms click
+  every half second; the callback notes the performance counter when it writes a click's first
+  frame, the reader when it gets the packet with the click's rising edge (packetization
+  included, as an application sees it); median as `tag_micro` computes it, 95th percentile,
+  maximum. `measure load`: a 440 Hz sine while 16 threads spin; crackles by `tag_micro`'s
+  criterion (a sample the sine does not predict, or 2 ms of silence). Both fail on an engine
+  discontinuity, a timed-out wait, less than 90 % of the frames due, and, per mode, under 80 %
+  of the clicks due or 90 % of audible signal (the independent review found that the first
+  version passed a silent or stalled microphone). `PlayerStats::gaps` counts the gaps between
+  writing wake-ups in buckets (`GAP_EDGES_US`, from 1.5 ms: the timer ticks every millisecond),
+  the distribution the reference loop's note asked for. In the VM: latency 58 of 58 clicks,
+  **median 10.1 ms**, 95th percentile 10.7 ms, maximum 10.8 ms (the target table: 9.6 to
+  10.8 ms); load, 16 threads, 30 s: **0 crackle**, 0 late, longest gap 1.6 ms, 98.8 %
+  audible; endurance, load for 10 minutes: **0 crackle**, 0 late, 0 discontinuity, 0 packet
+  skipped, 99.9 % of the frames due read, 14 of 413576 gaps above 2 ms, the longest 4.5 ms.
+  The gaps sit mostly in 1.5-2 ms (the VM's 1 ms timer ticks about every
+  1.46 ms), none above 3 ms in the 30 s runs. In a VM; the comparison with the target table, which
+  was measured on a real machine, is for M7, with a signed driver.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
