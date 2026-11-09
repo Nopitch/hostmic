@@ -316,7 +316,9 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   host interface now refuses removal while a handle to it is open (removing the driver with a
   host attached is "removed on reboot"; forcing a detach instead is for M6), and an `ATTACH`
   racing a `DETACH` on the same handle needed an "attaching" state not to leak the event.
-  Open: the generation is 16 bits wide in the driver while the ABI carries 32.
+  The generation is 16 bits wide in the driver while the ABI carries 32: settled at M4's close,
+  the ABI keeps 32 bits and documents that the driver uses 16, which wrap; a host only compares
+  generations for equality.
   *The jack follows the host (2026-11-09):* the topology's jack reports `IsConnected` from
   `HostLink` (connected while a host is attached) with
   `JACKDESC2_PRESENCE_DETECT_CAPABILITY`, and a filter-level `KSEVENT_PINCAPS_JACKINFOCHANGE`
@@ -386,10 +388,34 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   that raced `GetReadPacket` (now a run epoch packed with the last packet read, moved by one
   compare-and-exchange), packets dated from the wrong run, and the frames written ahead of an
   advance ignored by the "intact" check.
+  ***M4 done (2026-11-09).*** A user-mode host now feeds the microphone: it finds the host
+  interface by GUID (a raw child device with its own ACL), attaches, writes into a buffer the
+  driver maps into it and shares with the audio engine, and sets the pace with `ADVANCE`; the
+  driver produces no audio and keeps no clock, and the microphone shows unplugged without a
+  host. Pull requests: the ABI and its validation (#27), fuzzing in CI (#28), the child device
+  (#31), attach and the stream state (#32), the jack (#33), the shared buffer and its mapping
+  (#34), the host-advanced position with the counters and `hostmic-ctl status` (#35). The
+  "done when" holds: `tools/test-host` plays a tone that `tools/capture-check` records cleanly
+  (30 s, 1000.00 Hz, -6.02 dBFS, 0 glitch, no discontinuity); the microphone is unplugged
+  without a host; killing the host mid-capture leaves the system up and the next host plays
+  again; fuzzing runs on every pull request (seven targets, required check `fuzz`). Each
+  kernel pull request had an independent review, and each review found real defects; two of
+  them were in the reviews' own fixes, and one of those bug-checked the VM (an overflow in a
+  debug build): every fix is reviewed and tested again before merging. Carried over:
+  - to M5: the host library enforces the real-time rule the test host had to learn (no I/O,
+    lock or allocation in its audio loop; an MMCSS thread; pacing by the performance counter;
+    `ERROR_NOT_READY` means "read the stream again"), and reports how late it ever was;
+  - to M6: forcing a detach when the adapter is removed while a handle to the host interface
+    stays open (today the removal waits for a reboot); Driver Verifier over attach, advance,
+    detach and host death; one isolated `capture-check` `FAIL` after a killed host (clean
+    level, no glitch, reason not kept, not reproduced in five runs);
+  - open question: the `PROPOSEDATAFORMAT` probe (below).
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
+  The reference loop follows M4's lessons (above): `tools/test-host`'s player is its first
+  draft.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
-  resume, host crash, several hours of endurance.
+  resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
@@ -424,6 +450,10 @@ checks:
   `dynamic_analysis_unsafe` stays Unmet, with an updated justification: fuzzing covers the
   safe validation code, not the kernel's unsafe code. The percentages do not change: both
   criteria are suggested ones.
+- **M4's close (2026-11-09):** no further criterion is met. What remains needs a release
+  (release notes, signed tags, reproducible builds: M7), a second maintainer (bus factor,
+  access continuity, non-author approval), a coverage measurement (80% statements), or M6
+  (Driver Verifier for `dynamic_analysis_unsafe`, hardening).
 
 **The first release must not be a hand-made one.** Several criteria answered "not applicable"
 because no release exists become requirements with it; in particular, OSPS-BR-06.01 (baseline-2)

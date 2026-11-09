@@ -2,7 +2,7 @@
 
 hostmic is a Windows kernel-mode driver. This document states what users can and cannot expect
 from it in terms of security (its security requirements), then argues why the design and the
-development process meet them (an assurance case). It covers the state after milestone M3 and
+development process meet them (an assurance case). It covers the state after milestone M4 and
 says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
 [SECURITY.md](../SECURITY.md) the vulnerability process and the security rules.
 
@@ -11,7 +11,7 @@ says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
 ### You can expect
 
 - **No path from user mode to kernel memory.** No input reachable from user mode (Kernel
-  Streaming property requests and data formats today, the host's IOCTLs from M4) lets a process
+  Streaming property requests and data formats, the host interface's IOCTLs) lets a process
   read or write kernel memory, or memory of another process.
 - **Only the attached host gets the buffer.** From M4, the audio buffer, which the driver owns,
   is mapped into one process only besides the audio engine: the host that attached through the
@@ -65,7 +65,7 @@ of the build.
 
 ### 2.2 Trust boundaries and attack surface
 
-1. **User mode → kernel, through Kernel Streaming** (today): property handlers
+1. **User mode → kernel, through Kernel Streaming**: property handlers
    (`PROPOSEDATAFORMAT`, jack descriptions), data-range intersection, stream creation with a
    client-supplied data format. Each handler checks instance and value sizes before reading or
    writing; data formats are parsed by `hostmic_driver_core::format`, pure Rust with no kernel
