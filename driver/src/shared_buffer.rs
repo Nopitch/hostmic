@@ -168,16 +168,18 @@ impl BufferRef {
     /// whole 32-bit words.
     ///
     /// The pages are shared memory: the host and the audio engine access them through their
-    /// own mappings, and the stream's timer may write the test tone meanwhile. Like a device's
-    /// memory, they are only ever written through volatile accesses of aligned words, never
-    /// through a Rust reference.
+    /// own mappings, and the stream's timer may write the test tone meanwhile. The driver only
+    /// ever writes them as aligned 32-bit atomics (relaxed: a plain store on x64 and ARM64),
+    /// never through a non-atomic Rust access, so that its own concurrent writers do not race.
     pub fn zero(&self, bytes: usize) {
         #[allow(clippy::cast_ptr_alignment, reason = "the mapping is page-aligned")]
         let words = self.system().cast::<u32>();
         for index in 0..bytes.min(BYTES) / 4 {
             let word = words.wrapping_add(index);
-            // SAFETY: within the system mapping (`BYTES` bytes), aligned (page-aligned base).
-            unsafe { word.write_volatile(0) };
+            // SAFETY: within the system mapping (`BYTES` bytes), aligned (page-aligned base),
+            // valid while `self` lives; the driver accesses these words atomically only.
+            let word = unsafe { AtomicU32::from_ptr(word) };
+            word.store(0, Ordering::Relaxed);
         }
     }
 

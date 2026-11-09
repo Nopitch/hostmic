@@ -326,6 +326,32 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   integrated device; PortCls installs no fast I/O table (logged at load); the review moved the
   event's enables to the miniport's own port, since an old miniport's enable must never land
   in a newer port's list.
+  *The shared buffer and its mapping (2026-11-09):* `driver/src/shared_buffer.rs` allocates the
+  buffer at the adapter's first start (192512 bytes, 47 zeroed pages); each stream's
+  `AllocateAudioBuffer` returns a partial MDL over its start, sized up by
+  `buffer::geometry` (an exclusive-mode request beyond one second fails); `ATTACH` zeroes it,
+  maps it into the requesting process (`hostmic-sys/c/map_user.c`, the driver's only C) and
+  returns its address. `HostLink` undoes the mapping on detach, cleanup and close, attaching
+  to the host's process when another one closes the handle, and from
+  `PsSetCreateProcessNotifyRoutineEx` when the host's process exits; the driver is linked with
+  `/INTEGRITYCHECK`, which that routine requires. The driver still writes its tone, now into
+  the shared pages: `tools/test-host` reads it through its own mapping. In the VM: the audio
+  engine accepts the miniport's own partial MDL (`capture-check` `PASS`, 0 glitch); the host
+  reads peaks of -6.02 dBFS while the stream runs; a host killed while another process holds
+  a duplicate of its handle is detached by the process notification, and the next host
+  attaches; when that other process closes the last handle while the host lives, the host's
+  mapping disappears (`VirtualQuery`); `devcon remove` unloads the driver. Lessons: the
+  independent review found that removing an adapter that never started would wait forever on
+  an uninitialized mutex, and that a removal with a host attached left its mapping behind
+  (now detached at removal); the driver writes the shared pages only as aligned 32-bit atomic
+  stores, never through a non-atomic Rust access, since the host, the audio engine, the timer
+  and `ATTACH` share them. A first version of that change, written inline in the driver,
+  subtracted without saturation and bug-checked the VM (0x1E, a debug build's overflow
+  panic): the frame arithmetic went back to `hostmic-driver-core` (`ring::tone_words`), where
+  it is unit-tested. A second review found the link's "started" state inferred from a cursor
+  value of 0, which a wrapped generation can reproduce: it is now a flag of its own. Still
+  open: an adapter removed while a handle to the host interface stays open (forced detach,
+  M6).
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and

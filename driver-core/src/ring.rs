@@ -14,34 +14,34 @@ use crate::tone;
 /// - Trailing bytes of `ring` beyond its last whole frame are left untouched.
 pub fn write_tone(ring: &mut [u8], first: u64, end: u64) {
     let frames_in_ring = ring.len() / FRAME_BYTES;
-    if frames_in_ring == 0 || end <= first {
-        return;
+    for (index, word) in tone_words(first, end, frames_in_ring) {
+        let at = index * FRAME_BYTES;
+        ring[at..at + FRAME_BYTES].copy_from_slice(&word.to_le_bytes());
     }
-    let ring_frames = frames_in_ring as u64;
-    let first = first.max(end.saturating_sub(ring_frames));
-    let ring = &mut ring[..frames_in_ring * FRAME_BYTES];
+}
 
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "the remainder is below the ring's frame count, a usize"
-    )]
-    let start = (first % ring_frames) as usize;
-    let mut frame = first;
-    // At most two runs: from `start` to the end of the ring, then from its beginning.
-    let (wrapped, from_start) = ring.split_at_mut(start * FRAME_BYTES);
-    for run in [from_start, wrapped] {
-        for bytes in run.as_chunks_mut::<FRAME_BYTES>().0 {
-            if frame == end {
-                return;
-            }
-            let sample = tone::sample(frame).to_le_bytes();
-            for channel in bytes.as_chunks_mut::<SAMPLE_BYTES>().0 {
-                *channel = sample;
-            }
-            frame += 1;
-        }
-    }
-    debug_assert_eq!(frame, end);
+/// The tone for the stream frames `first..end` in a ring of `ring_frames` frames, as the driver
+/// writes it into memory it shares with user mode (one store per frame): for each frame, its
+/// index in the ring and the frame itself, both channels in one little-endian 32-bit word.
+///
+/// Same rules as [`write_tone`]: only the last `ring_frames` frames of a longer range, nothing
+/// for an empty or reversed range or an empty ring. No input can panic or overflow.
+pub fn tone_words(first: u64, end: u64, ring_frames: usize) -> impl Iterator<Item = (usize, u32)> {
+    let ring = ring_frames as u64;
+    let first = if ring == 0 {
+        end
+    } else {
+        first.max(end.saturating_sub(ring))
+    };
+    (first..end).map(move |frame| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the remainder is below the ring's frame count, a usize"
+        )]
+        let index = (frame % ring) as usize;
+        let sample = u32::from(tone::sample(frame).cast_unsigned());
+        (index, sample | (sample << 16))
+    })
 }
 
 // The writes above assume interleaved 16-bit samples.
@@ -131,6 +131,24 @@ mod tests {
         let mut ring = [UNTOUCHED; 3 * FRAME_BYTES + 3];
         write_tone(&mut ring, 0, 10);
         assert!(ring[3 * FRAME_BYTES..].iter().all(|&b| b == UNTOUCHED));
+    }
+
+    #[test]
+    fn tone_words_without_a_ring_yield_nothing() {
+        assert_eq!(tone_words(0, 10, 0).count(), 0);
+        assert_eq!(tone_words(u64::MAX - 1, u64::MAX, 0).count(), 0);
+        assert_eq!(tone_words(10, 0, 4).count(), 0);
+    }
+
+    #[test]
+    fn tone_words_are_both_channels_of_a_frame() {
+        for (frame, (index, word)) in (1_000..1_010).zip(tone_words(1_000, 1_010, 960)) {
+            assert_eq!(index as u64, frame % 960);
+            let sample = tone::sample(frame).to_le_bytes();
+            let bytes = word.to_le_bytes();
+            assert_eq!(bytes[..2], sample, "left channel of frame {frame}");
+            assert_eq!(bytes[2..], sample, "right channel of frame {frame}");
+        }
     }
 
     #[test]

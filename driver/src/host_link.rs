@@ -87,8 +87,13 @@ pub struct HostLink {
     /// The adapter's reference to the shared buffer (a raw [`BufferRef`]); null before the first
     /// start and after the removal. Changed under `host_lock`.
     buffer: AtomicPtr<c_void>,
-    /// Whether the link is in the registry the process notification routine reads.
+    /// Whether the link is in the registry the process notification routine reads, and hosts
+    /// may attach; cleared (under `host_lock`) by the adapter's removal.
     registered: AtomicBool,
+    /// Whether [`HostLink::init`] has run once: the cursor, the locks and the registration are
+    /// set up. Not derived from the cursor, whose packed value may be 0 again once the
+    /// generation wraps.
+    started: AtomicBool,
     /// The topology port's `IPortEvents`, to report jack changes: one reference, owned by the
     /// link; null while no topology miniport is initialized. As in Microsoft's sysvad sample,
     /// which keeps one in its topology miniport: PortCls releases the port's miniport when the
@@ -124,21 +129,16 @@ impl HostLink {
     ///
     /// `STATUS_INSUFFICIENT_RESOURCES` when the shared buffer cannot be allocated.
     pub fn init(&self) -> Result<(), NTSTATUS> {
-        if self
-            .cursor
-            .compare_exchange(
-                0,
-                Cursor::STOPPED.pack(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
+        // PnP requests for the adapter are serialized: no other start or removal runs meanwhile.
+        if !self.started.load(Ordering::Acquire) {
+            // No filter, hence no stream, exists before the first start.
+            self.cursor.store(Cursor::STOPPED.pack(), Ordering::Release);
             // SAFETY: the first start: nothing uses the locks yet.
             unsafe { KeInitializeGuardedMutex(self.jack_lock.get()) };
             // SAFETY: as above.
             unsafe { KeInitializeGuardedMutex(self.host_lock.get()) };
             self.registered.store(register(self), Ordering::Release);
+            self.started.store(true, Ordering::Release);
         }
         with_lock(&self.host_lock, || {
             if self.buffer.load(Ordering::Acquire).is_null() {
@@ -157,7 +157,7 @@ impl HostLink {
         // Never started (the start failed before `init`): nothing to undo, and the locks were
         // never initialized. PnP requests for the adapter are serialized, so `init` cannot run
         // meanwhile.
-        if self.cursor.load(Ordering::Acquire) == 0 {
+        if !self.started.load(Ordering::Acquire) {
             return;
         }
         let (detached, buffer) = with_lock(&self.host_lock, || {
@@ -409,20 +409,21 @@ impl HostLink {
                     reason: "another host is attached",
                 });
             }
-            if file.is_null() || !self.registered.load(Ordering::Acquire) {
-                return Err(AttachError {
-                    status: STATUS_INSUFFICIENT_RESOURCES,
-                    reason: "no process notification: the mapping could outlive the host",
-                });
-            }
             let raw = self.buffer.load(Ordering::Acquire);
             // SAFETY: the adapter's reference, kept while the lock is held; borrowed to clone.
             let Some(adapter) = (unsafe { BufferRef::from_raw(raw) }) else {
                 return Err(AttachError {
                     status: STATUS_INSUFFICIENT_RESOURCES,
-                    reason: "no shared buffer",
+                    reason: "no shared buffer: the adapter is not started",
                 });
             };
+            if file.is_null() || !self.registered.load(Ordering::Acquire) {
+                let _ = adapter.into_raw();
+                return Err(AttachError {
+                    status: STATUS_INSUFFICIENT_RESOURCES,
+                    reason: "no process notification: the mapping could outlive the host",
+                });
+            }
             let buffer = adapter.clone();
             let _ = adapter.into_raw();
             // What a previous host wrote is not this host's business.

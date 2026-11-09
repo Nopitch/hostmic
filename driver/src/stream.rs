@@ -31,7 +31,7 @@ use hostmic_driver_core::{
     buffer, clock,
     format::{CHANNELS, FRAME_BYTES, SAMPLE_RATE},
     host::MAX_BUFFER_BYTES,
-    packet, tone,
+    packet, ring,
 };
 use hostmic_sys::{
     BOOL, IMiniportWaveRTInputStreamVtbl, IMiniportWaveRTStreamNotificationVtbl, KSAUDIO_POSITION,
@@ -403,26 +403,18 @@ unsafe extern "C" fn tick(_timer: PEX_TIMER, context: PVOID) {
 
     let written = stream.written.load(Ordering::Relaxed);
     let target = elapsed.saturating_add(LEAD_FRAMES);
-    let ring_frames = (bytes / FRAME_BYTES) as u64;
-    if target > written && ring_frames != 0 {
-        // A writer late by more than the whole ring writes its last `ring_frames` frames only.
-        for frame in written.max(target.saturating_sub(ring_frames))..target {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "the remainder is below the ring's frame count, a usize"
-            )]
-            let index = (frame % ring_frames) as usize;
-            // Both channels of the frame, in one little-endian 32-bit word.
-            let sample = u32::from(tone::sample(frame).cast_unsigned());
+    if target > written {
+        for (index, value) in ring::tone_words(written, target, bytes / FRAME_BYTES) {
             #[allow(clippy::cast_ptr_alignment, reason = "the buffer is page-aligned")]
             let word = base.cast::<u32>().wrapping_add(index);
             // SAFETY: `base` maps the shared buffer, at least `bytes` bytes, while `buffer` is
             // set: `release_buffer` clears it and waits for this callback before letting the
-            // buffer go. `index` is a frame within those bytes; a frame is one aligned word
-            // (page-aligned base). The pages are shared memory, which the audio engine and the
-            // host access through their own mappings and `ATTACH` may zero meanwhile: written
-            // through volatile accesses only, never through a Rust reference.
-            unsafe { word.write_volatile(sample | (sample << 16)) };
+            // buffer go. `index` is a frame within those bytes (below `bytes / FRAME_BYTES`); a
+            // frame is one aligned word (page-aligned base). The pages are shared memory: the
+            // audio engine and the host access them through their own mappings, and `ATTACH`
+            // may zero them meanwhile: the driver accesses these words atomically only.
+            let word = unsafe { AtomicU32::from_ptr(word) };
+            word.store(value, Ordering::Relaxed);
         }
         stream.written.store(target, Ordering::Release);
     }
