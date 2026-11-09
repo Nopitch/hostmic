@@ -1,24 +1,20 @@
-//! The capture stream: the buffer the audio engine reads, its position, and the test tone.
+//! The capture stream: the buffer the audio engine reads and its position, which the host
+//! advances (PLAN.md, M4).
 //!
-//! Ported from `CMiniportWaveRTStream` of Microsoft's `simpleaudiosample`, with a different
-//! real-time design (PLAN.md, M3): no spin lock.
+//! Ported from `CMiniportWaveRTStream` of Microsoft's `simpleaudiosample`, without its timer:
+//! the driver produces no audio and keeps no clock. The host writes frames into the shared
+//! buffer and moves the stream position with `ADVANCE` ([`crate::host_link`]), which also
+//! signals the audio engine's notification event when a packet completes.
 //!
-//! - The stream's only writer is its timer callback ([`tick`]), every millisecond while the
-//!   stream runs. It computes the position from the performance counter (frames since RUN, a
-//!   pure function of the time), writes the tone a little ahead of it, publishes how far it
-//!   wrote with a `Release` store, and signals the notification event when a packet completes.
-//! - `GetPosition` and `GetReadPacket` only read: the position from the performance counter,
-//!   capped at what the timer published (`Acquire` load), so they never report frames that are
-//!   not in the buffer yet.
-//! - State changes, buffer allocation and event registration run at `PASSIVE_LEVEL`, serialized
-//!   by PortCls; before they take away something the timer uses (the running state, the
-//!   buffer, the event), they wait for any timer callback in flight to finish
-//!   (`KeFlushQueuedDpcs`).
+//! - `GetPosition` and `GetReadPacket` only read the position (an atomic) and the packet the
+//!   engine read last: no lock, no allocation, any IRQL up to `DISPATCH_LEVEL`.
+//! - State changes, buffer allocation and event registration run at `PASSIVE_LEVEL`,
+//!   serialized by PortCls, and publish what changes to the host link.
 //!
-//! The stream's buffer is the start of the adapter's shared buffer (PLAN.md, M4,
-//! [`crate::shared_buffer`]): `AllocateAudioBuffer` returns a partial MDL over it, sized up from
-//! the request (`hostmic_driver_core::buffer::geometry`), and holds a reference to the shared
-//! buffer until `FreeAudioBuffer`.
+//! The stream's buffer is the start of the adapter's shared buffer ([`crate::shared_buffer`]):
+//! `AllocateAudioBuffer` returns a partial MDL over it, sized up from the request
+//! (`hostmic_driver_core::buffer::geometry`), and holds a reference to the shared buffer until
+//! `FreeAudioBuffer`.
 
 use core::{
     ffi::c_void,
@@ -28,37 +24,25 @@ use core::{
 
 use hostmic_abi::{Format, SampleType, State};
 use hostmic_driver_core::{
-    buffer, clock,
+    buffer,
     format::{CHANNELS, FRAME_BYTES, SAMPLE_RATE},
     host::MAX_BUFFER_BYTES,
-    packet, ring,
+    packet,
 };
 use hostmic_sys::{
     BOOL, IMiniportWaveRTInputStreamVtbl, IMiniportWaveRTStreamNotificationVtbl, KSAUDIO_POSITION,
     KSRTAUDIO_HWLATENCY, KSRTAUDIO_HWREGISTER, KSSTATE, PKSAUDIO_POSITION, PKSDATAFORMAT, guid,
 };
 use wdk_sys::{
-    _MEMORY_CACHING_TYPE, DWORD, EX_TIMER_HIGH_RESOLUTION, FALSE, LARGE_INTEGER, MDL,
-    MEMORY_CACHING_TYPE, NTSTATUS, PEX_TIMER, PKEVENT, PMDL, PVOID, STATUS_DEVICE_NOT_READY,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED, STATUS_SUCCESS,
-    STATUS_UNSUCCESSFUL, ULONG, ULONG64,
-    ntddk::{
-        ExAllocateTimer, ExCancelTimer, ExDeleteTimer, ExSetTimer, KeFlushQueuedDpcs,
-        KeQueryPerformanceCounter, KeSetEvent,
-    },
+    _MEMORY_CACHING_TYPE, DWORD, FALSE, MDL, MEMORY_CACHING_TYPE, NTSTATUS, PKEVENT, PMDL,
+    STATUS_DEVICE_NOT_READY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_STATE,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
+    STATUS_SUCCESS, STATUS_UNSUCCESSFUL, TRUE, ULONG, ULONG64,
 };
 
 use crate::com::{self, ComObject, Unknown};
 use crate::host_link::LinkRef;
 use crate::shared_buffer::BufferRef;
-
-/// Timer period: 1 ms, in 100 ns units (the sample's).
-const TIMER_PERIOD: i64 = 10_000;
-
-/// How far ahead of the position the timer writes: two timer periods, so that a late timer
-/// callback does not stall the position.
-const LEAD_FRAMES: u64 = 2 * SAMPLE_RATE as u64 / 1_000;
 
 /// No packet read yet.
 const NO_PACKET: u64 = u64::MAX;
@@ -66,10 +50,6 @@ const NO_PACKET: u64 = u64::MAX;
 /// [`FRAME_BYTES`] as the `u32` the buffer geometry takes.
 #[allow(clippy::cast_possible_truncation, reason = "a frame is a few bytes")]
 const FRAME_BYTES_U32: u32 = FRAME_BYTES as u32;
-
-/// `TRUE` and `FALSE` as the kernel's one-byte `BOOLEAN`.
-const BOOLEAN_TRUE: u8 = 1;
-const BOOLEAN_FALSE: u8 = 0;
 
 /// The capture stream object.
 #[repr(C)]
@@ -80,24 +60,13 @@ pub struct Stream {
     /// `IMiniportWaveRTInputStream` (`GetReadPacket`).
     input: &'static IMiniportWaveRTInputStreamVtbl,
     references: AtomicU32,
-    /// The timer, allocated right after the object (it needs the object's address).
-    timer: AtomicPtr<wdk_sys::_EX_TIMER>,
-    /// Performance counter ticks per second.
-    qpc_frequency: AtomicU64,
     /// `KSSTATE`.
     state: AtomicI32,
-    /// Performance counter value at stream frame 0 of the current run, adjusted on resume so
-    /// that the position continues where the pause left it.
-    start_qpc: AtomicU64,
-    /// The position when not running.
-    paused_frames: AtomicU64,
-    /// Stream frames written into the buffer so far (by the timer only).
-    written: AtomicU64,
-    /// Packets the timer has signaled (timer only).
-    signaled_packets: AtomicU64,
-    /// Last packet number `GetReadPacket` returned.
+    /// The last packet `GetReadPacket` returned, or [`NO_PACKET`]. Only `GetReadPacket` (which
+    /// the audio engine calls from one thread) and the stop transition change it.
     last_read_packet: AtomicU64,
-    /// The buffer, mapped in system space, and its size in bytes (whole frames).
+    /// The buffer, mapped in system space (non-null while the stream has a buffer), and its
+    /// size in bytes (whole frames).
     buffer: AtomicPtr<u8>,
     buffer_bytes: AtomicUsize,
     /// The stream's reference to the shared buffer (a raw [`BufferRef`]) and its MDL over it,
@@ -106,9 +75,10 @@ pub struct Stream {
     mdl: AtomicPtr<MDL>,
     /// Frames per packet in event-driven mode, 0 in polling mode.
     frames_per_packet: AtomicU64,
-    /// The notification event of event-driven mode.
+    /// The notification event this stream registered with the host link, to release it if
+    /// PortCls does not.
     event: AtomicPtr<wdk_sys::_KEVENT>,
-    /// The adapter's host link, where the stream publishes its state for the host.
+    /// The adapter's host link: the position, the host, the engine's event.
     link: LinkRef,
 }
 
@@ -133,39 +103,25 @@ unsafe impl ComObject for Stream {
 impl Drop for Stream {
     /// Runs at `PASSIVE_LEVEL`, from PortCls's last `Release`.
     fn drop(&mut self) {
-        let timer = self.timer.load(Ordering::Acquire);
-        if !timer.is_null() {
-            // SAFETY: `timer` was allocated by `ExAllocateTimer` and is deleted once; cancel it
-            // and wait for a callback in flight, which uses this object, to finish.
-            unsafe { ExDeleteTimer(timer, BOOLEAN_TRUE, BOOLEAN_TRUE, ptr::null_mut()) };
+        // An event or a buffer PortCls did not give back (it always does, before the last
+        // release).
+        let event = self.event.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !event.is_null() {
+            self.link.get().clear_engine_event(event);
         }
-        // SAFETY: PASSIVE_LEVEL; waits for any DPC still queued.
-        unsafe { KeFlushQueuedDpcs() };
-        // A buffer PortCls did not free (it always does, before the last release).
         self.release_buffer();
         self.link.get().stream_closed();
     }
 }
 
 /// Creates a capture stream, or `None` when the pool is exhausted.
+#[must_use]
 pub fn new(link: LinkRef) -> Option<Unknown> {
-    let mut frequency = LARGE_INTEGER::default();
-    // SAFETY: any IRQL; `frequency` is a valid out-parameter.
-    unsafe { KeQueryPerformanceCounter(&raw mut frequency) };
-    // SAFETY: `QuadPart` is the whole value of the union.
-    let frequency = unsafe { frequency.QuadPart }.cast_unsigned();
-
     let stream = com::into_unknown(Stream {
         notification: &NOTIFICATION_VTABLE,
         input: &INPUT_VTABLE,
         references: AtomicU32::new(1),
-        timer: AtomicPtr::new(ptr::null_mut()),
-        qpc_frequency: AtomicU64::new(frequency),
         state: AtomicI32::new(KSSTATE::KSSTATE_STOP),
-        start_qpc: AtomicU64::new(0),
-        paused_frames: AtomicU64::new(0),
-        written: AtomicU64::new(0),
-        signaled_packets: AtomicU64::new(0),
         last_read_packet: AtomicU64::new(NO_PACKET),
         buffer: AtomicPtr::new(ptr::null_mut()),
         buffer_bytes: AtomicUsize::new(0),
@@ -175,15 +131,6 @@ pub fn new(link: LinkRef) -> Option<Unknown> {
         event: AtomicPtr::new(ptr::null_mut()),
         link,
     })?;
-    let object = stream.as_ptr().cast::<Stream>();
-    // SAFETY: `tick` matches `EXT_CALLBACK`; its context is the stream, which deletes the
-    // timer (waiting for callbacks) before it is freed.
-    let timer = unsafe { ExAllocateTimer(Some(tick), object.cast(), EX_TIMER_HIGH_RESOLUTION) };
-    if timer.is_null() {
-        return None; // `stream` is released here.
-    }
-    // SAFETY: `object` is the live stream `stream` owns.
-    unsafe { &*object }.timer.store(timer, Ordering::Release);
     link.get().stream_opened(Format {
         rate: SAMPLE_RATE,
         channels: CHANNELS,
@@ -193,48 +140,12 @@ pub fn new(link: LinkRef) -> Option<Unknown> {
 }
 
 impl Stream {
-    /// The current performance counter value.
-    fn qpc() -> u64 {
-        // SAFETY: any IRQL; no frequency requested.
-        let now = unsafe { KeQueryPerformanceCounter(ptr::null_mut()) };
-        // SAFETY: `QuadPart` is the whole value of the union.
-        unsafe { now.QuadPart }.cast_unsigned()
+    /// Frames in the buffer, 0 without one.
+    fn buffer_frames(&self) -> u64 {
+        (self.buffer_bytes.load(Ordering::Acquire) / FRAME_BYTES) as u64
     }
 
-    /// Frames since stream frame 0 of the current run, at performance counter value `now`.
-    fn elapsed(&self, now: u64) -> u64 {
-        let start = self.start_qpc.load(Ordering::Acquire);
-        clock::frames_elapsed(
-            now.saturating_sub(start),
-            self.qpc_frequency.load(Ordering::Relaxed),
-            SAMPLE_RATE,
-        )
-    }
-
-    /// The stream position in frames: elapsed time while running, the paused position
-    /// otherwise; never beyond what the timer has written.
-    fn position(&self) -> u64 {
-        let written = self.written.load(Ordering::Acquire);
-        let position = if self.state.load(Ordering::Acquire) == KSSTATE::KSSTATE_RUN {
-            self.elapsed(Self::qpc())
-        } else {
-            self.paused_frames.load(Ordering::Relaxed)
-        };
-        position.min(written)
-    }
-
-    /// Stops the timer and waits for a callback in flight. `PASSIVE_LEVEL`.
-    fn stop_timer(&self) {
-        let timer = self.timer.load(Ordering::Acquire);
-        if !timer.is_null() {
-            // SAFETY: a live timer of this stream.
-            unsafe { ExCancelTimer(timer, ptr::null_mut()) };
-        }
-        // SAFETY: PASSIVE_LEVEL; waits for a timer callback already running or queued.
-        unsafe { KeFlushQueuedDpcs() };
-    }
-
-    /// Allocates and maps the buffer; `frames_per_packet` is 0 in polling mode.
+    /// Takes a buffer in the shared buffer; `packets` is 0 in polling mode.
     fn allocate(
         &self,
         requested: ULONG,
@@ -267,14 +178,14 @@ impl Stream {
         let Some(mdl) = shared.stream_mdl(geometry.bytes) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
-        // Not shared with the audio engine yet; the host has not seen this buffer either.
+        // Not shared with the audio engine yet; the host writes only once the stream runs.
         shared.zero(geometry.bytes as usize);
         let base = shared.system();
 
         self.frames_per_packet
             .store(u64::from(geometry.frames_per_packet), Ordering::Relaxed);
         self.buffer_bytes
-            .store(geometry.bytes as usize, Ordering::Relaxed);
+            .store(geometry.bytes as usize, Ordering::Release);
         self.mdl.store(mdl.as_ptr(), Ordering::Relaxed);
         self.shared.store(shared.into_raw(), Ordering::Release);
         self.buffer.store(base, Ordering::Release);
@@ -301,18 +212,16 @@ impl Stream {
         self.release_buffer();
     }
 
-    /// Lets the buffer go: the timer stops using it, then the MDL and the reference to the
-    /// shared buffer are released. `PASSIVE_LEVEL`.
+    /// Lets the buffer go: the host link first (no host advances into it any more), then the
+    /// MDL and the reference to the shared buffer. `PASSIVE_LEVEL`.
     fn release_buffer(&self) {
         let base = self.buffer.swap(ptr::null_mut(), Ordering::AcqRel);
-        self.buffer_bytes.store(0, Ordering::Relaxed);
-        self.frames_per_packet.store(0, Ordering::Relaxed);
         if base.is_null() {
             return;
         }
-        // The timer may no longer touch the buffer.
-        self.stop_timer();
         self.link.get().set_buffer(0, 0);
+        self.buffer_bytes.store(0, Ordering::Release);
+        self.frames_per_packet.store(0, Ordering::Relaxed);
         let mdl = self.mdl.swap(ptr::null_mut(), Ordering::AcqRel);
         // SAFETY: the reference `allocate` stored, taken out once.
         let shared =
@@ -328,111 +237,32 @@ impl Stream {
     /// `SetState`. `PASSIVE_LEVEL`, serialized by PortCls.
     fn set_state(&self, state: KSSTATE::Type) -> NTSTATUS {
         wdk::println!("hostmic: SetState {state}");
+        let link = self.link.get();
         let previous = self.state.load(Ordering::Acquire);
         match state {
             KSSTATE::KSSTATE_RUN => {
+                self.state.store(state, Ordering::Release);
                 if previous != KSSTATE::KSSTATE_RUN {
-                    let paused = self.paused_frames.load(Ordering::Relaxed);
-                    let back = clock::ticks_for_frames(
-                        paused,
-                        self.qpc_frequency.load(Ordering::Relaxed),
-                        SAMPLE_RATE,
-                    );
-                    self.start_qpc
-                        .store(Self::qpc().saturating_sub(back), Ordering::Release);
-                    self.state.store(state, Ordering::Release);
-                    let timer = self.timer.load(Ordering::Acquire);
-                    // SAFETY: a live timer of this stream; relative due time, 1 ms period, no
-                    // parameters (optional).
-                    unsafe { ExSetTimer(timer, -TIMER_PERIOD, TIMER_PERIOD, ptr::null_mut()) };
-                    self.link.get().set_state(State::Running);
+                    link.set_state(State::Running);
                 }
             }
             KSSTATE::KSSTATE_PAUSE | KSSTATE::KSSTATE_ACQUIRE => {
-                if previous == KSSTATE::KSSTATE_RUN {
-                    let position = self.position();
-                    self.paused_frames.store(position, Ordering::Relaxed);
-                    self.state.store(state, Ordering::Release);
-                    self.stop_timer();
-                    self.link.get().set_state(State::Paused);
-                } else {
-                    self.state.store(state, Ordering::Release);
-                    if previous == KSSTATE::KSSTATE_STOP {
-                        self.link.get().set_state(State::Paused);
-                    }
+                self.state.store(state, Ordering::Release);
+                if previous == KSSTATE::KSSTATE_RUN || previous == KSSTATE::KSSTATE_STOP {
+                    link.set_state(State::Paused);
                 }
             }
             KSSTATE::KSSTATE_STOP => {
                 self.state.store(state, Ordering::Release);
-                self.stop_timer();
-                // A stopped stream starts again from position 0.
-                self.paused_frames.store(0, Ordering::Relaxed);
-                self.written.store(0, Ordering::Release);
-                self.signaled_packets.store(0, Ordering::Relaxed);
+                // A stopped stream starts again from position 0 (`Cursor::stopped`).
                 self.last_read_packet.store(NO_PACKET, Ordering::Relaxed);
                 if previous != KSSTATE::KSSTATE_STOP {
-                    self.link.get().set_state(State::Stopped);
+                    link.set_state(State::Stopped);
                 }
             }
             _ => return STATUS_INVALID_PARAMETER,
         }
         STATUS_SUCCESS
-    }
-}
-
-/// The timer callback, every millisecond while the stream runs: the stream's only writer.
-///
-/// Real-time path: no allocation, no lock, no I/O.
-///
-/// # Safety
-///
-/// Called by the kernel at `DISPATCH_LEVEL` with the stream as context; the stream deletes the
-/// timer (waiting for callbacks) before it is freed.
-unsafe extern "C" fn tick(_timer: PEX_TIMER, context: PVOID) {
-    // SAFETY: the context is the live stream (see above).
-    let stream = unsafe { &*context.cast::<Stream>() };
-    if stream.state.load(Ordering::Acquire) != KSSTATE::KSSTATE_RUN {
-        return;
-    }
-    let base = stream.buffer.load(Ordering::Acquire);
-    if base.is_null() {
-        return;
-    }
-    let bytes = stream.buffer_bytes.load(Ordering::Relaxed);
-    let elapsed = stream.elapsed(Stream::qpc());
-
-    let written = stream.written.load(Ordering::Relaxed);
-    let target = elapsed.saturating_add(LEAD_FRAMES);
-    if target > written {
-        for (index, value) in ring::tone_words(written, target, bytes / FRAME_BYTES) {
-            #[allow(clippy::cast_ptr_alignment, reason = "the buffer is page-aligned")]
-            let word = base.cast::<u32>().wrapping_add(index);
-            // SAFETY: `base` maps the shared buffer, at least `bytes` bytes, while `buffer` is
-            // set: `release_buffer` clears it and waits for this callback before letting the
-            // buffer go. `index` is a frame within those bytes (below `bytes / FRAME_BYTES`); a
-            // frame is one aligned word (page-aligned base). The pages are shared memory: the
-            // audio engine and the host access them through their own mappings, and `ATTACH`
-            // may zero them meanwhile: the driver accesses these words atomically only.
-            let word = unsafe { AtomicU32::from_ptr(word) };
-            word.store(value, Ordering::Relaxed);
-        }
-        stream.written.store(target, Ordering::Release);
-    }
-
-    let per_packet = stream.frames_per_packet.load(Ordering::Relaxed);
-    if per_packet == 0 {
-        return;
-    }
-    let complete = elapsed / per_packet;
-    if complete > stream.signaled_packets.load(Ordering::Relaxed) {
-        stream.signaled_packets.store(complete, Ordering::Relaxed);
-        let event = stream.event.load(Ordering::Acquire);
-        if !event.is_null() {
-            // SAFETY: a registered event stays valid until `UnregisterNotificationEvent`, which
-            // clears `event` and waits for this callback; DISPATCH_LEVEL is allowed without
-            // waiting.
-            unsafe { KeSetEvent(event, 0, BOOLEAN_FALSE) };
-        }
     }
 }
 
@@ -489,12 +319,12 @@ unsafe extern "C" fn get_position(this_: *mut c_void, position: PKSAUDIO_POSITIO
     }
     // SAFETY: called through the stream's primary vtable.
     let stream = unsafe { this(this_) };
-    let frames_in_buffer = stream.buffer_bytes.load(Ordering::Relaxed) / FRAME_BYTES;
+    let frames_in_buffer = stream.buffer_frames();
     let offset = if frames_in_buffer == 0 {
         0
     } else {
-        let frame = stream.position() % u64::try_from(frames_in_buffer).unwrap_or(u64::MAX);
-        frame * FRAME_BYTES as u64
+        // Below the buffer's frame count, so the product fits the buffer's size.
+        (stream.link.get().position() % frames_in_buffer) * FRAME_BYTES as u64
     };
     // SAFETY: `position` is writable (checked not null above).
     unsafe {
@@ -562,42 +392,47 @@ unsafe extern "C" fn get_register(
     STATUS_NOT_IMPLEMENTED
 }
 
-/// `RegisterNotificationEvent`: one event, the audio engine's.
+/// `RegisterNotificationEvent`: one event, the audio engine's, which the host's `ADVANCE`s
+/// signal through the host link.
 unsafe extern "C" fn register_notification_event(this_: *mut c_void, event: PKEVENT) -> NTSTATUS {
     if event.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: called through the stream's primary vtable.
     let stream = unsafe { this(this_) };
-    match stream
+    if stream
         .event
         .compare_exchange(ptr::null_mut(), event, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        Ok(_) => STATUS_SUCCESS,
-        Err(_) => STATUS_UNSUCCESSFUL,
+        return STATUS_UNSUCCESSFUL;
     }
+    if !stream.link.get().set_engine_event(event) {
+        stream.event.store(ptr::null_mut(), Ordering::Release);
+        return STATUS_UNSUCCESSFUL;
+    }
+    STATUS_SUCCESS
 }
 
-/// `UnregisterNotificationEvent`. `PASSIVE_LEVEL`.
+/// `UnregisterNotificationEvent`. `PASSIVE_LEVEL`: returns once no `ADVANCE` signals the
+/// event any more, since the caller may free it.
 unsafe extern "C" fn unregister_notification_event(this_: *mut c_void, event: PKEVENT) -> NTSTATUS {
     // SAFETY: called through the stream's primary vtable.
     let stream = unsafe { this(this_) };
-    match stream
+    if stream
         .event
         .compare_exchange(event, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        Ok(_) => {
-            // The caller may free the event when this returns: wait for a timer callback
-            // that may still be signaling it.
-            // SAFETY: PASSIVE_LEVEL.
-            unsafe { KeFlushQueuedDpcs() };
-            STATUS_SUCCESS
-        }
-        Err(_) => STATUS_NOT_FOUND,
+        return STATUS_NOT_FOUND;
     }
+    stream.link.get().clear_engine_event(event);
+    STATUS_SUCCESS
 }
 
-/// `IMiniportWaveRTInputStream::GetReadPacket`: the last complete packet. Reads only.
+/// `IMiniportWaveRTInputStream::GetReadPacket`: the oldest complete packet the engine has not
+/// read, with the performance counter value of its first frame. Any IRQL up to
+/// `DISPATCH_LEVEL`; no lock.
 unsafe extern "C" fn get_read_packet(
     this_: *mut c_void,
     packet_number: *mut ULONG,
@@ -621,32 +456,35 @@ unsafe extern "C" fn get_read_packet(
     if stream.state.load(Ordering::Acquire) < KSSTATE::KSSTATE_PAUSE {
         return STATUS_INVALID_DEVICE_STATE;
     }
-    let Some(available) = packet::last_complete(stream.position(), per_packet) else {
+    let link = stream.link.get();
+    let last = stream.last_read_packet.load(Ordering::Relaxed);
+    let Some(read) = packet::next_read(
+        link.position(),
+        per_packet,
+        stream.buffer_frames(),
+        (last != NO_PACKET).then_some(last),
+    ) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    if available == stream.last_read_packet.load(Ordering::Relaxed) {
-        return STATUS_DEVICE_NOT_READY;
+    stream
+        .last_read_packet
+        .store(read.packet, Ordering::Relaxed);
+    if read.skipped != 0 {
+        link.packets_skipped(read.skipped);
     }
-    stream.last_read_packet.store(available, Ordering::Relaxed);
-    // The sampling instant of the packet's first frame.
-    let start = stream.start_qpc.load(Ordering::Acquire);
-    let offset = clock::ticks_for_frames(
-        available.saturating_mul(per_packet),
-        stream.qpc_frequency.load(Ordering::Relaxed),
-        SAMPLE_RATE,
-    );
+    let counter = link.frame_qpc(read.packet.saturating_mul(per_packet));
     #[allow(
         clippy::cast_possible_truncation,
         reason = "packet numbers wrap at 32 bits, as the interface's ULONG does"
     )]
-    let number = available as ULONG;
+    let number = read.packet as ULONG;
     // SAFETY: the out-parameters are writable (checked not null above).
     unsafe { packet_number.write(number) };
     // SAFETY: as above.
     unsafe { flags.write(0) };
     // SAFETY: as above.
-    unsafe { performance_counter.write(start.saturating_add(offset)) };
-    // SAFETY: as above. The driver keeps no data beyond the buffer.
-    unsafe { more_data.write(FALSE.cast_signed()) };
+    unsafe { performance_counter.write(counter) };
+    // SAFETY: as above.
+    unsafe { more_data.write(if read.more { TRUE } else { FALSE }.cast_signed()) };
     STATUS_SUCCESS
 }

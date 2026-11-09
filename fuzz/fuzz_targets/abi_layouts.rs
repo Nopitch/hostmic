@@ -4,7 +4,7 @@
 #![no_main]
 
 use hostmic_abi::{
-    AdvanceReply, AdvanceRequest, AttachReply, AttachRequest, Format, FormatRange, Info,
+    AdvanceReply, AdvanceRequest, AttachReply, AttachRequest, Format, FormatRange, Info, Stats,
     StreamState,
 };
 use libfuzzer_sys::fuzz_target;
@@ -29,4 +29,5 @@ fuzz_target!(|data: &[u8]| {
     round_trip(data, StreamState::from_bytes, StreamState::to_bytes);
     round_trip(data, AdvanceRequest::from_bytes, AdvanceRequest::to_bytes);
     round_trip(data, AdvanceReply::from_bytes, AdvanceReply::to_bytes);
+    round_trip(data, Stats::from_bytes, Stats::to_bytes);
 });

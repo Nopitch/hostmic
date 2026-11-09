@@ -24,8 +24,9 @@ use core::{
 };
 
 use hostmic_abi::{
-    AttachReply, GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_INFO,
-    IOCTL_GET_STREAM, Info, StreamState,
+    AdvanceReply, AttachReply, GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ADVANCE, IOCTL_ATTACH,
+    IOCTL_DETACH, IOCTL_GET_INFO, IOCTL_GET_STATS, IOCTL_GET_STREAM, Info, Reason, Stats,
+    StreamState, function,
 };
 use hostmic_driver_core::host::{self, MAX_BUFFER_BYTES, Rejection};
 use hostmic_sys::WdmlibIoCreateDeviceSecure;
@@ -53,7 +54,7 @@ use wdk_sys::{
 };
 
 use crate::adapter::{current_stack_location, wide};
-use crate::host_link::{HostLink, LinkRef};
+use crate::host_link::{AdvanceError, HostLink, LinkRef};
 use crate::ks::size_ulong;
 
 /// The child's device type.
@@ -752,23 +753,48 @@ enum Refusal {
     Rejected(Rejection),
     /// Valid input, refused with this status, for this reason.
     Status(NTSTATUS, &'static str),
+    /// A request only the attached host may send, from another handle or process.
+    NotHost,
 }
 
-/// A reply of at most 32 bytes.
+impl Refusal {
+    /// The status the request completes with.
+    fn status(&self) -> NTSTATUS {
+        match self {
+            Self::Rejected(rejection) => rejection_status(*rejection),
+            Self::Status(status, _) => *status,
+            Self::NotHost => STATUS_INVALID_DEVICE_STATE,
+        }
+    }
+
+    /// The reason the counters report.
+    fn reason(&self) -> Reason {
+        match self {
+            Self::Rejected(rejection) => rejection.reason(),
+            Self::Status(..) => Reason::Status,
+            Self::NotHost => Reason::NotHost,
+        }
+    }
+}
+
+/// The largest reply: [`Stats`].
+const REPLY_MAX: usize = Stats::SIZE;
+
+/// A reply of at most [`REPLY_MAX`] bytes.
 struct Reply {
-    bytes: [u8; 32],
+    bytes: [u8; REPLY_MAX],
     len: usize,
 }
 
 impl Reply {
     const EMPTY: Self = Self {
-        bytes: [0; 32],
+        bytes: [0; REPLY_MAX],
         len: 0,
     };
 
     fn of<const N: usize>(encoded: [u8; N]) -> Self {
-        const { assert!(N <= 32) };
-        let mut bytes = [0; 32];
+        const { assert!(N <= REPLY_MAX) };
+        let mut bytes = [0; REPLY_MAX];
         bytes[..N].copy_from_slice(&encoded);
         Self { bytes, len: N }
     }
@@ -835,17 +861,38 @@ unsafe fn device_control(
                         if shared.detach(file) {
                             Ok(Reply::EMPTY)
                         } else {
-                            Err(Refusal::Status(
-                                STATUS_INVALID_DEVICE_STATE,
-                                "this handle is not the attached host",
-                            ))
+                            Err(Refusal::NotHost)
                         }
                     }),
+            ),
+            IOCTL_ADVANCE => (
+                "ADVANCE",
+                host::output(output, AdvanceReply::SIZE)
+                    .map_err(Refusal::Rejected)
+                    .and_then(|()| {
+                        shared.advance(file, input).map_err(|error| match error {
+                            AdvanceError::NotHost => Refusal::NotHost,
+                            AdvanceError::Rejected(rejection) => Refusal::Rejected(rejection),
+                        })
+                    })
+                    .map(|position| Reply::of(AdvanceReply { position }.to_bytes())),
+            ),
+            IOCTL_GET_STATS => (
+                "GET_STATS",
+                host::no_input(input)
+                    .and_then(|()| host::output(output, Stats::SIZE))
+                    .map(|()| Reply::of(shared.stats().to_bytes()))
+                    .map_err(Refusal::Rejected),
             ),
             code => {
                 println!(
                     "hostmic: unknown control code {code:#010x}, process {}",
                     current_process()
+                );
+                shared.refused(
+                    function(code),
+                    Reason::Status,
+                    STATUS_INVALID_DEVICE_REQUEST,
                 );
                 // SAFETY: the caller's contract.
                 return unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) };
@@ -863,23 +910,38 @@ unsafe fn device_control(
             // SAFETY: the caller's contract.
             unsafe { complete(irp, STATUS_SUCCESS, reply.len as u64) }
         }
-        Err(Refusal::Rejected(rejection)) => {
-            println!(
-                "hostmic: {name} refused: {rejection:?}, process {}",
-                current_process()
-            );
-            // SAFETY: the caller's contract.
-            unsafe { complete(irp, rejection_status(rejection), 0) }
-        }
-        Err(Refusal::Status(status, reason)) => {
-            println!(
-                "hostmic: {name} refused: {reason} ({status:#010x}), process {}",
-                current_process()
-            );
+        Err(refusal) => {
+            let status = count_refusal(shared, parameters.IoControlCode, name, &refusal);
             // SAFETY: the caller's contract.
             unsafe { complete(irp, status, 0) }
         }
     }
+}
+
+/// Counts a refused request and logs why; returns the status it completes with.
+fn count_refusal(shared: &HostLink, code: u32, name: &str, refusal: &Refusal) -> NTSTATUS {
+    let status = refusal.status();
+    shared.refused(function(code), refusal.reason(), status);
+    // `ADVANCE`s refused for a stale generation or position are part of the protocol (a state
+    // change raced the host) and may come by the hundred: counted, not logged.
+    if code == IOCTL_ADVANCE {
+        return status;
+    }
+    match refusal {
+        Refusal::Rejected(rejection) => println!(
+            "hostmic: {name} refused: {rejection:?}, process {}",
+            current_process()
+        ),
+        Refusal::Status(_, reason) => println!(
+            "hostmic: {name} refused: {reason} ({status:#010x}), process {}",
+            current_process()
+        ),
+        Refusal::NotHost => println!(
+            "hostmic: {name} refused: not the attached host's handle, process {}",
+            current_process()
+        ),
+    }
+    status
 }
 
 /// `IOCTL_ATTACH`: checks the request, references the host's event in its own process, and

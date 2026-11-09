@@ -1,9 +1,7 @@
-//! Conversions between the performance counter (`KeQueryPerformanceCounter`) and audio frames.
-//!
-//! A stream's position is a pure function of the time elapsed since it entered the RUN state:
-//! no carried remainder, no running sum, hence no state shared between the timer callback and
-//! the position queries, and no drift. The intermediate products are 128-bit, so any 64-bit
-//! tick count converts exactly (rounded down).
+//! Conversions between the performance counter (`KeQueryPerformanceCounter`) and audio frames:
+//! the driver dates each packet it hands to the audio engine from the time of the host's last
+//! `ADVANCE`. The intermediate products are 128-bit, so any 64-bit tick count converts exactly
+//! (rounded down).
 
 /// Frames elapsed after `ticks` performance counter ticks at `frequency` ticks per second, at
 /// `rate` frames per second, rounded down.

@@ -15,11 +15,13 @@
 //! so that the holder's is the last one, then watches its mapping without touching it (kill the
 //! holder: the driver must undo the mapping in this process, from the holder's).
 //!
-//! The driver maps its shared buffer into the host on attach. While the stream runs, the host
-//! prints once a second the peak of what the stream's part of the buffer holds: until the host
-//! advances the position (a later pull request, PLAN.md, M4), the driver writes its test tone
-//! there, so the peak shows that the host sees the audio engine's pages. Exit status: 0 on
-//! success, 1 on failure, 2 on a usage error.
+//! While the stream runs, the host plays a 1 kHz tone at -6.02 dBFS: it writes the frames due
+//! by the performance counter into the shared buffer the driver mapped on attach, and advances
+//! the stream position (`ADVANCE`) about once a millisecond, from a thread registered with
+//! MMCSS. The driver produces no audio and keeps no clock of its own: what
+//! `tools/capture-check` records is what this host wrote, at its pace. At the end it prints
+//! the driver's counters (`GET_STATS`). Exit status: 0 on success, 1 on failure, 2 on a usage
+//! error.
 
 use std::{
     env,
@@ -28,8 +30,9 @@ use std::{
 };
 
 use hostmic_abi::{
-    ABI_VERSION, AttachReply, AttachRequest, FormatRange, GUID_DEVINTERFACE_HOSTMIC_HOST,
-    IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_STREAM, SampleType, State, StreamState,
+    ABI_VERSION, AdvanceReply, AdvanceRequest, AttachReply, AttachRequest, FormatRange,
+    GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ADVANCE, IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_STATS,
+    IOCTL_GET_STREAM, SampleType, State, Stats, StreamState,
 };
 use windows::{
     Win32::{
@@ -41,6 +44,7 @@ use windows::{
             CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
             SetHandleInformation, WAIT_OBJECT_0,
         },
+        Media::{timeBeginPeriod, timeEndPeriod},
         Storage::FileSystem::{
             CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
             OPEN_EXISTING,
@@ -48,13 +52,14 @@ use windows::{
         System::{
             IO::DeviceIoControl,
             Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery},
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
             Threading::{
-                CREATE_NO_WINDOW, CreateEventW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
-                WaitForSingleObject,
+                AvSetMmThreadCharacteristicsW, CREATE_NO_WINDOW, CreateEventW, CreateProcessW,
+                PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
             },
         },
     },
-    core::{GUID, HSTRING, PCWSTR, PWSTR},
+    core::{GUID, HSTRING, PCWSTR, PWSTR, w},
 };
 
 const USAGE: &str = "usage: test-host [--seconds N] [--no-detach] [--holder [--close-own-handle]]";
@@ -164,34 +169,22 @@ fn run(options: &Options) -> Result<(), String> {
         }
     }
 
-    let end = Instant::now() + Duration::from_secs(options.seconds);
-    let mut stream = StreamState::default();
-    let mut next_peak = Instant::now();
-    while Instant::now() < end {
-        // SAFETY: an event handle this process owns.
-        let wait = unsafe { WaitForSingleObject(event.0, 250) };
-        if wait == WAIT_OBJECT_0 {
-            let mut state = [0u8; StreamState::SIZE];
-            device
-                .control(IOCTL_GET_STREAM, &[], &mut state)
-                .map_err(|e| format!("GET_STREAM: {e}"))?;
-            stream = StreamState::from_bytes(&state);
-            print_state(&stream);
-        }
-        if State::from_code(stream.state) == Some(State::Running) && Instant::now() >= next_peak {
-            next_peak = Instant::now() + Duration::from_secs(1);
-            // SAFETY: the driver mapped `buffer_bytes` bytes at `buffer` into this process
-            // until DETACH, which comes after the loop.
-            match unsafe { peak(&reply, &stream) } {
-                Some(peak) => println!(
-                    "buffer     peak {} over {} frames",
-                    dbfs(peak),
-                    stream.buffer_frames
-                ),
-                None => println!("buffer     the stream's buffer does not fit the mapping"),
-            }
-        }
-    }
+    // SAFETY: the driver mapped `buffer_bytes` bytes at `buffer` into this process until
+    // DETACH or the handle's close, which come after `play` returns.
+    unsafe { play(&device, &event, &reply, options.seconds) }?;
+
+    let mut stats = [0u8; Stats::SIZE];
+    device
+        .control(IOCTL_GET_STATS, &[], &mut stats)
+        .map_err(|e| format!("GET_STATS: {e}"))?;
+    let stats = Stats::from_bytes(&stats);
+    println!(
+        "driver     {} frames advanced, {} packets completed, {} skipped, {} requests refused",
+        stats.frames_advanced,
+        stats.packets_completed,
+        stats.packets_skipped,
+        stats.requests_refused
+    );
 
     if options.detach {
         device
@@ -269,41 +262,181 @@ fn watch_mapping(reply: &AttachReply, seconds: u64) {
     }
 }
 
-/// The largest absolute 16-bit sample in the stream's part of the shared buffer, or `None` when
-/// the stream's format is not 16-bit or its buffer exceeds the mapping.
+/// Frames per second of the one format the driver streams.
+const RATE: u64 = 48_000;
+
+/// One period of the test tone: 1 kHz at 48 kHz is exactly 48 frames, at half of full scale
+/// (-6.02 dBFS), the same signal `tools/capture-check` expects.
+fn tone_period() -> [i16; 48] {
+    core::array::from_fn(|n| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            reason = "|16384 sin x| <= 16384 fits an i16; n < 48 is exact"
+        )]
+        let sample = (16_384.0 * (core::f64::consts::TAU * n as f64 / 48.0).sin()).round() as i16;
+        sample
+    })
+}
+
+/// Writes the tone for the stream frames `frames` into the ring of `frames_in_buffer` 16-bit
+/// stereo frames at `base`, both channels alike.
 ///
 /// # Safety
 ///
-/// `reply` describes a live mapping of the shared buffer in this process.
-unsafe fn peak(reply: &AttachReply, stream: &StreamState) -> Option<u16> {
-    if SampleType::from_code(stream.format.sample_type) != Some(SampleType::Int16) {
-        return None;
+/// `base` is a live, page-aligned mapping of at least `frames_in_buffer` frames (4 bytes each).
+unsafe fn write_tone(
+    base: *mut u32,
+    tone: &[i16; 48],
+    frames: core::ops::Range<u64>,
+    frames_in_buffer: u64,
+) {
+    for frame in frames {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "remainders below 48 and below the buffer's frame count"
+        )]
+        let (sample, index) = (
+            tone[(frame % 48) as usize].cast_unsigned(),
+            (frame % frames_in_buffer) as usize,
+        );
+        // SAFETY: `index` is below `frames_in_buffer`, within the mapping, 4-byte aligned
+        // (page-aligned base). The audio engine reads these pages concurrently through its own
+        // mapping: a volatile write of whole frames.
+        unsafe {
+            base.wrapping_add(index)
+                .write_volatile(u32::from(sample) | (u32::from(sample) << 16));
+        };
     }
-    let samples = usize::try_from(stream.buffer_frames)
-        .ok()?
-        .checked_mul(usize::from(stream.format.channels))?;
-    if samples.checked_mul(2)? > reply.buffer_bytes as usize {
-        return None;
-    }
-    let base = usize::try_from(reply.buffer).ok()? as *const i16;
-    let mut peak = 0u16;
-    for index in 0..samples {
-        // Within the mapping (checked above), 2-byte aligned (page-aligned base).
-        let sample = base.wrapping_add(index);
-        // SAFETY: as above. The driver writes the same pages concurrently: a volatile read of
-        // each sample, which may be old or new, never torn (an aligned 16-bit read).
-        let sample = unsafe { sample.read_volatile() };
-        peak = peak.max(sample.unsigned_abs());
-    }
-    Some(peak)
 }
 
-/// A 16-bit peak in dBFS, two decimals.
-fn dbfs(peak: u16) -> String {
-    if peak == 0 {
-        return "-inf dBFS (silence)".to_owned();
+/// The performance counter.
+fn qpc() -> i64 {
+    let mut now = 0;
+    // SAFETY: a writable counter; cannot fail on Windows XP and later.
+    let _ = unsafe { QueryPerformanceCounter(&raw mut now) };
+    now
+}
+
+/// Plays the test tone into the stream for `seconds` seconds, as a host does: while the stream
+/// runs, writes the frames due by the performance counter into the shared buffer and advances
+/// the position, about once a millisecond, in a thread registered with MMCSS ("Pro Audio").
+/// Prints each stream change, and once a second how far it got.
+///
+/// # Safety
+///
+/// `reply` describes a live mapping of the shared buffer in this process for the whole call.
+unsafe fn play(
+    device: &Handle,
+    event: &Handle,
+    reply: &AttachReply,
+    seconds: u64,
+) -> Result<(), String> {
+    let mut task = 0u32;
+    // SAFETY: a static task name and a writable task index.
+    match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task) } {
+        Ok(_) => println!("thread     MMCSS Pro Audio"),
+        Err(error) => println!("thread     no MMCSS: {error}"),
     }
-    format!("{:.2} dBFS", 20.0 * (f64::from(peak) / 32768.0).log10())
+    // SAFETY: no precondition; undone below.
+    unsafe { timeBeginPeriod(1) };
+    let mut frequency = 0;
+    // SAFETY: a writable frequency.
+    unsafe { QueryPerformanceFrequency(&raw mut frequency) }
+        .map_err(|e| format!("QueryPerformanceFrequency: {e}"))?;
+    let tone = tone_period();
+    let base = usize::try_from(reply.buffer).map_err(|_| "buffer address")? as *mut u32;
+
+    let end = Instant::now() + Duration::from_secs(seconds);
+    let mut next_report = Instant::now();
+    let mut stream = StreamState::default();
+    // Performance counter and position at which the current run's clock starts.
+    let mut anchor: Option<(i64, u64)> = None;
+    let mut position = 0u64;
+    let (mut advanced, mut refused, mut late) = (0u64, 0u64, 0u64);
+    let mut refresh = false;
+    while Instant::now() < end {
+        // SAFETY: an event handle this process owns.
+        let wait = unsafe { WaitForSingleObject(event.0, 1) };
+        if wait == WAIT_OBJECT_0 || refresh {
+            refresh = false;
+            let mut state = [0u8; StreamState::SIZE];
+            device
+                .control(IOCTL_GET_STREAM, &[], &mut state)
+                .map_err(|e| format!("GET_STREAM: {e}"))?;
+            let previous = stream;
+            stream = StreamState::from_bytes(&state);
+            if stream != previous {
+                print_state(&stream);
+            }
+            let running = State::from_code(stream.state) == Some(State::Running);
+            if !running {
+                anchor = None;
+            } else if anchor.is_none() || stream.generation != previous.generation {
+                anchor = Some((qpc(), stream.position));
+                position = stream.position;
+            }
+        }
+        let Some((start, from)) = anchor else {
+            continue;
+        };
+        let frames_in_buffer = u64::from(stream.buffer_frames);
+        if frames_in_buffer == 0 || frames_in_buffer * 4 > u64::from(reply.buffer_bytes) {
+            return Err(format!(
+                "a buffer of {frames_in_buffer} frames does not fit the mapping"
+            ));
+        }
+        let elapsed = u64::try_from(qpc() - start).unwrap_or(0);
+        let due = from
+            + u64::try_from(
+                u128::from(elapsed) * u128::from(RATE) / u128::from(frequency.unsigned_abs()),
+            )
+            .unwrap_or(u64::MAX);
+        if due <= position {
+            continue;
+        }
+        let mut frames = due - position;
+        if frames > frames_in_buffer {
+            // More than a buffer late (the host was not scheduled): the engine lost those
+            // frames anyway; write one buffer and restart the clock from there.
+            late += 1;
+            frames = frames_in_buffer;
+            anchor = Some((qpc(), position + frames));
+        }
+        // SAFETY: the stream's frames fit the mapping (checked above).
+        unsafe { write_tone(base, &tone, position..position + frames, frames_in_buffer) };
+        let request = AdvanceRequest {
+            generation: stream.generation,
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "at most the buffer's frame count, a u32"
+            )]
+            frames: frames as u32,
+            from: position,
+        };
+        let mut answer = [0u8; AdvanceReply::SIZE];
+        if device
+            .control(IOCTL_ADVANCE, &request.to_bytes(), &mut answer)
+            .is_ok()
+        {
+            position = AdvanceReply::from_bytes(&answer).position;
+            advanced += frames;
+        } else {
+            // The stream changed meanwhile: read its state again.
+            refused += 1;
+            anchor = None;
+            refresh = true;
+        }
+        if Instant::now() >= next_report {
+            next_report = Instant::now() + Duration::from_secs(1);
+            println!(
+                "playing    position {position}  {advanced} frames advanced  {refused} refused  {late} late"
+            );
+        }
+    }
+    // SAFETY: matches `timeBeginPeriod` above.
+    unsafe { timeEndPeriod(1) };
+    Ok(())
 }
 
 /// One line per state, with units.

@@ -9,7 +9,8 @@
 //! The stream's generation and position follow `hostmic_driver_core::host::Cursor`'s protocol:
 //! a state change or a new buffer first halts the generation, then changes the rest. The writers
 //! here are the stream's state changes and buffer allocations (`PASSIVE_LEVEL`, serialized by
-//! PortCls); `ADVANCE` will join them with its compare-and-exchange.
+//! PortCls), and `ADVANCE`, which moves the position with one compare-and-exchange and loses
+//! to any of them.
 //!
 //! The link holds the adapter's reference to the shared buffer ([`crate::shared_buffer`]), and
 //! the attached host's mapping of it. A user mapping must be undone in its process before the
@@ -37,22 +38,35 @@ use core::{
 use crate::com::Unknown;
 use crate::shared_buffer::BufferRef;
 use crate::topology::PIN_MICROPHONE;
-use hostmic_abi::{Format, State, StreamState};
-use hostmic_driver_core::host::Cursor;
+use hostmic_abi::{Format, Reason, State, Stats, StreamState};
+use hostmic_driver_core::{
+    clock,
+    format::SAMPLE_RATE,
+    host::{self, Cursor, Rejection},
+    packet,
+};
 use hostmic_sys::{IPortEvents, IPortEventsVtbl, KSEVENT_PINCAPS_CHANGENOTIFICATIONS, guid};
 use wdk::println;
 use wdk_sys::{
-    _KPROCESS, EX_RUNDOWN_REF, FILE_OBJECT, HANDLE, KAPC_STATE, KEVENT, KGUARDED_MUTEX, NT_SUCCESS,
-    NTSTATUS, PEPROCESS, PPS_CREATE_NOTIFY_INFO, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES,
-    STATUS_SUCCESS,
+    _KPROCESS, EX_RUNDOWN_REF, FILE_OBJECT, HANDLE, KAPC_STATE, KEVENT, KGUARDED_MUTEX,
+    LARGE_INTEGER, NT_SUCCESS, NTSTATUS, PEPROCESS, PPS_CREATE_NOTIFY_INFO, STATUS_DEVICE_BUSY,
+    STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS,
     ntddk::{
         ExAcquireRundownProtection, ExReInitializeRundownProtection, ExReleaseRundownProtection,
         ExWaitForRundownProtectionRelease, IoGetCurrentProcess, KeAcquireGuardedMutex,
-        KeInitializeGuardedMutex, KeReleaseGuardedMutex, KeSetEvent, KeStackAttachProcess,
-        KeUnstackDetachProcess, ObfDereferenceObject, ObfReferenceObject,
+        KeInitializeGuardedMutex, KeQueryPerformanceCounter, KeReleaseGuardedMutex, KeSetEvent,
+        KeStackAttachProcess, KeUnstackDetachProcess, ObfDereferenceObject, ObfReferenceObject,
         PsSetCreateProcessNotifyRoutineEx,
     },
 };
+
+/// The current performance counter value. Any IRQL.
+fn qpc() -> u64 {
+    // SAFETY: any IRQL; no frequency requested.
+    let now = unsafe { KeQueryPerformanceCounter(ptr::null_mut()) };
+    // SAFETY: `QuadPart` is the whole value of the union.
+    unsafe { now.QuadPart }.cast_unsigned()
+}
 
 /// Shared between the capture stream and the host interface. All zeroes is its initial state
 /// (as in a fresh device extension) until [`HostLink::init`].
@@ -104,6 +118,34 @@ pub struct HostLink {
     jack_rundown: UnsafeCell<EX_RUNDOWN_REF>,
     /// Serializes the changes of `jack_events`; initialized by [`HostLink::init`].
     jack_lock: UnsafeCell<KGUARDED_MUTEX>,
+    /// The audio engine's notification event, which `ADVANCE` signals when a packet completes;
+    /// null without one. Not referenced: the stream registers and unregisters it, and
+    /// unregistering waits for `engine_rundown`.
+    engine_event: AtomicPtr<KEVENT>,
+    /// Keeps `engine_event` valid while an `ADVANCE` signals it.
+    engine_rundown: UnsafeCell<EX_RUNDOWN_REF>,
+    /// Performance counter ticks per second, read once by [`HostLink::init`].
+    qpc_frequency: AtomicU64,
+    /// The performance counter and the position of the last `ADVANCE`, from which packets are
+    /// dated. Written one after the other, so a reader may pair one advance's value with the
+    /// next one's: an error of at most one advance's frames.
+    advance_qpc: AtomicU64,
+    advance_position: AtomicU64,
+    /// The counters [`HostLink::stats`] reports (`hostmic_abi::Stats`).
+    frames_advanced: AtomicU64,
+    packets_completed: AtomicU64,
+    packets_skipped: AtomicU64,
+    requests_refused: AtomicU64,
+    /// The last refusal: request function (bits 0-15), reason (16-31), status (32-63).
+    last_refusal: AtomicU64,
+}
+
+/// Why `ADVANCE` was refused.
+pub enum AdvanceError {
+    /// The request does not come from the attached host's handle and process.
+    NotHost,
+    /// The validation in `hostmic-driver-core` refused it.
+    Rejected(Rejection),
 }
 
 // SAFETY: every field is atomic except the rundown references, which the kernel's rundown
@@ -133,6 +175,12 @@ impl HostLink {
         if !self.started.load(Ordering::Acquire) {
             // No filter, hence no stream, exists before the first start.
             self.cursor.store(Cursor::STOPPED.pack(), Ordering::Release);
+            let mut frequency = LARGE_INTEGER::default();
+            // SAFETY: any IRQL; `frequency` is a valid out-parameter.
+            unsafe { KeQueryPerformanceCounter(&raw mut frequency) };
+            // SAFETY: `QuadPart` is the whole value of the union.
+            let frequency = unsafe { frequency.QuadPart }.cast_unsigned();
+            self.qpc_frequency.store(frequency, Ordering::Relaxed);
             // SAFETY: the first start: nothing uses the locks yet.
             unsafe { KeInitializeGuardedMutex(self.jack_lock.get()) };
             // SAFETY: as above.
@@ -277,6 +325,150 @@ impl HostLink {
             }
         }
         state
+    }
+
+    /// The stream position, in frames since the stream started (stopped: 0). Any IRQL; reads
+    /// one atomic.
+    pub fn position(&self) -> u64 {
+        Cursor::unpack(self.cursor.load(Ordering::Acquire)).position
+    }
+
+    /// `IOCTL_ADVANCE`: the attached host wrote frames; moves the position with one
+    /// compare-and-exchange (`hostmic_driver_core::host::Cursor` has the protocol), signals the
+    /// audio engine when packets complete, and returns the new position. `PASSIVE_LEVEL`, in
+    /// the requesting thread; no lock.
+    ///
+    /// # Errors
+    ///
+    /// The request does not come from the attached host's handle and process, or its input
+    /// does not match the stream.
+    pub fn advance(&self, file: *mut FILE_OBJECT, input: &[u8]) -> Result<u64, AdvanceError> {
+        // SAFETY: any IRQL; the current process.
+        let current = unsafe { IoGetCurrentProcess() };
+        if file.is_null()
+            || self.host.load(Ordering::Acquire) != file
+            || self.process.load(Ordering::Acquire) != current
+        {
+            return Err(AdvanceError::NotHost);
+        }
+        // Each failed exchange means that another writer moved the cursor: its generation or its
+        // position changed, so the next validation refuses a request computed for the old one.
+        // The loop therefore runs at most twice.
+        let (from, to, per_packet) = loop {
+            let word = self.cursor.load(Ordering::Acquire);
+            // Read after the word: a new buffer halts the generation before it changes these,
+            // so values newer than the word make the exchange below fail.
+            let buffer_frames = self.buffer_frames.load(Ordering::Acquire);
+            let per_packet = self.frames_per_packet.load(Ordering::Acquire);
+            let next = host::advance(input, word, buffer_frames).map_err(AdvanceError::Rejected)?;
+            if self
+                .cursor
+                .compare_exchange(word, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break (
+                    Cursor::unpack(word).position,
+                    Cursor::unpack(next).position,
+                    per_packet,
+                );
+            }
+        };
+        self.advance_qpc.store(qpc(), Ordering::Relaxed);
+        self.advance_position.store(to, Ordering::Release);
+        self.frames_advanced.fetch_add(to - from, Ordering::Relaxed);
+        let completed = packet::completed_between(from, to, u64::from(per_packet));
+        if completed != 0 {
+            self.packets_completed
+                .fetch_add(completed, Ordering::Relaxed);
+            self.signal_engine();
+        }
+        Ok(to)
+    }
+
+    /// Signals the audio engine's notification event, if one is registered. Never waits.
+    fn signal_engine(&self) {
+        // SAFETY: a valid rundown reference, initialized (all zeroes or reinitialized).
+        if unsafe { ExAcquireRundownProtection(self.engine_rundown.get()) } == 0 {
+            return;
+        }
+        let event = self.engine_event.load(Ordering::Acquire);
+        if !event.is_null() {
+            // SAFETY: a registered event, valid until `clear_engine_event`, which waits for the
+            // rundown protection held here. No wait follows.
+            unsafe { KeSetEvent(event, 0, 0) };
+        }
+        // SAFETY: acquired above.
+        unsafe { ExReleaseRundownProtection(self.engine_rundown.get()) };
+    }
+
+    /// The stream registered the audio engine's notification event; `false` if another one is
+    /// registered.
+    pub fn set_engine_event(&self, event: *mut KEVENT) -> bool {
+        self.engine_event
+            .compare_exchange(ptr::null_mut(), event, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The stream unregistered `event`: returns once no `ADVANCE` signals it any more.
+    /// `PASSIVE_LEVEL`; PortCls serializes registrations, so no other wait overlaps.
+    pub fn clear_engine_event(&self, event: *mut KEVENT) {
+        if self
+            .engine_event
+            .compare_exchange(event, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // SAFETY: PASSIVE_LEVEL; waits for `signal_engine` calls holding the protection.
+        unsafe { ExWaitForRundownProtectionRelease(self.engine_rundown.get()) };
+        // SAFETY: the rundown completed and nobody holds it.
+        unsafe { ExReInitializeRundownProtection(self.engine_rundown.get()) };
+    }
+
+    /// The performance counter value at which stream frame `frame` was written, estimated from
+    /// the last `ADVANCE` (its time and position) at the stream's rate. Any IRQL; reads atomics.
+    pub fn frame_qpc(&self, frame: u64) -> u64 {
+        let position = self.advance_position.load(Ordering::Acquire);
+        let at = self.advance_qpc.load(Ordering::Relaxed);
+        let back = clock::ticks_for_frames(
+            position.saturating_sub(frame),
+            self.qpc_frequency.load(Ordering::Relaxed),
+            SAMPLE_RATE,
+        );
+        at.saturating_sub(back)
+    }
+
+    /// `GetReadPacket` skipped `count` packets the host had overwritten. Any IRQL.
+    pub fn packets_skipped(&self, count: u64) {
+        self.packets_skipped.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// A request of control code function `request` was refused, for `reason`, with `status`.
+    /// Any IRQL.
+    pub fn refused(&self, request: u16, reason: Reason, status: NTSTATUS) {
+        self.requests_refused.fetch_add(1, Ordering::Relaxed);
+        let packed = u64::from(request)
+            | u64::from(reason.code()) << 16
+            | u64::from(status.cast_unsigned()) << 32;
+        self.last_refusal.store(packed, Ordering::Relaxed);
+    }
+
+    /// What `IOCTL_GET_STATS` replies.
+    pub fn stats(&self) -> Stats {
+        let refusal = self.last_refusal.load(Ordering::Relaxed);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "unpacks the fields `refused` packed"
+        )]
+        Stats {
+            frames_advanced: self.frames_advanced.load(Ordering::Relaxed),
+            packets_completed: self.packets_completed.load(Ordering::Relaxed),
+            packets_skipped: self.packets_skipped.load(Ordering::Relaxed),
+            requests_refused: self.requests_refused.load(Ordering::Relaxed),
+            last_request: refusal as u16,
+            last_reason: (refusal >> 16) as u16,
+            last_status: (refusal >> 32) as u32,
+        }
     }
 
     /// Whether a host is attached: the microphone's jack is connected.
