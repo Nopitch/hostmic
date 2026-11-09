@@ -15,21 +15,26 @@
 //! so that the holder's is the last one, then watches its mapping without touching it (kill the
 //! holder: the driver must undo the mapping in this process, from the holder's).
 //!
-//! The driver maps its shared buffer into the host on attach. While the stream runs, the host
-//! prints once a second the peak of what the stream's part of the buffer holds: until the host
-//! advances the position (a later pull request, PLAN.md, M4), the driver writes its test tone
-//! there, so the peak shows that the host sees the audio engine's pages. Exit status: 0 on
-//! success, 1 on failure, 2 on a usage error.
+//! While the stream runs, the host plays a 1 kHz tone at -6.02 dBFS: it writes the frames due
+//! by the performance counter into the shared buffer the driver mapped on attach, and advances
+//! the stream position (`ADVANCE`) about once a millisecond, from a thread registered with
+//! MMCSS. The driver produces no audio and keeps no clock of its own: what
+//! `tools/capture-check` records is what this host wrote, at its pace. At the end it prints
+//! the driver's counters (`GET_STATS`). Exit status: 0 on success, 1 on failure, 2 on a usage
+//! error.
 
 use std::{
     env,
     process::ExitCode,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
 use hostmic_abi::{
-    ABI_VERSION, AttachReply, AttachRequest, FormatRange, GUID_DEVINTERFACE_HOSTMIC_HOST,
-    IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_STREAM, SampleType, State, StreamState,
+    ABI_VERSION, AdvanceReply, AdvanceRequest, AttachReply, AttachRequest, FormatRange,
+    GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ADVANCE, IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_STATS,
+    IOCTL_GET_STREAM, SampleType, State, Stats, StreamState,
 };
 use windows::{
     Win32::{
@@ -38,9 +43,10 @@ use windows::{
             CM_Get_Device_Interface_ListW, CR_SUCCESS,
         },
         Foundation::{
-            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
+            CloseHandle, ERROR_NOT_READY, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
             SetHandleInformation, WAIT_OBJECT_0,
         },
+        Media::{timeBeginPeriod, timeEndPeriod},
         Storage::FileSystem::{
             CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
             OPEN_EXISTING,
@@ -48,13 +54,14 @@ use windows::{
         System::{
             IO::DeviceIoControl,
             Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery},
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
             Threading::{
-                CREATE_NO_WINDOW, CreateEventW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
-                WaitForSingleObject,
+                AvSetMmThreadCharacteristicsW, CREATE_NO_WINDOW, CreateEventW, CreateProcessW,
+                PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
             },
         },
     },
-    core::{GUID, HSTRING, PCWSTR, PWSTR},
+    core::{GUID, HSTRING, PCWSTR, PWSTR, w},
 };
 
 const USAGE: &str = "usage: test-host [--seconds N] [--no-detach] [--holder [--close-own-handle]]";
@@ -164,34 +171,22 @@ fn run(options: &Options) -> Result<(), String> {
         }
     }
 
-    let end = Instant::now() + Duration::from_secs(options.seconds);
-    let mut stream = StreamState::default();
-    let mut next_peak = Instant::now();
-    while Instant::now() < end {
-        // SAFETY: an event handle this process owns.
-        let wait = unsafe { WaitForSingleObject(event.0, 250) };
-        if wait == WAIT_OBJECT_0 {
-            let mut state = [0u8; StreamState::SIZE];
-            device
-                .control(IOCTL_GET_STREAM, &[], &mut state)
-                .map_err(|e| format!("GET_STREAM: {e}"))?;
-            stream = StreamState::from_bytes(&state);
-            print_state(&stream);
-        }
-        if State::from_code(stream.state) == Some(State::Running) && Instant::now() >= next_peak {
-            next_peak = Instant::now() + Duration::from_secs(1);
-            // SAFETY: the driver mapped `buffer_bytes` bytes at `buffer` into this process
-            // until DETACH, which comes after the loop.
-            match unsafe { peak(&reply, &stream) } {
-                Some(peak) => println!(
-                    "buffer     peak {} over {} frames",
-                    dbfs(peak),
-                    stream.buffer_frames
-                ),
-                None => println!("buffer     the stream's buffer does not fit the mapping"),
-            }
-        }
-    }
+    // SAFETY: the driver mapped `buffer_bytes` bytes at `buffer` into this process until
+    // DETACH or the handle's close, which come after `play` returns.
+    unsafe { play(&device, &event, &reply, options.seconds) }?;
+
+    let mut stats = [0u8; Stats::SIZE];
+    device
+        .control(IOCTL_GET_STATS, &[], &mut stats)
+        .map_err(|e| format!("GET_STATS: {e}"))?;
+    let stats = Stats::from_bytes(&stats);
+    println!(
+        "driver     {} frames advanced, {} packets completed, {} skipped, {} requests refused",
+        stats.frames_advanced,
+        stats.packets_completed,
+        stats.packets_skipped,
+        stats.requests_refused
+    );
 
     if options.detach {
         device
@@ -269,41 +264,342 @@ fn watch_mapping(reply: &AttachReply, seconds: u64) {
     }
 }
 
-/// The largest absolute 16-bit sample in the stream's part of the shared buffer, or `None` when
-/// the stream's format is not 16-bit or its buffer exceeds the mapping.
+/// Frames per second of the one format the driver streams.
+const RATE: u64 = 48_000;
+
+/// One period of the test tone: 1 kHz at 48 kHz is exactly 48 frames, at half of full scale
+/// (-6.02 dBFS), the same signal `tools/capture-check` expects.
+fn tone_period() -> [i16; 48] {
+    core::array::from_fn(|n| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            reason = "|16384 sin x| <= 16384 fits an i16; n < 48 is exact"
+        )]
+        let sample = (16_384.0 * (core::f64::consts::TAU * n as f64 / 48.0).sin()).round() as i16;
+        sample
+    })
+}
+
+/// Writes the tone for the stream frames `frames` into the ring of `frames_in_buffer` 16-bit
+/// stereo frames at `base`, both channels alike.
 ///
 /// # Safety
 ///
-/// `reply` describes a live mapping of the shared buffer in this process.
-unsafe fn peak(reply: &AttachReply, stream: &StreamState) -> Option<u16> {
-    if SampleType::from_code(stream.format.sample_type) != Some(SampleType::Int16) {
-        return None;
+/// `base` is a live, page-aligned mapping of at least `frames_in_buffer` frames (4 bytes each).
+unsafe fn write_tone(
+    base: *mut u32,
+    tone: &[i16; 48],
+    frames: core::ops::Range<u64>,
+    frames_in_buffer: u64,
+) {
+    for frame in frames {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "remainders below 48 and below the buffer's frame count"
+        )]
+        let (sample, index) = (
+            tone[(frame % 48) as usize].cast_unsigned(),
+            (frame % frames_in_buffer) as usize,
+        );
+        // SAFETY: `index` is below `frames_in_buffer`, within the mapping, 4-byte aligned
+        // (page-aligned base). The audio engine reads these pages concurrently through its own
+        // mapping: a volatile write of whole frames.
+        unsafe {
+            base.wrapping_add(index)
+                .write_volatile(u32::from(sample) | (u32::from(sample) << 16));
+        };
     }
-    let samples = usize::try_from(stream.buffer_frames)
-        .ok()?
-        .checked_mul(usize::from(stream.format.channels))?;
-    if samples.checked_mul(2)? > reply.buffer_bytes as usize {
-        return None;
-    }
-    let base = usize::try_from(reply.buffer).ok()? as *const i16;
-    let mut peak = 0u16;
-    for index in 0..samples {
-        // Within the mapping (checked above), 2-byte aligned (page-aligned base).
-        let sample = base.wrapping_add(index);
-        // SAFETY: as above. The driver writes the same pages concurrently: a volatile read of
-        // each sample, which may be old or new, never torn (an aligned 16-bit read).
-        let sample = unsafe { sample.read_volatile() };
-        peak = peak.max(sample.unsigned_abs());
-    }
-    Some(peak)
 }
 
-/// A 16-bit peak in dBFS, two decimals.
-fn dbfs(peak: u16) -> String {
-    if peak == 0 {
-        return "-inf dBFS (silence)".to_owned();
+/// Performance counter ticks in milliseconds.
+fn ms(ticks: i64, frequency: i64) -> f64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a duration for display, far below 2^52 ticks"
+    )]
+    let ms = ticks as f64 * 1_000.0 / frequency.max(1) as f64;
+    ms
+}
+
+/// The performance counter.
+fn qpc() -> i64 {
+    let mut now = 0;
+    // SAFETY: a writable counter; cannot fail on Windows XP and later.
+    let _ = unsafe { QueryPerformanceCounter(&raw mut now) };
+    now
+}
+
+/// What the player thread tells the main thread, which prints it: the player itself never
+/// writes to the console or a file, which can block for tens of milliseconds.
+enum Note {
+    /// The player thread's scheduling (MMCSS).
+    Thread(String),
+    /// The stream changed.
+    Stream(StreamState),
+    /// More than a buffer of frames was due at `position`: the host was not scheduled for
+    /// `gap_ms` milliseconds.
+    Late {
+        position: u64,
+        frames: u64,
+        gap_ms: f64,
+    },
+    /// Once a second while playing.
+    Progress {
+        position: u64,
+        advanced: u64,
+        refused: u64,
+        late: u64,
+        longest_gap_ms: f64,
+    },
+}
+
+/// Plays the test tone into the stream for `seconds` seconds, as a host does: a player thread
+/// registered with MMCSS ("Pro Audio") writes, while the stream runs, the frames due by the
+/// performance counter into the shared buffer and advances the position about once a
+/// millisecond; this thread prints what it reports.
+///
+/// # Safety
+///
+/// `reply` describes a live mapping of the shared buffer in this process for the whole call.
+unsafe fn play(
+    device: &Handle,
+    event: &Handle,
+    reply: &AttachReply,
+    seconds: u64,
+) -> Result<(), String> {
+    let mut frequency = 0;
+    // SAFETY: a writable frequency.
+    unsafe { QueryPerformanceFrequency(&raw mut frequency) }
+        .map_err(|e| format!("QueryPerformanceFrequency: {e}"))?;
+    let base = Mapping(usize::try_from(reply.buffer).map_err(|_| "buffer address")? as *mut u32);
+    let buffer_bytes = u64::from(reply.buffer_bytes);
+    let (notes, received) = mpsc::channel();
+    thread::scope(|scope| {
+        let player = scope.spawn(move || {
+            let mut player = Player {
+                device,
+                base,
+                buffer_bytes,
+                frequency,
+                notes,
+                tone: tone_period(),
+            };
+            player.run(event, Duration::from_secs(seconds))
+        });
+        for note in received {
+            print_note(&note);
+        }
+        player
+            .join()
+            .map_err(|_| "the player thread panicked".to_owned())?
+    })
+}
+
+fn print_note(note: &Note) {
+    match note {
+        Note::Thread(text) => println!("thread     {text}"),
+        Note::Stream(stream) => print_state(stream),
+        Note::Late {
+            position,
+            frames,
+            gap_ms,
+        } => println!(
+            "late       at position {position}: {frames} frames due, {gap_ms:.1} ms since the previous write"
+        ),
+        Note::Progress {
+            position,
+            advanced,
+            refused,
+            late,
+            longest_gap_ms,
+        } => println!(
+            "playing    position {position}  {advanced} frames advanced  {refused} refused  {late} late  longest gap {longest_gap_ms:.1} ms"
+        ),
     }
-    format!("{:.2} dBFS", 20.0 * (f64::from(peak) / 32768.0).log10())
+}
+
+/// The shared buffer's address in this process.
+#[derive(Clone, Copy)]
+struct Mapping(*mut u32);
+
+// SAFETY: an address in this process's space, valid for every thread; `play`'s contract keeps
+// the mapping alive while the player uses it.
+unsafe impl Send for Mapping {}
+
+/// The player thread's state.
+struct Player<'a> {
+    device: &'a Handle,
+    base: Mapping,
+    buffer_bytes: u64,
+    frequency: i64,
+    notes: mpsc::Sender<Note>,
+    tone: [i16; 48],
+}
+
+impl Player<'_> {
+    /// The player loop, for `duration`.
+    fn run(&mut self, event: &Handle, duration: Duration) -> Result<(), String> {
+        let mut task = 0u32;
+        // SAFETY: a static task name and a writable task index. Failure only loses priority.
+        let mmcss = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task) };
+        let _ = self.notes.send(Note::Thread(match mmcss {
+            Ok(_) => "MMCSS Pro Audio".to_owned(),
+            Err(error) => format!("no MMCSS: {error}"),
+        }));
+        // SAFETY: no precondition; undone below.
+        unsafe { timeBeginPeriod(1) };
+        let result = self.play_for(event, duration);
+        // SAFETY: matches `timeBeginPeriod` above.
+        unsafe { timeEndPeriod(1) };
+        result
+    }
+
+    fn play_for(&mut self, event: &Handle, duration: Duration) -> Result<(), String> {
+        let end = Instant::now() + duration;
+        let mut next_report = Instant::now();
+        let mut stream = StreamState::default();
+        // Performance counter and position at which the current run's clock starts.
+        let mut anchor: Option<(i64, u64)> = None;
+        let mut position = 0u64;
+        let (mut advanced, mut refused, mut late) = (0u64, 0u64, 0u64);
+        // The performance counter at the last write, and the longest time between two writes.
+        let mut last_write: Option<i64> = None;
+        let mut longest_gap = 0i64;
+        let mut refresh = false;
+        while Instant::now() < end {
+            // SAFETY: an event handle this process owns.
+            let wait = unsafe { WaitForSingleObject(event.0, 1) };
+            if wait == WAIT_OBJECT_0 || refresh {
+                refresh = false;
+                let previous = stream;
+                stream = self.stream()?;
+                if stream != previous {
+                    let _ = self.notes.send(Note::Stream(stream));
+                }
+                // Running for the host: the running state under an even (accepting) generation,
+                // with a buffer. The driver may report `running` one step early, under the
+                // last odd generation.
+                let running = State::from_code(stream.state) == Some(State::Running)
+                    && stream.generation % 2 == 0
+                    && stream.buffer_frames != 0;
+                if !running {
+                    anchor = None;
+                    last_write = None;
+                } else if anchor.is_none() || stream.generation != previous.generation {
+                    anchor = Some((qpc(), stream.position));
+                    position = stream.position;
+                    last_write = None;
+                }
+            }
+            let Some((start, from)) = anchor else {
+                continue;
+            };
+            let frames_in_buffer = u64::from(stream.buffer_frames);
+            // Not while `running` requires a buffer; kept against a division by zero below.
+            if frames_in_buffer == 0 {
+                anchor = None;
+                continue;
+            }
+            if frames_in_buffer * 4 > self.buffer_bytes {
+                return Err(format!(
+                    "a buffer of {frames_in_buffer} frames does not fit the mapping"
+                ));
+            }
+            let now = qpc();
+            let due = from + self.frames_in(now - start);
+            if due <= position {
+                continue;
+            }
+            let mut frames = due - position;
+            let gap = now - last_write.unwrap_or(now);
+            last_write = Some(now);
+            longest_gap = longest_gap.max(gap);
+            if frames > frames_in_buffer {
+                // More than a buffer late: the engine lost those frames anyway; write one
+                // buffer and restart the clock from there.
+                late += 1;
+                let _ = self.notes.send(Note::Late {
+                    position,
+                    frames,
+                    gap_ms: ms(gap, self.frequency),
+                });
+                frames = frames_in_buffer;
+                anchor = Some((now, position + frames));
+            }
+            // SAFETY: the stream's frames fit the mapping (checked above).
+            unsafe {
+                write_tone(
+                    self.base.0,
+                    &self.tone,
+                    position..position + frames,
+                    frames_in_buffer,
+                );
+            };
+            if let Some(next) = self.advance(stream.generation, frames, position)? {
+                position = next;
+                advanced += frames;
+            } else {
+                // The stream changed meanwhile: read its state again.
+                refused += 1;
+                anchor = None;
+                refresh = true;
+            }
+            if Instant::now() >= next_report {
+                next_report = Instant::now() + Duration::from_secs(1);
+                let _ = self.notes.send(Note::Progress {
+                    position,
+                    advanced,
+                    refused,
+                    late,
+                    longest_gap_ms: ms(longest_gap, self.frequency),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// `GET_STREAM`.
+    fn stream(&self) -> Result<StreamState, String> {
+        let mut state = [0u8; StreamState::SIZE];
+        self.device
+            .control(IOCTL_GET_STREAM, &[], &mut state)
+            .map_err(|e| format!("GET_STREAM: {e}"))?;
+        Ok(StreamState::from_bytes(&state))
+    }
+
+    /// `ADVANCE` by `frames` from `from`: the new position, or `None` when the request no longer
+    /// matches the stream (a state change raced it: `ERROR_NOT_READY`, see `IOCTL_ADVANCE`).
+    ///
+    /// # Errors
+    ///
+    /// Any other refusal: this process is no longer the attached host, for instance.
+    fn advance(&self, generation: u32, frames: u64, from: u64) -> Result<Option<u64>, String> {
+        let request = AdvanceRequest {
+            generation,
+            frames: u32::try_from(frames).map_err(|_| "too many frames")?,
+            from,
+        };
+        let mut answer = [0u8; AdvanceReply::SIZE];
+        match self
+            .device
+            .call(IOCTL_ADVANCE, &request.to_bytes(), &mut answer)
+        {
+            Ok(returned) if returned as usize == AdvanceReply::SIZE => {
+                Ok(Some(AdvanceReply::from_bytes(&answer).position))
+            }
+            Ok(returned) => Err(format!("ADVANCE returned {returned} bytes")),
+            Err(error) if error.code() == ERROR_NOT_READY.to_hresult() => Ok(None),
+            Err(error) => Err(format!("ADVANCE: {error}")),
+        }
+    }
+
+    /// Frames in `ticks` performance counter ticks, rounded down; 0 for a negative count.
+    fn frames_in(&self, ticks: i64) -> u64 {
+        let ticks = u128::from(u64::try_from(ticks).unwrap_or(0));
+        u64::try_from(ticks * u128::from(RATE) / u128::from(self.frequency.unsigned_abs().max(1)))
+            .unwrap_or(u64::MAX)
+    }
 }
 
 /// One line per state, with units.
@@ -391,6 +687,11 @@ fn interface_paths() -> Result<Vec<String>, String> {
 /// A handle this process owns, closed on drop.
 struct Handle(HANDLE);
 
+// SAFETY: a kernel handle is valid in every thread of the process, and the calls made with it
+// (`DeviceIoControl`, `WaitForSingleObject`) may run concurrently from several threads; it is
+// closed only when the `Handle` is dropped, after the threads that borrow it end.
+unsafe impl Sync for Handle {}
+
 impl Handle {
     /// Opens `path` for reading and writing, as a host must.
     fn open(path: &str) -> Result<Self, windows::core::Error> {
@@ -412,9 +713,19 @@ impl Handle {
 
     /// A synchronous device control request; the reply must fill `output` exactly.
     fn control(&self, code: u32, input: &[u8], output: &mut [u8]) -> Result<(), String> {
-        let mut returned = 0u32;
-        let input_length = u32::try_from(input.len()).unwrap_or(u32::MAX);
         let output_length = u32::try_from(output.len()).unwrap_or(u32::MAX);
+        let returned = self.call(code, input, output).map_err(|e| e.to_string())?;
+        if returned != output_length {
+            return Err(format!(
+                "{returned} bytes returned, {output_length} expected"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `DeviceIoControl`, synchronous; the bytes returned.
+    fn call(&self, code: u32, input: &[u8], output: &mut [u8]) -> windows::core::Result<u32> {
+        let mut returned = 0u32;
         // SAFETY: an open handle; buffers of the given lengths that live through the
         // synchronous call; a writable byte count.
         unsafe {
@@ -422,20 +733,14 @@ impl Handle {
                 self.0,
                 code,
                 (!input.is_empty()).then_some(input.as_ptr().cast()),
-                input_length,
+                u32::try_from(input.len()).unwrap_or(u32::MAX),
                 (!output.is_empty()).then_some(output.as_mut_ptr().cast()),
-                output_length,
+                u32::try_from(output.len()).unwrap_or(u32::MAX),
                 Some(&raw mut returned),
                 None,
             )
-        }
-        .map_err(|e| e.to_string())?;
-        if returned != output_length {
-            return Err(format!(
-                "{returned} bytes returned, {output_length} expected"
-            ));
-        }
-        Ok(())
+        }?;
+        Ok(returned)
     }
 }
 

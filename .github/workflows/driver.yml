@@ -88,7 +88,7 @@ jobs:
 
       # hostmic-sys: Rust layouts and GUIDs checked against what MSVC computes from the WDK
       # headers. hostmic-abi: request layouts match their byte encodings. hostmic-driver-core:
-      # the driver's pure logic (tone, clock, ring, packets, host request validation).
+      # the driver's pure logic (clock, packets, buffer geometry, host request validation).
       - name: Test
         run: cargo test --locked
 

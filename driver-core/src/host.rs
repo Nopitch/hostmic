@@ -8,7 +8,8 @@
 //! The layouts are `hostmic-abi`'s; what the driver accepts is decided here.
 
 use hostmic_abi::{
-    ABI_VERSION, AdvanceRequest, AttachRequest, FormatRange, Info, SAMPLE_TYPES_ALL, SampleType,
+    ABI_VERSION, AdvanceRequest, AttachRequest, FormatRange, Info, Reason, SAMPLE_TYPES_ALL,
+    SampleType,
 };
 
 use crate::format::{BYTES_PER_SECOND, CHANNELS, SAMPLE_RATE};
@@ -89,6 +90,28 @@ pub enum Rejection {
     /// The host is a 32-bit process: the buffer may be mapped above 4 GiB, where it cannot
     /// reach it. Only 64-bit hosts are supported.
     Wow64,
+}
+
+impl Rejection {
+    /// The [`Reason`] code the driver's counters report for it.
+    #[must_use]
+    pub const fn reason(self) -> Reason {
+        match self {
+            Self::InputSize { .. } => Reason::InputSize,
+            Self::OutputSize { .. } => Reason::OutputSize,
+            Self::Version { .. } => Reason::Version,
+            Self::Reserved => Reason::Reserved,
+            Self::Event { .. } => Reason::Event,
+            Self::InvalidRange => Reason::InvalidRange,
+            Self::NoCommonFormat => Reason::NoCommonFormat,
+            Self::NotRunning => Reason::NotRunning,
+            Self::Generation { .. } => Reason::Generation,
+            Self::Frames { .. } => Reason::Frames,
+            Self::Position { .. } => Reason::Position,
+            Self::Overflow => Reason::Overflow,
+            Self::Wow64 => Reason::Wow64,
+        }
+    }
 }
 
 /// What [`IOCTL_GET_INFO`](hostmic_abi::IOCTL_GET_INFO) replies.

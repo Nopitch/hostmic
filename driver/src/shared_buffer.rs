@@ -16,8 +16,8 @@
 //! freed with the last one, so that a stream or a host outliving the adapter's removal never
 //! reads freed pages.
 //!
-//! The driver writes into the buffer (zeroes, and until the host advances the position, the
-//! test tone) and never reads it: what the host writes is opaque data for the audio engine.
+//! The driver writes into the buffer only to zero it (on allocation and for each new host) and
+//! never reads it: what the host writes is opaque data for the audio engine.
 
 use core::{
     alloc::Layout,
@@ -168,7 +168,7 @@ impl BufferRef {
     /// whole 32-bit words.
     ///
     /// The pages are shared memory: the host and the audio engine access them through their
-    /// own mappings, and the stream's timer may write the test tone meanwhile. The driver only
+    /// own mappings, and a stream allocation and an `ATTACH` may zero it at once. The driver only
     /// ever writes them as aligned 32-bit atomics (relaxed: a plain store on x64 and ARM64),
     /// never through a non-atomic Rust access, so that its own concurrent writers do not race.
     pub fn zero(&self, bytes: usize) {

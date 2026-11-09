@@ -5,9 +5,10 @@
 //! `simpleaudiosample` (Copyright (c) Microsoft Corporation, MS-PL); PLAN.md lists where it
 //! deliberately departs from it.
 //!
-//! Milestone M3: the endpoint "Microphone (hostmic)", whose capture stream the driver fills
-//! itself with a 1 kHz test tone; M4 hands the buffer and the clock to a user-mode host,
-//! through a host interface of its own.
+//! Milestone M4: the endpoint "Microphone (hostmic)", unplugged until a user-mode host attaches
+//! through a host interface of its own; the host writes the audio into a buffer shared with
+//! the audio engine and advances the stream position: the driver produces no audio and keeps no
+//! clock.
 //!
 //! - [`com`]: COM-style objects and interface references.
 //! - [`ks`]: Kernel Streaming descriptor and property helpers.
@@ -18,7 +19,7 @@
 //! - [`fast_io`]: the fast I/O table, kept away from the host interface.
 //! - [`topology`]: the topology miniport.
 //! - [`wave`]: the WaveRT miniport.
-//! - [`stream`]: the capture stream and its timer.
+//! - [`stream`]: the capture stream.
 
 #![cfg_attr(not(test), no_std)]
 

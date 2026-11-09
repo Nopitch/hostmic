@@ -67,6 +67,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "read_packet"
+path = "fuzz_targets/read_packet.rs"
+test = false
+doc = false
+bench = false
+
 # The lock-free protocol between the stream's state changes and ADVANCE.
 
 [[bin]]

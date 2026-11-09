@@ -20,6 +20,7 @@
 //! | [`IOCTL_GET_STREAM`] | none | [`StreamState`] | read |
 //! | [`IOCTL_ADVANCE`] | [`AdvanceRequest`] | [`AdvanceReply`] | read, write |
 //! | [`IOCTL_DETACH`] | none | none | read, write |
+//! | [`IOCTL_GET_STATS`] | none | [`Stats`] | read |
 
 #![no_std]
 
@@ -98,7 +99,14 @@ pub const IOCTL_GET_STREAM: u32 = ctl_code(
 );
 
 /// Tells the driver that the host wrote more frames: [`AdvanceRequest`] in, [`AdvanceReply`]
-/// out. Attached host only.
+/// out. Attached host only (its handle and process). A request computed for a stream state that
+/// has changed since (generation, position, not running) fails with `ERROR_NOT_READY`: the host
+/// reads [`IOCTL_GET_STREAM`] again. Any other refusal is a host bug or a lost attachment.
+///
+/// The host writes the frames of a request just before sending it, and keeps requests short
+/// (about a millisecond of audio): the driver takes the size of the last request as how far the
+/// host may be writing ahead of the position when it hands packets to the audio engine.
+/// Requests are serial: the next one starts from the position the last one returned.
 pub const IOCTL_ADVANCE: u32 = ctl_code(
     FILE_DEVICE_UNKNOWN,
     FUNCTION_BASE + 3,
@@ -114,6 +122,22 @@ pub const IOCTL_DETACH: u32 = ctl_code(
     METHOD_BUFFERED,
     FILE_READ_DATA | FILE_WRITE_DATA,
 );
+
+/// Reads the driver's counters: [`Stats`]. Any process allowed to open the interface may send
+/// it.
+pub const IOCTL_GET_STATS: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    FUNCTION_BASE + 5,
+    METHOD_BUFFERED,
+    FILE_READ_DATA,
+);
+
+/// The function number of a control code (bits 2 to 13), as [`Stats::last_request`] reports
+/// the request.
+#[must_use]
+pub const fn function(code: u32) -> u16 {
+    ((code >> 2) & 0xFFF) as u16
+}
 
 /// The encoding of one sample.
 #[repr(u16)]
@@ -531,6 +555,141 @@ impl AdvanceReply {
     }
 }
 
+/// Why the driver refused a request, as [`Stats::last_reason`] reports it.
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Reason {
+    /// No request refused yet.
+    None = 0,
+    /// The input is not exactly the request's size.
+    InputSize = 1,
+    /// The output buffer cannot hold the reply.
+    OutputSize = 2,
+    /// The host was built against another [`ABI_VERSION`].
+    Version = 3,
+    /// A reserved field is not 0.
+    Reserved = 4,
+    /// The event handle value is invalid.
+    Event = 5,
+    /// The host's format range is empty, inverted or names an unknown sample type.
+    InvalidRange = 6,
+    /// No format is both in the host's range and supported.
+    NoCommonFormat = 7,
+    /// `ADVANCE`: the stream is not running.
+    NotRunning = 8,
+    /// `ADVANCE`: computed for another stream generation.
+    Generation = 9,
+    /// `ADVANCE`: 0 frames, or more than the stream's buffer.
+    Frames = 10,
+    /// `ADVANCE`: the stream is not at the position the host expected.
+    Position = 11,
+    /// `ADVANCE`: the position would overflow.
+    Overflow = 12,
+    /// `ATTACH`: a 32-bit host.
+    Wow64 = 13,
+    /// The request must come from the attached host's handle and process.
+    NotHost = 14,
+    /// Refused by the driver's state or a kernel call: [`Stats::last_status`] says which.
+    Status = 15,
+}
+
+impl Reason {
+    /// Every reason, in code order.
+    pub const ALL: [Self; 16] = [
+        Self::None,
+        Self::InputSize,
+        Self::OutputSize,
+        Self::Version,
+        Self::Reserved,
+        Self::Event,
+        Self::InvalidRange,
+        Self::NoCommonFormat,
+        Self::NotRunning,
+        Self::Generation,
+        Self::Frames,
+        Self::Position,
+        Self::Overflow,
+        Self::Wow64,
+        Self::NotHost,
+        Self::Status,
+    ];
+
+    /// The reason of a wire code, or `None` for an unknown one.
+    #[must_use]
+    pub const fn from_code(code: u16) -> Option<Self> {
+        if (code as usize) < Self::ALL.len() {
+            Some(Self::ALL[code as usize])
+        } else {
+            None
+        }
+    }
+
+    /// The wire code.
+    #[must_use]
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+/// Output of [`IOCTL_GET_STATS`]: the counters of one host interface (one microphone), since
+/// its device started, never reset. Each counter is read on its own: they are consistent with
+/// one another only within a few requests. Any process allowed to open the interface reads
+/// them, as it reads the stream's state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Stats {
+    /// Frames the host advanced.
+    pub frames_advanced: u64,
+    /// Packets the host's advances completed (event-driven streams only); the audio engine's
+    /// event is signaled for them when it registered one.
+    pub packets_completed: u64,
+    /// Packets the audio engine never read: when it asked for the next packet, the host had
+    /// already overwritten it (it got more than a buffer ahead of the engine). Counted when the
+    /// engine reads again.
+    pub packets_skipped: u64,
+    /// Requests refused, of any kind and from any process allowed to open the interface.
+    pub requests_refused: u64,
+    /// The [`function`] of the last refused request's control code; 0 if none.
+    pub last_request: u16,
+    /// Why it was refused: a [`Reason`] code.
+    pub last_reason: u16,
+    /// The status it completed with (an `NTSTATUS`).
+    pub last_status: u32,
+}
+
+impl Stats {
+    /// Encoded size in bytes.
+    pub const SIZE: usize = 40;
+
+    /// The little-endian encoding.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0; Self::SIZE];
+        put_u64(&mut out, 0, self.frames_advanced);
+        put_u64(&mut out, 8, self.packets_completed);
+        put_u64(&mut out, 16, self.packets_skipped);
+        put_u64(&mut out, 24, self.requests_refused);
+        put(&mut out, 32, &self.last_request.to_le_bytes());
+        put(&mut out, 34, &self.last_reason.to_le_bytes());
+        put_u32(&mut out, 36, self.last_status);
+        out
+    }
+
+    /// Decodes [`to_bytes`](Self::to_bytes)' encoding.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
+        Self {
+            frames_advanced: get_u64(bytes, 0),
+            packets_completed: get_u64(bytes, 8),
+            packets_skipped: get_u64(bytes, 16),
+            requests_refused: get_u64(bytes, 24),
+            last_request: u16::from_le_bytes(get(bytes, 32)),
+            last_reason: u16::from_le_bytes(get(bytes, 34)),
+            last_status: get_u32(bytes, 36),
+        }
+    }
+}
+
 // Fixed-offset little-endian accessors. Every call site uses a constant offset that the
 // tests exercise, so the slicing below cannot go out of bounds.
 
@@ -582,6 +741,19 @@ mod tests {
         assert_eq!(IOCTL_GET_STREAM, 0x0022_6408);
         assert_eq!(IOCTL_ADVANCE, 0x0022_E40C);
         assert_eq!(IOCTL_DETACH, 0x0022_E410);
+        assert_eq!(IOCTL_GET_STATS, 0x0022_6414);
+        assert_eq!(function(IOCTL_GET_INFO), 0x900);
+        assert_eq!(function(IOCTL_GET_STATS), 0x905);
+    }
+
+    #[test]
+    fn reasons() {
+        for (code, reason) in Reason::ALL.into_iter().enumerate() {
+            assert_eq!(usize::from(reason.code()), code);
+            assert_eq!(Reason::from_code(reason.code()), Some(reason));
+        }
+        assert_eq!(Reason::from_code(16), None);
+        assert_eq!(Reason::from_code(u16::MAX), None);
     }
 
     #[test]
@@ -652,6 +824,14 @@ mod tests {
         assert_eq!(offset_of!(AdvanceRequest, from), 8);
 
         assert_eq!(size_of::<AdvanceReply>(), AdvanceReply::SIZE);
+
+        assert_eq!(size_of::<Stats>(), Stats::SIZE);
+        assert_eq!(offset_of!(Stats, packets_completed), 8);
+        assert_eq!(offset_of!(Stats, packets_skipped), 16);
+        assert_eq!(offset_of!(Stats, requests_refused), 24);
+        assert_eq!(offset_of!(Stats, last_request), 32);
+        assert_eq!(offset_of!(Stats, last_reason), 34);
+        assert_eq!(offset_of!(Stats, last_status), 36);
     }
 
     /// Distinct bytes in every field, so that a swapped or misplaced field shows.
@@ -728,5 +908,17 @@ mod tests {
 
         let advanced = AdvanceReply { position: 42 };
         assert_eq!(AdvanceReply::from_bytes(&advanced.to_bytes()), advanced);
+
+        let stats = Stats {
+            frames_advanced: 0x0102_0304_0506_0708,
+            packets_completed: 0x1112_1314_1516_1718,
+            packets_skipped: 0x2122_2324_2526_2728,
+            requests_refused: 0x3132_3334_3536_3738,
+            last_request: 0x4142,
+            last_reason: 0x4344,
+            last_status: 0xC000_000D,
+        };
+        assert_eq!(Stats::from_bytes(&stats.to_bytes()), stats);
+        assert_eq!(stats.to_bytes()[32..36], [0x42, 0x41, 0x44, 0x43]);
     }
 }

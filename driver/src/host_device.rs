@@ -24,8 +24,9 @@ use core::{
 };
 
 use hostmic_abi::{
-    AttachReply, GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_INFO,
-    IOCTL_GET_STREAM, Info, StreamState,
+    AdvanceReply, AttachReply, GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ADVANCE, IOCTL_ATTACH,
+    IOCTL_DETACH, IOCTL_GET_INFO, IOCTL_GET_STATS, IOCTL_GET_STREAM, Info, Reason, Stats,
+    StreamState, function,
 };
 use hostmic_driver_core::host::{self, MAX_BUFFER_BYTES, Rejection};
 use hostmic_sys::WdmlibIoCreateDeviceSecure;
@@ -42,9 +43,9 @@ use wdk_sys::{
     IRP_MN_REMOVE_DEVICE, IRP_MN_SET_POWER, IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE,
     IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS, PDEVICE_OBJECT, POOL_FLAG_PAGED, PVOID,
     STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_DELETE_PENDING, STATUS_DEVICE_BUSY,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE,
-    STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS,
-    STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
+    STATUS_DEVICE_NOT_READY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE,
+    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
     ntddk::{
         ExAllocatePool2, ExFreePool, IoDeleteDevice, IoGetCurrentProcess, IoGetRequestorProcess,
         IoIs32bitProcess, IoRegisterDeviceInterface, IoSetDeviceInterfaceState, IofCompleteRequest,
@@ -53,7 +54,7 @@ use wdk_sys::{
 };
 
 use crate::adapter::{current_stack_location, wide};
-use crate::host_link::{HostLink, LinkRef};
+use crate::host_link::{AdvanceError, HostLink, LinkRef};
 use crate::ks::size_ulong;
 
 /// The child's device type.
@@ -752,23 +753,48 @@ enum Refusal {
     Rejected(Rejection),
     /// Valid input, refused with this status, for this reason.
     Status(NTSTATUS, &'static str),
+    /// A request only the attached host may send, from another handle or process.
+    NotHost,
 }
 
-/// A reply of at most 32 bytes.
+impl Refusal {
+    /// The status the request completes with.
+    fn status(&self) -> NTSTATUS {
+        match self {
+            Self::Rejected(rejection) => rejection_status(*rejection),
+            Self::Status(status, _) => *status,
+            Self::NotHost => STATUS_INVALID_DEVICE_STATE,
+        }
+    }
+
+    /// The reason the counters report.
+    fn reason(&self) -> Reason {
+        match self {
+            Self::Rejected(rejection) => rejection.reason(),
+            Self::Status(..) => Reason::Status,
+            Self::NotHost => Reason::NotHost,
+        }
+    }
+}
+
+/// The largest reply: [`Stats`].
+const REPLY_MAX: usize = Stats::SIZE;
+
+/// A reply of at most [`REPLY_MAX`] bytes.
 struct Reply {
-    bytes: [u8; 32],
+    bytes: [u8; REPLY_MAX],
     len: usize,
 }
 
 impl Reply {
     const EMPTY: Self = Self {
-        bytes: [0; 32],
+        bytes: [0; REPLY_MAX],
         len: 0,
     };
 
     fn of<const N: usize>(encoded: [u8; N]) -> Self {
-        const { assert!(N <= 32) };
-        let mut bytes = [0; 32];
+        const { assert!(N <= REPLY_MAX) };
+        let mut bytes = [0; REPLY_MAX];
         bytes[..N].copy_from_slice(&encoded);
         Self { bytes, len: N }
     }
@@ -835,18 +861,42 @@ unsafe fn device_control(
                         if shared.detach(file) {
                             Ok(Reply::EMPTY)
                         } else {
-                            Err(Refusal::Status(
-                                STATUS_INVALID_DEVICE_STATE,
-                                "this handle is not the attached host",
-                            ))
+                            Err(Refusal::NotHost)
                         }
                     }),
             ),
+            IOCTL_ADVANCE => (
+                "ADVANCE",
+                host::output(output, AdvanceReply::SIZE)
+                    .map_err(Refusal::Rejected)
+                    .and_then(|()| {
+                        shared.advance(file, input).map_err(|error| match error {
+                            AdvanceError::NotHost => Refusal::NotHost,
+                            AdvanceError::Rejected(rejection) => Refusal::Rejected(rejection),
+                        })
+                    })
+                    .map(|position| Reply::of(AdvanceReply { position }.to_bytes())),
+            ),
+            IOCTL_GET_STATS => (
+                "GET_STATS",
+                host::no_input(input)
+                    .and_then(|()| host::output(output, Stats::SIZE))
+                    .map(|()| Reply::of(shared.stats().to_bytes()))
+                    .map_err(Refusal::Rejected),
+            ),
             code => {
-                println!(
-                    "hostmic: unknown control code {code:#010x}, process {}",
-                    current_process()
+                let count = shared.refused(
+                    function(code),
+                    Reason::Status,
+                    STATUS_INVALID_DEVICE_REQUEST,
                 );
+                // Rate-limited as `count_refusal` does.
+                if count <= 16 || count.is_power_of_two() {
+                    println!(
+                        "hostmic: unknown control code {code:#010x}, process {}",
+                        current_process()
+                    );
+                }
                 // SAFETY: the caller's contract.
                 return unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) };
             }
@@ -863,23 +913,46 @@ unsafe fn device_control(
             // SAFETY: the caller's contract.
             unsafe { complete(irp, STATUS_SUCCESS, reply.len as u64) }
         }
-        Err(Refusal::Rejected(rejection)) => {
-            println!(
-                "hostmic: {name} refused: {rejection:?}, process {}",
-                current_process()
-            );
-            // SAFETY: the caller's contract.
-            unsafe { complete(irp, rejection_status(rejection), 0) }
-        }
-        Err(Refusal::Status(status, reason)) => {
-            println!(
-                "hostmic: {name} refused: {reason} ({status:#010x}), process {}",
-                current_process()
-            );
+        Err(refusal) => {
+            let status = count_refusal(shared, parameters.IoControlCode, name, &refusal);
             // SAFETY: the caller's contract.
             unsafe { complete(irp, status, 0) }
         }
     }
+}
+
+/// Counts a refused request and logs why; returns the status it completes with.
+fn count_refusal(shared: &HostLink, code: u32, name: &str, refusal: &Refusal) -> NTSTATUS {
+    let status = refusal.status();
+    let count = shared.refused(function(code), refusal.reason(), status);
+    // `ADVANCE`s refused because a state change raced the host (stale generation or position,
+    // stream no longer running) are part of the protocol and may come by the hundred: counted,
+    // not logged. Other refusals are logged, a foreign process's included, but any process
+    // allowed to open the interface may send them in a loop: the first 16, then at every power
+    // of two; the counters keep the totals.
+    let race = code == IOCTL_ADVANCE
+        && matches!(
+            refusal.reason(),
+            Reason::Generation | Reason::Position | Reason::NotRunning
+        );
+    if race || (count > 16 && !count.is_power_of_two()) {
+        return status;
+    }
+    match refusal {
+        Refusal::Rejected(rejection) => println!(
+            "hostmic: {name} refused: {rejection:?}, process {}",
+            current_process()
+        ),
+        Refusal::Status(_, reason) => println!(
+            "hostmic: {name} refused: {reason} ({status:#010x}), process {}",
+            current_process()
+        ),
+        Refusal::NotHost => println!(
+            "hostmic: {name} refused: not the attached host's handle, process {}",
+            current_process()
+        ),
+    }
+    status
 }
 
 /// `IOCTL_ATTACH`: checks the request, references the host's event in its own process, and
@@ -955,6 +1028,10 @@ const USER_MODE: i8 = 1;
 fn rejection_status(rejection: Rejection) -> NTSTATUS {
     match rejection {
         Rejection::OutputSize { .. } => STATUS_BUFFER_TOO_SMALL,
+        // A state change raced the host: it reads the stream again (`ERROR_NOT_READY`).
+        Rejection::Generation { .. } | Rejection::Position { .. } | Rejection::NotRunning => {
+            STATUS_DEVICE_NOT_READY
+        }
         _ => STATUS_INVALID_PARAMETER,
     }
 }
