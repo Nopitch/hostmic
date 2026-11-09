@@ -8,8 +8,11 @@
 //! driver signals a change, for `N` seconds (default 30), and detaches. With `--no-detach` it
 //! exits without detaching, to check that closing the handle detaches the host.
 //!
-//! It plays no audio yet: the shared buffer and the host-advanced position come with later
-//! pull requests (PLAN.md, M4). Exit status: 0 on success, 1 on failure, 2 on a usage error.
+//! The driver maps its shared buffer into the host on attach. While the stream runs, the host
+//! prints once a second the peak of what the stream's part of the buffer holds: until the host
+//! advances the position (a later pull request, PLAN.md, M4), the driver writes its test tone
+//! there, so the peak shows that the host sees the audio engine's pages. Exit status: 0 on
+//! success, 1 on failure, 2 on a usage error.
 
 use std::{
     env,
@@ -121,18 +124,40 @@ fn run(options: &Options) -> Result<(), String> {
         reply.buffer, reply.buffer_bytes
     );
 
+    if reply.buffer == 0 || !reply.buffer.is_multiple_of(4096) {
+        return Err(format!(
+            "ATTACH: unusable buffer address {:#x}",
+            reply.buffer
+        ));
+    }
+
     let end = Instant::now() + Duration::from_secs(options.seconds);
+    let mut stream = StreamState::default();
+    let mut next_peak = Instant::now();
     while Instant::now() < end {
         // SAFETY: an event handle this process owns.
         let wait = unsafe { WaitForSingleObject(event.0, 250) };
-        if wait != WAIT_OBJECT_0 {
-            continue;
+        if wait == WAIT_OBJECT_0 {
+            let mut state = [0u8; StreamState::SIZE];
+            device
+                .control(IOCTL_GET_STREAM, &[], &mut state)
+                .map_err(|e| format!("GET_STREAM: {e}"))?;
+            stream = StreamState::from_bytes(&state);
+            print_state(&stream);
         }
-        let mut state = [0u8; StreamState::SIZE];
-        device
-            .control(IOCTL_GET_STREAM, &[], &mut state)
-            .map_err(|e| format!("GET_STREAM: {e}"))?;
-        print_state(&StreamState::from_bytes(&state));
+        if State::from_code(stream.state) == Some(State::Running) && Instant::now() >= next_peak {
+            next_peak = Instant::now() + Duration::from_secs(1);
+            // SAFETY: the driver mapped `buffer_bytes` bytes at `buffer` into this process
+            // until DETACH, which comes after the loop.
+            match unsafe { peak(&reply, &stream) } {
+                Some(peak) => println!(
+                    "buffer     peak {} over {} frames",
+                    dbfs(peak),
+                    stream.buffer_frames
+                ),
+                None => println!("buffer     the stream's buffer does not fit the mapping"),
+            }
+        }
     }
 
     if options.detach {
@@ -144,6 +169,43 @@ fn run(options: &Options) -> Result<(), String> {
         println!("exiting without DETACH: closing the handle detaches");
     }
     Ok(())
+}
+
+/// The largest absolute 16-bit sample in the stream's part of the shared buffer, or `None` when
+/// the stream's format is not 16-bit or its buffer exceeds the mapping.
+///
+/// # Safety
+///
+/// `reply` describes a live mapping of the shared buffer in this process.
+unsafe fn peak(reply: &AttachReply, stream: &StreamState) -> Option<u16> {
+    if SampleType::from_code(stream.format.sample_type) != Some(SampleType::Int16) {
+        return None;
+    }
+    let samples = usize::try_from(stream.buffer_frames)
+        .ok()?
+        .checked_mul(usize::from(stream.format.channels))?;
+    if samples.checked_mul(2)? > reply.buffer_bytes as usize {
+        return None;
+    }
+    let base = usize::try_from(reply.buffer).ok()? as *const i16;
+    let mut peak = 0u16;
+    for index in 0..samples {
+        // Within the mapping (checked above), 2-byte aligned (page-aligned base).
+        let sample = base.wrapping_add(index);
+        // SAFETY: as above. The driver writes the same pages concurrently: a volatile read of
+        // each sample, which may be old or new, never torn (an aligned 16-bit read).
+        let sample = unsafe { sample.read_volatile() };
+        peak = peak.max(sample.unsigned_abs());
+    }
+    Some(peak)
+}
+
+/// A 16-bit peak in dBFS, two decimals.
+fn dbfs(peak: u16) -> String {
+    if peak == 0 {
+        return "-inf dBFS (silence)".to_owned();
+    }
+    format!("{:.2} dBFS", 20.0 * (f64::from(peak) / 32768.0).log10())
 }
 
 /// One line per state, with units.

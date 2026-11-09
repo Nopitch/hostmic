@@ -27,7 +27,7 @@ use hostmic_abi::{
     AttachReply, GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_INFO,
     IOCTL_GET_STREAM, Info, StreamState,
 };
-use hostmic_driver_core::host::{self, Rejection};
+use hostmic_driver_core::host::{self, MAX_BUFFER_BYTES, Rejection};
 use hostmic_sys::WdmlibIoCreateDeviceSecure;
 use wdk::println;
 use wdk_sys::{
@@ -48,8 +48,7 @@ use wdk_sys::{
     ntddk::{
         ExAllocatePool2, ExFreePool, IoDeleteDevice, IoGetCurrentProcess, IoGetRequestorProcess,
         IoIs32bitProcess, IoRegisterDeviceInterface, IoSetDeviceInterfaceState, IofCompleteRequest,
-        ObReferenceObjectByHandle, ObfDereferenceObject, ObfReferenceObject, PsGetCurrentProcessId,
-        RtlFreeUnicodeString,
+        ObReferenceObjectByHandle, ObfReferenceObject, PsGetCurrentProcessId, RtlFreeUnicodeString,
     },
 };
 
@@ -935,16 +934,14 @@ unsafe fn attach(
     if !NT_SUCCESS(status) {
         return Err(Refusal::Status(status, "event handle"));
     }
-    shared.attach(file, object.cast()).map_err(|event| {
-        // SAFETY: the reference taken above, which the link did not keep.
-        unsafe { ObfDereferenceObject(event.cast()) };
-        Refusal::Status(STATUS_DEVICE_BUSY, "another host is attached")
-    })?;
-    // No buffer yet: the shared buffer and its mapping come with a later pull request.
+    // SAFETY: PASSIVE_LEVEL, in the requesting process (checked above), which becomes the host.
+    // The event's reference passes to the link, which releases it on failure.
+    let address = unsafe { shared.attach(file, object.cast()) }
+        .map_err(|error| Refusal::Status(error.status, error.reason))?;
     Ok(Reply::of(
         AttachReply {
-            buffer: 0,
-            buffer_bytes: 0,
+            buffer: address.as_ptr() as u64,
+            buffer_bytes: MAX_BUFFER_BYTES,
             reserved: 0,
         }
         .to_bytes(),

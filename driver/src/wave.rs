@@ -272,8 +272,8 @@ unsafe extern "C" fn new_stream(
     }
     // SAFETY: called through the miniport's vtable, at offset 0.
     let link = unsafe { com::object::<WaveMiniport, 0>(this) }.link;
-    // SAFETY: `port_stream` is the port's stream for this new stream, valid for its life.
-    let Some(stream) = (unsafe { stream::new(port_stream, link) }) else {
+    // The port's stream is not needed: the stream's buffer is the adapter's shared buffer.
+    let Some(stream) = stream::new(link) else {
         return STATUS_INSUFFICIENT_RESOURCES;
     };
     // The stream's reference passes to PortCls.

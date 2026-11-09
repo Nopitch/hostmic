@@ -14,6 +14,7 @@
 //! - [`adapter`]: the PnP device and its subdevices.
 //! - [`host_device`]: the host interface's device object, a child of the adapter.
 //! - [`host_link`]: what the stream and the host interface share.
+//! - [`shared_buffer`]: the buffer the host writes and the audio engine reads.
 //! - [`fast_io`]: the fast I/O table, kept away from the host interface.
 //! - [`topology`]: the topology miniport.
 //! - [`wave`]: the WaveRT miniport.
@@ -31,6 +32,7 @@ pub mod fast_io;
 pub mod host_device;
 pub mod host_link;
 pub mod ks;
+pub mod shared_buffer;
 pub mod stream;
 pub mod topology;
 pub mod wave;
@@ -97,6 +99,8 @@ pub unsafe extern "system" fn driver_entry(
         PORTCLS_UNLOAD.store(unload as *mut c_void, Ordering::Release);
     }
     driver.DriverUnload = Some(driver_unload);
+    // Last: nothing after it can fail, so the unload routine always removes it.
+    host_link::driver_init();
     status
 }
 
@@ -149,6 +153,7 @@ unsafe extern "C" fn dispatch(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTST
 /// The driver's unload routine: logs, then runs PortCls's.
 unsafe extern "C" fn driver_unload(driver: *mut DRIVER_OBJECT) {
     println!("hostmic: driver unloaded");
+    host_link::driver_exit();
     let unload = PORTCLS_UNLOAD.load(Ordering::Acquire);
     if !unload.is_null() {
         // SAFETY: `unload` was stored from a `DRIVER_UNLOAD` function pointer in

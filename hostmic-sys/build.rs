@@ -9,6 +9,9 @@
 //!   are read from the headers through MSVC's preprocessor.
 //! - `layout.c` (compiled with MSVC into a static library) and `layout_tests.rs`: the test
 //!   suite compares Rust sizes, alignments and field offsets with what MSVC computes.
+//!
+//! It also compiles `c/map_user.c`, the driver's one C routine (a structured exception handler,
+//! which Rust cannot write), into the static library `hostmic_sys_c`.
 
 use std::{
     env,
@@ -514,6 +517,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         generate_bindings(&config, &base, &out_dir)?;
         generate_guids(&config, &base, &out_dir)?;
         generate_layout_checks(&config, &base, &out_dir)?;
+        compile_c(&config, &out_dir)?;
         Ok::<(), Box<dyn Error>>(())
     })
 }
@@ -555,6 +559,22 @@ fn msvc_build(config: &Config) -> Result<cc::Build, Box<dyn Error>> {
         build.define(&key, value.as_deref());
     }
     Ok(build)
+}
+
+/// Compiles the driver's C code for kernel mode: `/kernel` (kernel code generation, no C++
+/// exceptions or RTTI), `/GS-` (no security cookie, which would need the kernel's own cookie
+/// library) and `/Zl` (no C runtime library named in the object).
+fn compile_c(config: &Config, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let source = Path::new("c").join("map_user.c");
+    println!("cargo:rerun-if-changed={}", source.display());
+    msvc_build(config)?
+        .flag("/kernel")
+        .flag("/GS-")
+        .flag("/Zl")
+        .file(&source)
+        .try_compile("hostmic_sys_c")?;
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    Ok(())
 }
 
 fn generate_guids(config: &Config, base: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
