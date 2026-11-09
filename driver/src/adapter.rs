@@ -92,6 +92,7 @@ pub(crate) unsafe fn link(device: PDEVICE_OBJECT) -> LinkRef {
     let extension = unsafe { (*device).DeviceExtension };
     // The extension holds a `HostLink` at `LINK_OFFSET`, zeroed by `IoCreateDevice` (its
     // initial state) and only ever accessed through shared references.
+    // Never null: `PcAddAdapterDevice` allocated the extension (`DEVICE_EXTENSION_SIZE` bytes).
     let link = NonNull::new(extension.wrapping_byte_add(LINK_OFFSET).cast::<HostLink>())
         .unwrap_or(NonNull::dangling());
     // SAFETY: the adapter's link, in the extension, which outlives the stream and the host

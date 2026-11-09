@@ -20,7 +20,7 @@ use core::{
     mem::{offset_of, size_of},
     ptr::{self, NonNull},
     slice,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
 
 use hostmic_abi::{
@@ -41,14 +41,15 @@ use wdk_sys::{
     IRP_MN_QUERY_ID, IRP_MN_QUERY_POWER, IRP_MN_QUERY_REMOVE_DEVICE, IRP_MN_QUERY_STOP_DEVICE,
     IRP_MN_REMOVE_DEVICE, IRP_MN_SET_POWER, IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE,
     IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS, PDEVICE_OBJECT, POOL_FLAG_PAGED, PVOID,
-    STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_DEVICE_BUSY,
+    STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_DELETE_PENDING, STATUS_DEVICE_BUSY,
     STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE,
     STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS,
     STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
     ntddk::{
-        ExAllocatePool2, ExFreePool, IoDeleteDevice, IoIs32bitProcess, IoRegisterDeviceInterface,
-        IoSetDeviceInterfaceState, IofCompleteRequest, ObReferenceObjectByHandle,
-        ObfDereferenceObject, ObfReferenceObject, PsGetCurrentProcessId, RtlFreeUnicodeString,
+        ExAllocatePool2, ExFreePool, IoDeleteDevice, IoGetCurrentProcess, IoGetRequestorProcess,
+        IoIs32bitProcess, IoRegisterDeviceInterface, IoSetDeviceInterfaceState, IofCompleteRequest,
+        ObReferenceObjectByHandle, ObfDereferenceObject, ObfReferenceObject, PsGetCurrentProcessId,
+        RtlFreeUnicodeString,
     },
 };
 
@@ -109,6 +110,12 @@ pub struct HostDevice {
     started: AtomicBool,
     /// Whether the PnP manager removed this child (`IRP_MN_REMOVE_DEVICE`) since its last start.
     removed: AtomicBool,
+    /// Handles open on the child, from a successful create to its close. While any is open,
+    /// the child refuses removal: requests on those handles use the adapter's host link,
+    /// which lives in the adapter's device extension.
+    open_files: AtomicU32,
+    /// Between an accepted `IRP_MN_QUERY_REMOVE_DEVICE` and its cancellation: no new opens.
+    remove_pending: AtomicBool,
     /// The interface's symbolic link name, registered on the first start. Only PnP requests
     /// for this child and [`delete`] (once nothing else can reach it) touch it, and the PnP
     /// manager serializes them.
@@ -177,6 +184,8 @@ pub unsafe fn create(
                 enumerated: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 removed: AtomicBool::new(false),
+                open_files: AtomicU32::new(0),
+                remove_pending: AtomicBool::new(false),
                 link: UnsafeCell::new(UNICODE_STRING {
                     Length: 0,
                     MaximumLength: 0,
@@ -383,10 +392,12 @@ pub unsafe fn dispatch(device: PDEVICE_OBJECT, irp: *mut IRP) -> NTSTATUS {
             // At cleanup (last handle closed) normally; at close too, for an `ATTACH` that
             // was still in flight when the handle was closed.
             // SAFETY: the caller's contract.
-            unsafe { this(device) }
-                .shared
-                .get()
-                .detach(stack.FileObject);
+            let this = unsafe { this(device) };
+            this.shared.get().detach(stack.FileObject);
+            if u32::from(stack.MajorFunction) == IRP_MJ_CLOSE {
+                // The last request on this handle: it no longer holds the device back.
+                this.open_files.fetch_sub(1, Ordering::SeqCst);
+            }
             // SAFETY: a request owned by this driver.
             unsafe { complete(irp, STATUS_SUCCESS, 0) }
         }
@@ -459,10 +470,29 @@ unsafe fn pnp(device: PDEVICE_OBJECT, irp: *mut IRP, stack: &IO_STACK_LOCATION) 
     let status = match u32::from(stack.MinorFunction) {
         // SAFETY: a start request for `device`.
         IRP_MN_START_DEVICE => unsafe { start(device) },
-        IRP_MN_QUERY_STOP_DEVICE
-        | IRP_MN_CANCEL_STOP_DEVICE
-        | IRP_MN_QUERY_REMOVE_DEVICE
-        | IRP_MN_CANCEL_REMOVE_DEVICE => STATUS_SUCCESS,
+        IRP_MN_QUERY_STOP_DEVICE | IRP_MN_CANCEL_STOP_DEVICE => STATUS_SUCCESS,
+        IRP_MN_QUERY_REMOVE_DEVICE => {
+            // SAFETY: a live device of this module.
+            let this = unsafe { this(device) };
+            // Pending first, then count: a create counts first, then checks (`create_file`),
+            // so one of the two sees the other.
+            this.remove_pending.store(true, Ordering::SeqCst);
+            let open = this.open_files.load(Ordering::SeqCst);
+            if open == 0 {
+                STATUS_SUCCESS
+            } else {
+                this.remove_pending.store(false, Ordering::SeqCst);
+                println!("hostmic: host interface removal refused: {open} handle(s) open");
+                STATUS_DEVICE_BUSY
+            }
+        }
+        IRP_MN_CANCEL_REMOVE_DEVICE => {
+            // SAFETY: a live device of this module.
+            unsafe { this(device) }
+                .remove_pending
+                .store(false, Ordering::SeqCst);
+            STATUS_SUCCESS
+        }
         IRP_MN_STOP_DEVICE => {
             // SAFETY: a live device of this module.
             unsafe { this(device) }
@@ -707,6 +737,13 @@ fn create_file(this: &HostDevice, stack: &IO_STACK_LOCATION) -> NTSTATUS {
     if file.FileName.Length != 0 {
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    // Count first, then check for a pending removal (`IRP_MN_QUERY_REMOVE_DEVICE` does the
+    // reverse): either the removal sees this handle, or this open sees the removal.
+    this.open_files.fetch_add(1, Ordering::SeqCst);
+    if this.remove_pending.load(Ordering::SeqCst) {
+        this.open_files.fetch_sub(1, Ordering::SeqCst);
+        return STATUS_DELETE_PENDING;
+    }
     STATUS_SUCCESS
 }
 
@@ -731,6 +768,7 @@ impl Reply {
     };
 
     fn of<const N: usize>(encoded: [u8; N]) -> Self {
+        const { assert!(N <= 32) };
         let mut bytes = [0; 32];
         bytes[..N].copy_from_slice(&encoded);
         Self { bytes, len: N }
@@ -858,6 +896,20 @@ unsafe fn attach(
     output: usize,
     shared: &HostLink,
 ) -> Result<Reply, Refusal> {
+    // The event handle is looked up in the current process: it must be the requestor, in
+    // user mode (a filter above the interface could otherwise make it another process).
+    // SAFETY: a request being processed.
+    let requestor_mode = unsafe { (*irp).RequestorMode };
+    // SAFETY: as above.
+    let requestor = unsafe { IoGetRequestorProcess(irp) };
+    // SAFETY: any IRQL.
+    let current = unsafe { IoGetCurrentProcess() };
+    if requestor_mode != USER_MODE || requestor != current {
+        return Err(Refusal::Status(
+            STATUS_ACCESS_DENIED,
+            "not called from user mode in the requesting process",
+        ));
+    }
     // SAFETY: a request being processed.
     let wow64 = unsafe { IoIs32bitProcess(irp) } != 0;
     let request = host::attach(input, wow64).map_err(Refusal::Rejected)?;

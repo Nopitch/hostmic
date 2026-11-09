@@ -11,9 +11,10 @@
 //! here are the stream's state changes and buffer allocations (`PASSIVE_LEVEL`, serialized by
 //! PortCls); `ADVANCE` will join them with its compare-and-exchange.
 //!
-//! The link lives in the adapter's device extension, which outlives the stream (PortCls closes
-//! streams before the device is removed) and the host interface's device (deleted at the latest
-//! during the adapter's removal).
+//! The link lives in the adapter's device extension, whose memory outlives its holders: an
+//! open pin keeps the adapter's device object alive until the stream is released; the host
+//! interface's device refuses removal while a handle to it is open, so the PnP manager cannot
+//! remove (and PortCls delete) the adapter before every request to the interface is over.
 
 use core::{
     cell::UnsafeCell,
@@ -34,6 +35,8 @@ use wdk_sys::{
 
 /// `HostLink::host` while a detachment is in progress: no file object has this address.
 const DETACHING: *mut FILE_OBJECT = core::ptr::dangling_mut();
+/// `HostLink::host` while an attachment is in progress, likewise.
+const ATTACHING: *mut FILE_OBJECT = DETACHING.wrapping_add(1);
 
 /// Shared between the capture stream and the host interface. All zeroes is its initial state
 /// (as in a fresh device extension) until [`HostLink::init`].
@@ -131,18 +134,30 @@ impl HostLink {
         self.notify();
     }
 
-    /// What `GET_STREAM` replies. The fields are read one by one: a reply taken during a change
-    /// may mix old and new values, and the host reads again on the event that change signals.
+    /// What `GET_STREAM` replies. The fields are read one by one, then the cursor again: a
+    /// reply is retried while the generation moved meanwhile, so the buffer geometry belongs to
+    /// the generation reported. Within one generation the state may still lag by one step (a
+    /// stream about to run reports `Running` under the last odd generation); the host reads
+    /// again on the event every change signals.
     pub fn snapshot(&self) -> StreamState {
-        let cursor = Cursor::unpack(self.cursor.load(Ordering::Acquire));
-        StreamState {
-            generation: u32::from(cursor.generation),
-            state: self.state.load(Ordering::Acquire),
-            format: Format::from_bytes(&self.format.load(Ordering::Acquire).to_le_bytes()),
-            buffer_frames: self.buffer_frames.load(Ordering::Acquire),
-            frames_per_packet: self.frames_per_packet.load(Ordering::Acquire),
-            position: cursor.position,
+        let mut state = StreamState::default();
+        for _ in 0..4 {
+            let before = self.cursor.load(Ordering::Acquire);
+            let cursor = Cursor::unpack(before);
+            state = StreamState {
+                generation: u32::from(cursor.generation),
+                state: self.state.load(Ordering::Acquire),
+                format: Format::from_bytes(&self.format.load(Ordering::Acquire).to_le_bytes()),
+                buffer_frames: self.buffer_frames.load(Ordering::Acquire),
+                frames_per_packet: self.frames_per_packet.load(Ordering::Acquire),
+                position: cursor.position,
+            };
+            let after = Cursor::unpack(self.cursor.load(Ordering::Acquire));
+            if after.generation == cursor.generation {
+                break;
+            }
         }
+        state
     }
 
     /// Signals the attached host's event, if any. Any IRQL up to `DISPATCH_LEVEL`; never waits.
@@ -168,19 +183,24 @@ impl HostLink {
     ///
     /// `event`, given back, when another host is attached; the caller dereferences it.
     pub fn attach(&self, file: *mut FILE_OBJECT, event: *mut KEVENT) -> Result<(), *mut KEVENT> {
-        if self
-            .host
-            .compare_exchange(
-                core::ptr::null_mut(),
-                file,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
+        // Claim the slot, store the event, then publish the file object: a `DETACH` or a
+        // cleanup racing on the same handle cannot see `file` before the event is in place
+        // (it fails, and the handle's close detaches it once this request is over).
+        if file.is_null()
+            || self
+                .host
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    ATTACHING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
         {
             return Err(event);
         }
         self.event.store(event, Ordering::Release);
+        self.host.store(file, Ordering::Release);
         println!("hostmic: host attached");
         // The host reads the stream's state as it is now.
         self.notify();
