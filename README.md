@@ -1,5 +1,8 @@
 # hostmic
 
+[![driver](https://github.com/Nopitch/hostmic/actions/workflows/driver.yml/badge.svg?branch=main)](https://github.com/Nopitch/hostmic/actions/workflows/driver.yml)
+[![fuzz](https://github.com/Nopitch/hostmic/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/Nopitch/hostmic/actions/workflows/fuzz.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Nopitch/hostmic/badge)](https://scorecard.dev/viewer/?uri=github.com/Nopitch/hostmic)
 [![OpenSSF Baseline](https://www.bestpractices.dev/projects/16465/baseline)](https://www.bestpractices.dev/projects/16465)
 
 An open-source Windows **virtual microphone driver fed by a user-mode host**, written in Rust.
