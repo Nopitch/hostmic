@@ -26,6 +26,8 @@
 use std::{
     env,
     process::ExitCode,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -41,8 +43,8 @@ use windows::{
             CM_Get_Device_Interface_ListW, CR_SUCCESS,
         },
         Foundation::{
-            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
-            SetHandleInformation, WAIT_OBJECT_0,
+            CloseHandle, ERROR_INVALID_PARAMETER, GENERIC_READ, GENERIC_WRITE, HANDLE,
+            HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
         },
         Media::{timeBeginPeriod, timeEndPeriod},
         Storage::FileSystem::{
@@ -310,6 +312,16 @@ unsafe fn write_tone(
     }
 }
 
+/// Performance counter ticks in milliseconds.
+fn ms(ticks: i64, frequency: i64) -> f64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a duration for display, far below 2^52 ticks"
+    )]
+    let ms = ticks as f64 * 1_000.0 / frequency.max(1) as f64;
+    ms
+}
+
 /// The performance counter.
 fn qpc() -> i64 {
     let mut now = 0;
@@ -318,10 +330,32 @@ fn qpc() -> i64 {
     now
 }
 
-/// Plays the test tone into the stream for `seconds` seconds, as a host does: while the stream
-/// runs, writes the frames due by the performance counter into the shared buffer and advances
-/// the position, about once a millisecond, in a thread registered with MMCSS ("Pro Audio").
-/// Prints each stream change, and once a second how far it got.
+/// What the player thread tells the main thread, which prints it: the player itself never
+/// writes to the console or a file, which can block for tens of milliseconds.
+enum Note {
+    /// The stream changed.
+    Stream(StreamState),
+    /// More than a buffer of frames was due at `position`: the host was not scheduled for
+    /// `gap_ms` milliseconds.
+    Late {
+        position: u64,
+        frames: u64,
+        gap_ms: f64,
+    },
+    /// Once a second while playing.
+    Progress {
+        position: u64,
+        advanced: u64,
+        refused: u64,
+        late: u64,
+        longest_gap_ms: f64,
+    },
+}
+
+/// Plays the test tone into the stream for `seconds` seconds, as a host does: a player thread
+/// registered with MMCSS ("Pro Audio") writes, while the stream runs, the frames due by the
+/// performance counter into the shared buffer and advances the position about once a
+/// millisecond; this thread prints what it reports.
 ///
 /// # Safety
 ///
@@ -332,111 +366,232 @@ unsafe fn play(
     reply: &AttachReply,
     seconds: u64,
 ) -> Result<(), String> {
-    let mut task = 0u32;
-    // SAFETY: a static task name and a writable task index.
-    match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task) } {
-        Ok(_) => println!("thread     MMCSS Pro Audio"),
-        Err(error) => println!("thread     no MMCSS: {error}"),
-    }
-    // SAFETY: no precondition; undone below.
-    unsafe { timeBeginPeriod(1) };
     let mut frequency = 0;
     // SAFETY: a writable frequency.
     unsafe { QueryPerformanceFrequency(&raw mut frequency) }
         .map_err(|e| format!("QueryPerformanceFrequency: {e}"))?;
-    let tone = tone_period();
-    let base = usize::try_from(reply.buffer).map_err(|_| "buffer address")? as *mut u32;
+    let base = Mapping(usize::try_from(reply.buffer).map_err(|_| "buffer address")? as *mut u32);
+    let buffer_bytes = u64::from(reply.buffer_bytes);
+    let (notes, received) = mpsc::channel();
+    thread::scope(|scope| {
+        let player = scope.spawn(move || {
+            let mut player = Player {
+                device,
+                base,
+                buffer_bytes,
+                frequency,
+                notes,
+                tone: tone_period(),
+            };
+            player.run(event, Duration::from_secs(seconds))
+        });
+        for note in received {
+            print_note(&note);
+        }
+        player
+            .join()
+            .map_err(|_| "the player thread panicked".to_owned())?
+    })
+}
 
-    let end = Instant::now() + Duration::from_secs(seconds);
-    let mut next_report = Instant::now();
-    let mut stream = StreamState::default();
-    // Performance counter and position at which the current run's clock starts.
-    let mut anchor: Option<(i64, u64)> = None;
-    let mut position = 0u64;
-    let (mut advanced, mut refused, mut late) = (0u64, 0u64, 0u64);
-    let mut refresh = false;
-    while Instant::now() < end {
-        // SAFETY: an event handle this process owns.
-        let wait = unsafe { WaitForSingleObject(event.0, 1) };
-        if wait == WAIT_OBJECT_0 || refresh {
-            refresh = false;
-            let mut state = [0u8; StreamState::SIZE];
-            device
-                .control(IOCTL_GET_STREAM, &[], &mut state)
-                .map_err(|e| format!("GET_STREAM: {e}"))?;
-            let previous = stream;
-            stream = StreamState::from_bytes(&state);
-            if stream != previous {
-                print_state(&stream);
+fn print_note(note: &Note) {
+    match note {
+        Note::Stream(stream) => print_state(stream),
+        Note::Late {
+            position,
+            frames,
+            gap_ms,
+        } => println!(
+            "late       at position {position}: {frames} frames due, {gap_ms:.1} ms since the previous write"
+        ),
+        Note::Progress {
+            position,
+            advanced,
+            refused,
+            late,
+            longest_gap_ms,
+        } => println!(
+            "playing    position {position}  {advanced} frames advanced  {refused} refused  {late} late  longest gap {longest_gap_ms:.1} ms"
+        ),
+    }
+}
+
+/// The shared buffer's address in this process.
+#[derive(Clone, Copy)]
+struct Mapping(*mut u32);
+
+// SAFETY: an address in this process's space, valid for every thread; `play`'s contract keeps
+// the mapping alive while the player uses it.
+unsafe impl Send for Mapping {}
+
+/// The player thread's state.
+struct Player<'a> {
+    device: &'a Handle,
+    base: Mapping,
+    buffer_bytes: u64,
+    frequency: i64,
+    notes: mpsc::Sender<Note>,
+    tone: [i16; 48],
+}
+
+impl Player<'_> {
+    /// The player loop, for `duration`.
+    fn run(&mut self, event: &Handle, duration: Duration) -> Result<(), String> {
+        let mut task = 0u32;
+        // SAFETY: a static task name and a writable task index. Failure only loses priority.
+        let _ = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task) };
+        // SAFETY: no precondition; undone below.
+        unsafe { timeBeginPeriod(1) };
+        let result = self.play_for(event, duration);
+        // SAFETY: matches `timeBeginPeriod` above.
+        unsafe { timeEndPeriod(1) };
+        result
+    }
+
+    fn play_for(&mut self, event: &Handle, duration: Duration) -> Result<(), String> {
+        let end = Instant::now() + duration;
+        let mut next_report = Instant::now();
+        let mut stream = StreamState::default();
+        // Performance counter and position at which the current run's clock starts.
+        let mut anchor: Option<(i64, u64)> = None;
+        let mut position = 0u64;
+        let (mut advanced, mut refused, mut late) = (0u64, 0u64, 0u64);
+        // The performance counter at the last write, and the longest time between two writes.
+        let mut last_write: Option<i64> = None;
+        let mut longest_gap = 0i64;
+        let mut refresh = false;
+        while Instant::now() < end {
+            // SAFETY: an event handle this process owns.
+            let wait = unsafe { WaitForSingleObject(event.0, 1) };
+            if wait == WAIT_OBJECT_0 || refresh {
+                refresh = false;
+                let previous = stream;
+                stream = self.stream()?;
+                if stream != previous {
+                    let _ = self.notes.send(Note::Stream(stream));
+                }
+                // Running for the host: the running state under an even (accepting) generation,
+                // with a buffer. The driver may report `running` one step early, under the
+                // last odd generation.
+                let running = State::from_code(stream.state) == Some(State::Running)
+                    && stream.generation % 2 == 0
+                    && stream.buffer_frames != 0;
+                if !running {
+                    anchor = None;
+                    last_write = None;
+                } else if anchor.is_none() || stream.generation != previous.generation {
+                    anchor = Some((qpc(), stream.position));
+                    position = stream.position;
+                    last_write = None;
+                }
             }
-            let running = State::from_code(stream.state) == Some(State::Running);
-            if !running {
+            let Some((start, from)) = anchor else {
+                continue;
+            };
+            let frames_in_buffer = u64::from(stream.buffer_frames);
+            if frames_in_buffer == 0 {
                 anchor = None;
-            } else if anchor.is_none() || stream.generation != previous.generation {
-                anchor = Some((qpc(), stream.position));
-                position = stream.position;
+                continue;
+            }
+            if frames_in_buffer * 4 > self.buffer_bytes {
+                return Err(format!(
+                    "a buffer of {frames_in_buffer} frames does not fit the mapping"
+                ));
+            }
+            let now = qpc();
+            let due = from + self.frames_in(now - start);
+            if due <= position {
+                continue;
+            }
+            let mut frames = due - position;
+            let gap = now - last_write.unwrap_or(now);
+            last_write = Some(now);
+            longest_gap = longest_gap.max(gap);
+            if frames > frames_in_buffer {
+                // More than a buffer late: the engine lost those frames anyway; write one
+                // buffer and restart the clock from there.
+                late += 1;
+                let _ = self.notes.send(Note::Late {
+                    position,
+                    frames,
+                    gap_ms: ms(gap, self.frequency),
+                });
+                frames = frames_in_buffer;
+                anchor = Some((now, position + frames));
+            }
+            // SAFETY: the stream's frames fit the mapping (checked above).
+            unsafe {
+                write_tone(
+                    self.base.0,
+                    &self.tone,
+                    position..position + frames,
+                    frames_in_buffer,
+                );
+            };
+            if let Some(next) = self.advance(stream.generation, frames, position)? {
+                position = next;
+                advanced += frames;
+            } else {
+                // The stream changed meanwhile: read its state again.
+                refused += 1;
+                anchor = None;
+                refresh = true;
+            }
+            if Instant::now() >= next_report {
+                next_report = Instant::now() + Duration::from_secs(1);
+                let _ = self.notes.send(Note::Progress {
+                    position,
+                    advanced,
+                    refused,
+                    late,
+                    longest_gap_ms: ms(longest_gap, self.frequency),
+                });
             }
         }
-        let Some((start, from)) = anchor else {
-            continue;
-        };
-        let frames_in_buffer = u64::from(stream.buffer_frames);
-        if frames_in_buffer == 0 || frames_in_buffer * 4 > u64::from(reply.buffer_bytes) {
-            return Err(format!(
-                "a buffer of {frames_in_buffer} frames does not fit the mapping"
-            ));
-        }
-        let elapsed = u64::try_from(qpc() - start).unwrap_or(0);
-        let due = from
-            + u64::try_from(
-                u128::from(elapsed) * u128::from(RATE) / u128::from(frequency.unsigned_abs()),
-            )
-            .unwrap_or(u64::MAX);
-        if due <= position {
-            continue;
-        }
-        let mut frames = due - position;
-        if frames > frames_in_buffer {
-            // More than a buffer late (the host was not scheduled): the engine lost those
-            // frames anyway; write one buffer and restart the clock from there.
-            late += 1;
-            frames = frames_in_buffer;
-            anchor = Some((qpc(), position + frames));
-        }
-        // SAFETY: the stream's frames fit the mapping (checked above).
-        unsafe { write_tone(base, &tone, position..position + frames, frames_in_buffer) };
+        Ok(())
+    }
+
+    /// `GET_STREAM`.
+    fn stream(&self) -> Result<StreamState, String> {
+        let mut state = [0u8; StreamState::SIZE];
+        self.device
+            .control(IOCTL_GET_STREAM, &[], &mut state)
+            .map_err(|e| format!("GET_STREAM: {e}"))?;
+        Ok(StreamState::from_bytes(&state))
+    }
+
+    /// `ADVANCE` by `frames` from `from`: the new position, or `None` when the request no longer
+    /// matches the stream (a state change raced it: `ERROR_INVALID_PARAMETER`).
+    ///
+    /// # Errors
+    ///
+    /// Any other refusal: this process is no longer the attached host, for instance.
+    fn advance(&self, generation: u32, frames: u64, from: u64) -> Result<Option<u64>, String> {
         let request = AdvanceRequest {
-            generation: stream.generation,
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "at most the buffer's frame count, a u32"
-            )]
-            frames: frames as u32,
-            from: position,
+            generation,
+            frames: u32::try_from(frames).map_err(|_| "too many frames")?,
+            from,
         };
         let mut answer = [0u8; AdvanceReply::SIZE];
-        if device
-            .control(IOCTL_ADVANCE, &request.to_bytes(), &mut answer)
-            .is_ok()
+        match self
+            .device
+            .call(IOCTL_ADVANCE, &request.to_bytes(), &mut answer)
         {
-            position = AdvanceReply::from_bytes(&answer).position;
-            advanced += frames;
-        } else {
-            // The stream changed meanwhile: read its state again.
-            refused += 1;
-            anchor = None;
-            refresh = true;
-        }
-        if Instant::now() >= next_report {
-            next_report = Instant::now() + Duration::from_secs(1);
-            println!(
-                "playing    position {position}  {advanced} frames advanced  {refused} refused  {late} late"
-            );
+            Ok(returned) if returned as usize == AdvanceReply::SIZE => {
+                Ok(Some(AdvanceReply::from_bytes(&answer).position))
+            }
+            Ok(returned) => Err(format!("ADVANCE returned {returned} bytes")),
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => Ok(None),
+            Err(error) => Err(format!("ADVANCE: {error}")),
         }
     }
-    // SAFETY: matches `timeBeginPeriod` above.
-    unsafe { timeEndPeriod(1) };
-    Ok(())
+
+    /// Frames in `ticks` performance counter ticks, rounded down; 0 for a negative count.
+    fn frames_in(&self, ticks: i64) -> u64 {
+        let ticks = u128::from(u64::try_from(ticks).unwrap_or(0));
+        u64::try_from(ticks * u128::from(RATE) / u128::from(self.frequency.unsigned_abs().max(1)))
+            .unwrap_or(u64::MAX)
+    }
 }
 
 /// One line per state, with units.
@@ -524,6 +679,11 @@ fn interface_paths() -> Result<Vec<String>, String> {
 /// A handle this process owns, closed on drop.
 struct Handle(HANDLE);
 
+// SAFETY: a kernel handle is valid in every thread of the process, and the calls made with it
+// (`DeviceIoControl`, `WaitForSingleObject`) may run concurrently from several threads; it is
+// closed only when the `Handle` is dropped, after the threads that borrow it end.
+unsafe impl Sync for Handle {}
+
 impl Handle {
     /// Opens `path` for reading and writing, as a host must.
     fn open(path: &str) -> Result<Self, windows::core::Error> {
@@ -545,9 +705,19 @@ impl Handle {
 
     /// A synchronous device control request; the reply must fill `output` exactly.
     fn control(&self, code: u32, input: &[u8], output: &mut [u8]) -> Result<(), String> {
-        let mut returned = 0u32;
-        let input_length = u32::try_from(input.len()).unwrap_or(u32::MAX);
         let output_length = u32::try_from(output.len()).unwrap_or(u32::MAX);
+        let returned = self.call(code, input, output).map_err(|e| e.to_string())?;
+        if returned != output_length {
+            return Err(format!(
+                "{returned} bytes returned, {output_length} expected"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `DeviceIoControl`, synchronous; the bytes returned.
+    fn call(&self, code: u32, input: &[u8], output: &mut [u8]) -> windows::core::Result<u32> {
+        let mut returned = 0u32;
         // SAFETY: an open handle; buffers of the given lengths that live through the
         // synchronous call; a writable byte count.
         unsafe {
@@ -555,20 +725,14 @@ impl Handle {
                 self.0,
                 code,
                 (!input.is_empty()).then_some(input.as_ptr().cast()),
-                input_length,
+                u32::try_from(input.len()).unwrap_or(u32::MAX),
                 (!output.is_empty()).then_some(output.as_mut_ptr().cast()),
-                output_length,
+                u32::try_from(output.len()).unwrap_or(u32::MAX),
                 Some(&raw mut returned),
                 None,
             )
-        }
-        .map_err(|e| e.to_string())?;
-        if returned != output_length {
-            return Err(format!(
-                "{returned} bytes returned, {output_length} expected"
-            ));
-        }
-        Ok(())
+        }?;
+        Ok(returned)
     }
 }
 

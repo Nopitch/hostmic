@@ -6,8 +6,9 @@
 //! buffer and moves the stream position with `ADVANCE` ([`crate::host_link`]), which also
 //! signals the audio engine's notification event when a packet completes.
 //!
-//! - `GetPosition` and `GetReadPacket` only read the position (an atomic) and the packet the
-//!   engine read last: no lock, no allocation, any IRQL up to `DISPATCH_LEVEL`.
+//! - `GetPosition` reads the position (an atomic); `GetReadPacket` also moves the number of the
+//!   packet the engine read last (a compare-and-exchange, so that a racing stop's reset wins)
+//!   and counts skipped packets: no lock, no allocation, any IRQL up to `DISPATCH_LEVEL`.
 //! - State changes, buffer allocation and event registration run at `PASSIVE_LEVEL`,
 //!   serialized by PortCls, and publish what changes to the host link.
 //!
@@ -463,12 +464,19 @@ unsafe extern "C" fn get_read_packet(
         per_packet,
         stream.buffer_frames(),
         (last != NO_PACKET).then_some(last),
+        link.advance_frames(),
     ) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    stream
+    // A stop that raced this call reset the numbering: its reset wins, and the packet read
+    // here belongs to the stopped run.
+    if stream
         .last_read_packet
-        .store(read.packet, Ordering::Relaxed);
+        .compare_exchange(last, read.packet, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return STATUS_DEVICE_NOT_READY;
+    }
     if read.skipped != 0 {
         link.packets_skipped(read.skipped);
     }

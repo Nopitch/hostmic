@@ -19,15 +19,21 @@ pub struct Read {
 
 /// The packet `GetReadPacket` returns at stream `position`, after the engine last read
 /// `last_read` (`None`: nothing read yet), with packets of `frames_per_packet` frames in a
-/// buffer of `buffer_frames` frames: the oldest complete packet not read yet whose frames are
-/// all still in the buffer. `None` when there is none (or a size is 0, or the buffer is
-/// smaller than a packet). No input can panic or overflow.
+/// buffer of `buffer_frames` frames, when the host may already have written `ahead` frames
+/// beyond the position (those of its next `ADVANCE`): the oldest complete packet not read yet
+/// whose frames are all still in the buffer. `None` when there is none (or a size is 0, or
+/// the buffer is smaller than a packet). No input can panic or overflow.
+///
+/// The host writes frame `n` where frame `n - buffer_frames` was, before it advances past it:
+/// a packet is intact while its first frame is at least a buffer behind the frames the host
+/// may be writing.
 #[must_use]
 pub const fn next_read(
     position: u64,
     frames_per_packet: u64,
     buffer_frames: u64,
     last_read: Option<u64>,
+    ahead: u64,
 ) -> Option<Read> {
     if frames_per_packet == 0 || buffer_frames < frames_per_packet {
         return None;
@@ -41,9 +47,8 @@ pub const fn next_read(
         },
         None => 0,
     };
-    // A packet is intact while its first frame is at most a buffer behind the position: the
-    // host writes frame `n` where frame `n - buffer_frames` was.
-    let oldest = position
+    let written = position.saturating_add(ahead);
+    let oldest = written
         .saturating_sub(buffer_frames)
         .div_ceil(frames_per_packet);
     let mut skipped = 0;
@@ -93,29 +98,41 @@ mod tests {
 
     #[test]
     fn first_packet() {
-        assert_eq!(next_read(0, PACKET, BUFFER, None), None);
-        assert_eq!(next_read(479, PACKET, BUFFER, None), None);
-        assert_eq!(next_read(480, PACKET, BUFFER, None), read(0, false, 0));
-        assert_eq!(next_read(959, PACKET, BUFFER, None), read(0, false, 0));
+        assert_eq!(next_read(0, PACKET, BUFFER, None, 0), None);
+        assert_eq!(next_read(479, PACKET, BUFFER, None, 0), None);
+        assert_eq!(next_read(480, PACKET, BUFFER, None, 0), read(0, false, 0));
+        assert_eq!(next_read(959, PACKET, BUFFER, None, 0), read(0, false, 0));
     }
 
     #[test]
     fn in_order_then_nothing() {
-        assert_eq!(next_read(960, PACKET, BUFFER, None), read(0, true, 0));
-        assert_eq!(next_read(960, PACKET, BUFFER, Some(0)), read(1, false, 0));
-        assert_eq!(next_read(960, PACKET, BUFFER, Some(1)), None);
-        assert_eq!(next_read(1_440, PACKET, BUFFER, Some(1)), read(2, false, 0));
+        assert_eq!(next_read(960, PACKET, BUFFER, None, 0), read(0, true, 0));
+        assert_eq!(
+            next_read(960, PACKET, BUFFER, Some(0), 0),
+            read(1, false, 0)
+        );
+        assert_eq!(next_read(960, PACKET, BUFFER, Some(1), 0), None);
+        assert_eq!(
+            next_read(1_440, PACKET, BUFFER, Some(1), 0),
+            read(2, false, 0)
+        );
     }
 
     #[test]
     fn overwritten_packets_are_skipped() {
         // Position 1200: frames 240.. are in the buffer, so packet 0 (frames 0..480) is
         // partly overwritten; packet 1 is the oldest intact one.
-        assert_eq!(next_read(1_200, PACKET, BUFFER, None), read(1, false, 1));
+        assert_eq!(next_read(1_200, PACKET, BUFFER, None, 0), read(1, false, 1));
         // Far ahead: packets 2..9 are gone, 10 and 11 complete and intact.
-        assert_eq!(next_read(5_760, PACKET, BUFFER, Some(1)), read(10, true, 8));
+        assert_eq!(
+            next_read(5_760, PACKET, BUFFER, Some(1), 0),
+            read(10, true, 8)
+        );
         // Exactly one buffer ahead: nothing is overwritten yet.
-        assert_eq!(next_read(1_440, PACKET, BUFFER, Some(0)), read(1, true, 0));
+        assert_eq!(
+            next_read(1_440, PACKET, BUFFER, Some(0), 0),
+            read(1, true, 0)
+        );
     }
 
     #[test]
@@ -129,20 +146,43 @@ mod tests {
 
     #[test]
     fn degenerate_sizes_and_extremes_do_not_panic() {
-        assert_eq!(next_read(1_000, 0, BUFFER, None), None);
-        assert_eq!(next_read(1_000, PACKET, 0, None), None);
-        assert_eq!(next_read(1_000, PACKET, PACKET - 1, None), None);
-        assert_eq!(next_read(u64::MAX, PACKET, BUFFER, Some(u64::MAX)), None);
-        assert_eq!(next_read(u64::MAX, 1, u64::MAX, None), read(0, true, 0));
+        assert_eq!(next_read(1_000, 0, BUFFER, None, 0), None);
+        assert_eq!(next_read(1_000, PACKET, 0, None, 0), None);
+        assert_eq!(next_read(1_000, PACKET, PACKET - 1, None, 0), None);
+        assert_eq!(next_read(u64::MAX, PACKET, BUFFER, Some(u64::MAX), 0), None);
+        assert_eq!(next_read(u64::MAX, 1, u64::MAX, None, 0), read(0, true, 0));
         assert_eq!(completed_between(0, 1_000, 0), 0);
+        assert_eq!(
+            next_read(960, PACKET, BUFFER, None, BUFFER),
+            None,
+            "a whole buffer written ahead overwrites every complete packet"
+        );
+        let _ = next_read(u64::MAX, PACKET, BUFFER, Some(7), u64::MAX);
         for position in 0..5_000 {
             for last in [None, Some(0), Some(3), Some(9)] {
-                if let Some(r) = next_read(position, PACKET, BUFFER, last) {
-                    assert!((r.packet + 1) * PACKET <= position, "complete");
-                    assert!(r.packet * PACKET + BUFFER >= position, "intact");
-                    assert!(last.is_none_or(|l| r.packet > l), "after the last read");
+                for ahead in [0, 48, 479] {
+                    if let Some(r) = next_read(position, PACKET, BUFFER, last, ahead) {
+                        assert!((r.packet + 1) * PACKET <= position, "complete");
+                        assert!(r.packet * PACKET + BUFFER >= position + ahead, "intact");
+                        assert!(last.is_none_or(|l| r.packet > l), "after the last read");
+                    }
                 }
             }
         }
+    }
+
+    /// The host writes the frames of its next `ADVANCE` before sending it: they may already
+    /// overwrite the oldest packet.
+    #[test]
+    fn frames_written_ahead_count_as_overwriting() {
+        // Position 960, host writing 960..1008 into packet 0's place: packet 0 is gone.
+        assert_eq!(next_read(960, PACKET, BUFFER, None, 48), read(1, false, 1));
+        // Nothing written ahead yet: packet 0 is still whole.
+        assert_eq!(next_read(960, PACKET, BUFFER, None, 0), read(0, true, 0));
+        // One millisecond into packet 2's writing, packet 1 is still whole.
+        assert_eq!(
+            next_read(1_008, PACKET, BUFFER, Some(0), 48),
+            read(1, false, 0)
+        );
     }
 }

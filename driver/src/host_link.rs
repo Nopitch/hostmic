@@ -8,9 +8,9 @@
 //!
 //! The stream's generation and position follow `hostmic_driver_core::host::Cursor`'s protocol:
 //! a state change or a new buffer first halts the generation, then changes the rest. The writers
-//! here are the stream's state changes and buffer allocations (`PASSIVE_LEVEL`, serialized by
-//! PortCls), and `ADVANCE`, which moves the position with one compare-and-exchange and loses
-//! to any of them.
+//! here are the stream's creation, state changes, buffer allocations and release (`PASSIVE_LEVEL`,
+//! serialized by PortCls), and `ADVANCE`, which moves the position with one compare-and-exchange
+//! and loses to any of them.
 //!
 //! The link holds the adapter's reference to the shared buffer ([`crate::shared_buffer`]), and
 //! the attached host's mapping of it. A user mapping must be undone in its process before the
@@ -126,11 +126,15 @@ pub struct HostLink {
     engine_rundown: UnsafeCell<EX_RUNDOWN_REF>,
     /// Performance counter ticks per second, read once by [`HostLink::init`].
     qpc_frequency: AtomicU64,
-    /// The performance counter and the position of the last `ADVANCE`, from which packets are
-    /// dated. Written one after the other, so a reader may pair one advance's value with the
-    /// next one's: an error of at most one advance's frames.
+    /// The performance counter and the cursor word (generation and position) of the last
+    /// `ADVANCE`, from which packets are dated ([`HostLink::frame_qpc`]). Two stores, so a
+    /// reader may pair values of two advances that ran concurrently or were preempted between
+    /// them; a word of another generation than the stream's is ignored.
     advance_qpc: AtomicU64,
-    advance_position: AtomicU64,
+    advance_word: AtomicU64,
+    /// Frames of the last `ADVANCE`: how far ahead of the position the host may already be
+    /// writing (it writes the frames of an advance before sending it).
+    advance_frames: AtomicU64,
     /// The counters [`HostLink::stats`] reports (`hostmic_abi::Stats`).
     frames_advanced: AtomicU64,
     packets_completed: AtomicU64,
@@ -354,7 +358,7 @@ impl HostLink {
         // Each failed exchange means that another writer moved the cursor: its generation or its
         // position changed, so the next validation refuses a request computed for the old one.
         // The loop therefore runs at most twice.
-        let (from, to, per_packet) = loop {
+        let (from, next, per_packet) = loop {
             let word = self.cursor.load(Ordering::Acquire);
             // Read after the word: a new buffer halts the generation before it changes these,
             // so values newer than the word make the exchange below fail.
@@ -366,15 +370,13 @@ impl HostLink {
                 .compare_exchange(word, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                break (
-                    Cursor::unpack(word).position,
-                    Cursor::unpack(next).position,
-                    per_packet,
-                );
+                break (Cursor::unpack(word).position, next, per_packet);
             }
         };
+        let to = Cursor::unpack(next).position;
         self.advance_qpc.store(qpc(), Ordering::Relaxed);
-        self.advance_position.store(to, Ordering::Release);
+        self.advance_word.store(next, Ordering::Release);
+        self.advance_frames.store(to - from, Ordering::Relaxed);
         self.frames_advanced.fetch_add(to - from, Ordering::Relaxed);
         let completed = packet::completed_between(from, to, u64::from(per_packet));
         if completed != 0 {
@@ -425,17 +427,25 @@ impl HostLink {
         unsafe { ExReInitializeRundownProtection(self.engine_rundown.get()) };
     }
 
-    /// The performance counter value at which stream frame `frame` was written, estimated from
-    /// the last `ADVANCE` (its time and position) at the stream's rate. Any IRQL; reads atomics.
+    /// The performance counter value at which stream frame `frame` was written: counted back
+    /// at the stream's rate from the last `ADVANCE` of the current generation, or from now and
+    /// the current position when there is none (an advance of an earlier run that finished
+    /// late). Any IRQL; reads atomics.
     pub fn frame_qpc(&self, frame: u64) -> u64 {
-        let position = self.advance_position.load(Ordering::Acquire);
+        let advanced = Cursor::unpack(self.advance_word.load(Ordering::Acquire));
         let at = self.advance_qpc.load(Ordering::Relaxed);
-        let back = clock::ticks_for_frames(
-            position.saturating_sub(frame),
-            self.qpc_frequency.load(Ordering::Relaxed),
-            SAMPLE_RATE,
-        );
-        at.saturating_sub(back)
+        let current = Cursor::unpack(self.cursor.load(Ordering::Acquire));
+        let frequency = self.qpc_frequency.load(Ordering::Relaxed);
+        if advanced.generation == current.generation {
+            clock::sampling_instant(frame, advanced.position, at, frequency, SAMPLE_RATE)
+        } else {
+            clock::sampling_instant(frame, current.position, qpc(), frequency, SAMPLE_RATE)
+        }
+    }
+
+    /// Frames of the last `ADVANCE`: how far the host may be writing ahead of the position.
+    pub fn advance_frames(&self) -> u64 {
+        self.advance_frames.load(Ordering::Relaxed)
     }
 
     /// `GetReadPacket` skipped `count` packets the host had overwritten. Any IRQL.

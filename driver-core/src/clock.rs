@@ -30,9 +30,49 @@ pub fn ticks_for_frames(frames: u64, frequency: u64, rate: u32) -> u64 {
     u64::try_from(ticks).unwrap_or(u64::MAX)
 }
 
+/// The performance counter value at which stream frame `frame` was sampled, given that frame
+/// `reference` was reached at `reference_qpc`, at `rate` frames per second and `frequency`
+/// ticks per second. Frames after the reference are dated at the reference (they cannot be
+/// earlier); the result saturates at 0.
+#[must_use]
+pub fn sampling_instant(
+    frame: u64,
+    reference: u64,
+    reference_qpc: u64,
+    frequency: u64,
+    rate: u32,
+) -> u64 {
+    reference_qpc.saturating_sub(ticks_for_frames(
+        reference.saturating_sub(frame),
+        frequency,
+        rate,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_instants_count_back_from_the_reference() {
+        // 480 frames at 48 kHz are 10 ms: 100 000 ticks at 10 MHz.
+        assert_eq!(
+            sampling_instant(960, 1_440, 5_000_000, QPC, 48_000),
+            4_900_000
+        );
+        assert_eq!(
+            sampling_instant(1_440, 1_440, 5_000_000, QPC, 48_000),
+            5_000_000
+        );
+        // A frame after the reference: dated at the reference.
+        assert_eq!(
+            sampling_instant(2_000, 1_440, 5_000_000, QPC, 48_000),
+            5_000_000
+        );
+        // A reference from long ago: saturates at 0 instead of wrapping.
+        assert_eq!(sampling_instant(0, u64::MAX, 7, QPC, 48_000), 0);
+        assert_eq!(sampling_instant(0, 0, 0, 0, 0), 0);
+    }
 
     /// The usual performance counter frequency on current Windows.
     const QPC: u64 = 10_000_000;

@@ -624,19 +624,23 @@ impl Reason {
     }
 }
 
-/// Output of [`IOCTL_GET_STATS`]: counters since the driver started, never reset. Each counter
-/// is read on its own: they are consistent with one another only within a few requests.
+/// Output of [`IOCTL_GET_STATS`]: the counters of one host interface (one microphone), since
+/// its device started, never reset. Each counter is read on its own: they are consistent with
+/// one another only within a few requests. Any process allowed to open the interface reads
+/// them, as it reads the stream's state.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Stats {
     /// Frames the host advanced.
     pub frames_advanced: u64,
-    /// Packets the host's advances completed, each signaled to the audio engine.
+    /// Packets the host's advances completed (event-driven streams only); the audio engine's
+    /// event is signaled for them when it registered one.
     pub packets_completed: u64,
-    /// Packets the audio engine never read: the host got more than a buffer ahead of it and
-    /// overwrote them.
+    /// Packets the audio engine never read: when it asked for the next packet, the host had
+    /// already overwritten it (it got more than a buffer ahead of the engine). Counted when the
+    /// engine reads again.
     pub packets_skipped: u64,
-    /// Requests refused, of any kind.
+    /// Requests refused, of any kind and from any process allowed to open the interface.
     pub requests_refused: u64,
     /// The [`function`] of the last refused request's control code; 0 if none.
     pub last_request: u16,

@@ -922,9 +922,15 @@ unsafe fn device_control(
 fn count_refusal(shared: &HostLink, code: u32, name: &str, refusal: &Refusal) -> NTSTATUS {
     let status = refusal.status();
     shared.refused(function(code), refusal.reason(), status);
-    // `ADVANCE`s refused for a stale generation or position are part of the protocol (a state
-    // change raced the host) and may come by the hundred: counted, not logged.
-    if code == IOCTL_ADVANCE {
+    // `ADVANCE`s refused because a state change raced the host (stale generation or position,
+    // stream no longer running) are part of the protocol and may come by the hundred: counted,
+    // not logged. Every other refusal, a foreign process's included, is logged.
+    if code == IOCTL_ADVANCE
+        && matches!(
+            refusal.reason(),
+            Reason::Generation | Reason::Position | Reason::NotRunning
+        )
+    {
         return status;
     }
     match refusal {
