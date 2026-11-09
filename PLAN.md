@@ -597,8 +597,44 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   The gaps sit mostly in 1.5-2 ms (the VM's 1 ms timer ticks about every 1.46 ms), none above
   3 ms in the 30 s runs. In a VM; the comparison with the target table, which was measured on
   a real machine, is for M7, with a signed driver.
+  ***M5 done (2026-11-09).*** Hosts no longer speak the protocol themselves: the crate
+  `hostmic` (`host/`) finds the microphone, attaches, writes into the shared buffer and
+  advances the position safely (the low layer, for hosts with a loop of their own), and
+  `Player` runs the reference loop (MMCSS, a high-resolution timer, pacing by the performance
+  counter, no allocation, lock or I/O, atomic counters), following the microphone as Windows
+  adds and removes it. `tools/hostmic-ctl`, `tools/test-host`, `tools/handle-check` and
+  `tools/measure` are built on it. Pull requests: the design (#49), the low layer (#50), only
+  the host's process detaches (#51), the host interface opens again after a disable and enable
+  (#52), the reference loop (#53), device notifications (#54), the measurements (#55). The
+  "done when" items, in the VM:
+  - `test-host` plays through the `Player` and `capture-check` passes (three 30 s runs, 0
+    glitch, no discontinuity, 0 late);
+  - the longest gap below 2.6 ms is **not met reliably** (2.5, 2.6 and 8.7 ms in three runs): a
+    single maximum in a VM measures the hypervisor's scheduling as much as the loop. The
+    distribution replaced it (`PlayerStats::gaps`): none above 3 ms in the 30 s runs, 14 of
+    413576 above 2 ms in 10 minutes under load, the longest 4.5 ms, with no consequence (the
+    shared-mode buffer is 20 ms);
+  - `devcon remove` while a host plays removes the device and unloads the driver, and the host
+    attaches again after the reinstall; disabling and enabling the host interface makes it let
+    go and attach again;
+  - the measurements meet the target table: write → read median 10.1 ms (9.6 to 10.8 ms), 0
+    crackle under load for 30 s and for 10 minutes.
+  Each pull request had an independent review, and the reviews found real defects again: a
+  `DETACH` accepted from another process holding a duplicate of the host's handle (#51), the
+  host interface refusing every open after a disable and enable (#52), a late tick sent as one
+  large `ADVANCE` that made the driver skip a packet (#53), a host attaching again before the
+  driver's query-remove and so holding the removal back until a reboot (#54, also seen in the
+  VM), and a measurement verdict that passed a silent or stalled microphone (#55). Carried
+  over:
+  - to M6: the gaps' tail in a VM (hours of `measure load`, with the distribution); Driver
+    Verifier while a crate host attaches, follows a removal and dies; the isolated
+    `capture-check` `FAIL` after a checkpoint restore (#51), not seen in M5's later runs;
+  - to M7: `measure` on a real machine, against the target table, once the driver is signed;
+  - to M8: Résonnance on the low layer, clocked by its physical microphone; the caller-driven
+    clock with a correction ratio, and the C header, once that host has settled the API;
+  - open question: the PipeWire backend (below).
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
-  resume, host crash, several hours of endurance; M4's carried-over items (above).
+  resume, host crash, several hours of endurance; M4's and M5's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

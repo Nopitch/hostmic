@@ -2,7 +2,7 @@
 
 hostmic is a Windows kernel-mode driver. This document states what users can and cannot expect
 from it in terms of security (its security requirements), then argues why the design and the
-development process meet them (an assurance case). It covers the state after milestone M4 and
+development process meet them (an assurance case). It covers the state after milestone M5 and
 says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
 [SECURITY.md](../SECURITY.md) the vulnerability process and the security rules.
 
@@ -146,8 +146,11 @@ of the build.
   `multiple_unsafe_ops_per_block` forbidden in the driver; CodeQL; zizmor.
 - VM tests documented in [docs/test-vm.md](test-vm.md), including a measured recording
   (`tools/capture-check`: frequency, level, discontinuities).
-- Review of every change through pull requests, and an independent review of the PortCls
-  adapter (M3).
+- The host crate `hostmic` (M5) under the same `unsafe` lints; its writes into the shared
+  buffer are volatile, never through a Rust reference, and its pure parts (the clock, the
+  ring's wrap, sample conversion) are unit-tested in CI.
+- Review of every change through pull requests, an independent review of the PortCls adapter
+  (M3), and of every kernel and host-crate pull request since M4.
 
 ### 2.6 Known gaps and plans
 
