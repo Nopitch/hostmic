@@ -594,9 +594,9 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   10.8 ms); load, 16 threads, 30 s: **0 crackle**, 0 late, longest gap 1.6 ms, 98.8 %
   audible; endurance, load for 10 minutes: **0 crackle**, 0 late, 0 discontinuity, 0 packet
   skipped, 99.9 % of the frames due read, 14 of 413576 gaps above 2 ms, the longest 4.5 ms.
-  The gaps sit mostly in 1.5-2 ms (the VM's 1 ms timer ticks about every
-  1.46 ms), none above 3 ms in the 30 s runs. In a VM; the comparison with the target table, which
-  was measured on a real machine, is for M7, with a signed driver.
+  The gaps sit mostly in 1.5-2 ms (the VM's 1 ms timer ticks about every 1.46 ms), none above
+  3 ms in the 30 s runs. In a VM; the comparison with the target table, which was measured on
+  a real machine, is for M7, with a signed driver.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
