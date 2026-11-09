@@ -33,6 +33,12 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 lto = true
+# As in debug builds: an arithmetic overflow panics instead of wrapping. The code saturates or
+# checks wherever a value can overflow; should one ever wrap anyway, the release driver stops
+# with a bug check that names the place (`wdk-panic`: code "RPNC", the file and line in its
+# parameters) rather than going on with a wrong size or position, which in the kernel can
+# corrupt memory. Hosts and tools built in release abort the same way (PLAN.md, M6).
+overflow-checks = true
 
 [workspace.dependencies]
 # Same bindgen as wdk-build's `BuilderExt`, which is implemented for this version's `Builder`.

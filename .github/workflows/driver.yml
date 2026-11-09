@@ -202,9 +202,10 @@ jobs:
           Write-Host $version
           if ($version -notmatch [regex]::Escape($env:CARGO_WDK_VERSION)) { throw "Expected cargo-wdk $env:CARGO_WDK_VERSION, got: $version" }
 
-      # Build, stampinf, inf2cat, infverif and test signing with a throwaway certificate. The
-      # debug build (overflow checks, debug assertions) is the one tested in the VM; the release
-      # build is what a release ships, as other driver projects build both.
+      # Build, stampinf, inf2cat, infverif and test signing with a throwaway certificate. Both
+      # builds check arithmetic overflows (Cargo.toml); the debug build adds debug assertions.
+      # The release build is what a release ships; the VM's test campaign runs on both
+      # (docs/test-vm.md, section 8).
       - name: Build and package the driver (debug)
         if: steps.scope.outputs.code == 'true'
         run: cargo wdk build --locked
