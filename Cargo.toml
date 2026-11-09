@@ -6,6 +6,7 @@ members = [
     "driver-core",
     "hostmic-sys",
     "tools/capture-check",
+    "tools/handle-check",
     "tools/hostmic-ctl",
     "tools/test-host",
 ]
