@@ -22,8 +22,12 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
+use crate::topology::PIN_MICROPHONE;
 use hostmic_abi::{Format, State, StreamState};
 use hostmic_driver_core::host::Cursor;
+use hostmic_sys::{
+    IPortEvents, IPortEventsVtbl, KSEVENT_PINCAPS_CHANGENOTIFICATIONS, PKSEVENT_ENTRY, guid,
+};
 use wdk::println;
 use wdk_sys::{
     EX_RUNDOWN_REF, FILE_OBJECT, KEVENT,
@@ -59,6 +63,12 @@ pub struct HostLink {
     /// Keeps `event` alive while [`HostLink::notify`] signals it. All zeroes is an initialized
     /// rundown reference.
     rundown: UnsafeCell<EX_RUNDOWN_REF>,
+    /// The topology port's `IPortEvents`, to report jack changes; null while the topology
+    /// miniport is not initialized. Not counted: a reference would make a cycle (the port holds
+    /// the miniport), and the topology miniport clears it before its port goes away.
+    jack_events: AtomicPtr<IPortEvents>,
+    /// Keeps `jack_events` usable while a jack event is added or generated.
+    jack_rundown: UnsafeCell<EX_RUNDOWN_REF>,
 }
 
 // SAFETY: every field is atomic except the rundown reference, which the kernel's rundown
@@ -160,6 +170,102 @@ impl HostLink {
         state
     }
 
+    /// Whether a host is attached: the microphone's jack is connected.
+    pub fn is_attached(&self) -> bool {
+        let host = self.host.load(Ordering::Acquire);
+        !host.is_null() && host != ATTACHING && host != DETACHING
+    }
+
+    /// The topology miniport was initialized: `events` is its port's `IPortEvents`, valid
+    /// until [`HostLink::clear_jack_events`].
+    ///
+    /// # Safety
+    ///
+    /// `events` is a live `IPortEvents` of the topology port, which the topology miniport
+    /// clears with [`HostLink::clear_jack_events`] before that port goes away.
+    pub unsafe fn set_jack_events(&self, events: *mut IPortEvents) {
+        self.jack_events.store(events, Ordering::Release);
+    }
+
+    /// The topology miniport that set `events` goes away: no more jack events through it (a
+    /// newer miniport's are left alone). `PASSIVE_LEVEL`: waits for a jack event in flight.
+    pub fn clear_jack_events(&self, events: *mut IPortEvents) {
+        if events.is_null()
+            || self
+                .jack_events
+                .compare_exchange(
+                    events,
+                    core::ptr::null_mut(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return;
+        }
+        // SAFETY: PASSIVE_LEVEL; waits for the callers of `with_jack_events`.
+        unsafe { ExWaitForRundownProtectionRelease(self.jack_rundown.get()) };
+        // SAFETY: the rundown completed and nobody holds it.
+        unsafe { ExReInitializeRundownProtection(self.jack_rundown.get()) };
+    }
+
+    /// Calls `f` with the topology port's events interface, if there is one, while it cannot
+    /// be cleared.
+    fn with_jack_events(&self, f: impl FnOnce(*mut IPortEvents, &IPortEventsVtbl)) {
+        // SAFETY: a valid, initialized rundown reference (zeroed or reinitialized).
+        if unsafe { ExAcquireRundownProtection(self.jack_rundown.get()) } == 0 {
+            return;
+        }
+        let events = self.jack_events.load(Ordering::Acquire);
+        if !events.is_null() {
+            // SAFETY: a live `IPortEvents` (`set_jack_events`' contract), kept by the rundown
+            // protection held here: `clear_jack_events` waits for it.
+            let vtable = unsafe { (*events).lpVtbl };
+            // SAFETY: an interface's vtable is valid for its lifetime.
+            f(events, unsafe { &*vtable });
+        }
+        // SAFETY: acquired above.
+        unsafe { ExReleaseRundownProtection(self.jack_rundown.get()) };
+    }
+
+    /// Adds an event entry that a client enabled on the jack (`KSEVENT_PINCAPS_JACKINFOCHANGE`)
+    /// to the port's list, so that [`HostLink::jack_changed`] signals it.
+    ///
+    /// # Safety
+    ///
+    /// `entry` is the event entry of a `PCEVENT_VERB_ADD` request that PortCls passed.
+    pub unsafe fn add_jack_event(&self, entry: PKSEVENT_ENTRY) {
+        self.with_jack_events(|events, vtable| {
+            if let Some(add) = vtable.AddEventToEventList {
+                // SAFETY: a live interface; the entry comes from PortCls's event request.
+                unsafe { add(events.cast(), entry) };
+            }
+        });
+    }
+
+    /// Tells the clients (the audio endpoint builder) that the microphone's jack changed.
+    fn jack_changed(&self) {
+        self.with_jack_events(|events, vtable| {
+            if let Some(generate) = vtable.GenerateEventList {
+                let mut set = guid::KSEVENTSETID_PinCapsChange;
+                // SAFETY: a live interface; the set GUID outlives the call; a pin event on the
+                // microphone pin, no node.
+                unsafe {
+                    generate(
+                        events.cast(),
+                        &raw mut set,
+                        KSEVENT_PINCAPS_CHANGENOTIFICATIONS::KSEVENT_PINCAPS_JACKINFOCHANGE
+                            .cast_unsigned(),
+                        1,
+                        PIN_MICROPHONE,
+                        0,
+                        u32::MAX,
+                    );
+                };
+            }
+        });
+    }
+
     /// Signals the attached host's event, if any. Any IRQL up to `DISPATCH_LEVEL`; never waits.
     pub fn notify(&self) {
         // SAFETY: a valid rundown reference, initialized (all zeroes or reinitialized).
@@ -202,6 +308,8 @@ impl HostLink {
         self.event.store(event, Ordering::Release);
         self.host.store(file, Ordering::Release);
         println!("hostmic: host attached");
+        // The microphone is plugged in.
+        self.jack_changed();
         // The host reads the stream's state as it is now.
         self.notify();
         Ok(())
@@ -231,6 +339,8 @@ impl HostLink {
         }
         self.host.store(core::ptr::null_mut(), Ordering::Release);
         println!("hostmic: host detached");
+        // The microphone is unplugged.
+        self.jack_changed();
         true
     }
 }

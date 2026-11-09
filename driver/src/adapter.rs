@@ -175,7 +175,7 @@ unsafe fn install_filters(
     resources: PRESOURCELIST,
     link: LinkRef,
 ) -> Result<(Unknown, Unknown), NTSTATUS> {
-    let topology_miniport = topology::new().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    let topology_miniport = topology::new(link).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     // SAFETY: the caller's contract.
     let topology_port = unsafe {
         install_subdevice(
