@@ -114,7 +114,8 @@ pub struct HostDevice {
     /// the child refuses removal: requests on those handles use the adapter's host link,
     /// which lives in the adapter's device extension.
     open_files: AtomicU32,
-    /// Between an accepted `IRP_MN_QUERY_REMOVE_DEVICE` and its cancellation: no new opens.
+    /// From an accepted `IRP_MN_QUERY_REMOVE_DEVICE` to its cancellation or the next start: no
+    /// new opens.
     remove_pending: AtomicBool,
     /// The interface's symbolic link name, registered on the first start. Only PnP requests
     /// for this child and [`delete`] (once nothing else can reach it) touch it, and the PnP
@@ -590,8 +591,11 @@ unsafe fn start(device: PDEVICE_OBJECT) -> NTSTATUS {
     let status = unsafe { IoSetDeviceInterfaceState(link, 1) };
     println!("hostmic: host interface enabled: {status:#010x}");
     if NT_SUCCESS(status) {
-        // A device disabled and enabled again in Device Manager is removed, then started.
+        // A device disabled and enabled again in Device Manager is queried for removal,
+        // removed, then started, with no cancellation in between: both flags go back here,
+        // before opens are allowed again.
         this.removed.store(false, Ordering::Release);
+        this.remove_pending.store(false, Ordering::SeqCst);
         this.started.store(true, Ordering::Release);
     }
     status
