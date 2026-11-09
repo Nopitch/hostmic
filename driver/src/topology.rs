@@ -3,8 +3,9 @@
 //!
 //! Ported from the `MicArray1` topology of Microsoft's `simpleaudiosample`, simplified to a
 //! plain microphone (PLAN.md, M3): two bridge pins joined directly, no volume or mute node, no
-//! microphone-array geometry. The jack is always connected until the host interface (M4) makes
-//! it follow the host.
+//! microphone-array geometry. The jack follows the host (M4): connected while a host is attached,
+//! with presence detection, and a jack change event for the audio endpoint builder, so that
+//! Windows shows the microphone unplugged without a host.
 //!
 //! ```text
 //!               +-----------+
@@ -13,24 +14,32 @@
 //!               +-----------+
 //! ```
 
-use core::{ffi::c_void, ptr, sync::atomic::AtomicU32};
+use core::{
+    ffi::c_void,
+    ptr,
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+};
 
 use hostmic_sys::{
     EPcxConnectionType, EPcxGenLocation, EPcxGeoLocation, EPxcPortConnection,
-    IMiniportTopologyVtbl, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1, KSDATARANGE,
-    KSJACK_DESCRIPTION, KSJACK_DESCRIPTION2, KSPIN_COMMUNICATION, KSPIN_DATAFLOW, KSPIN_DESCRIPTOR,
-    KSPIN_DESCRIPTOR__bindgen_ty_1, KSPROPERTY_JACK, KSPROPERTY_TYPE_BASICSUPPORT,
-    KSPROPERTY_TYPE_GET, PCAUTOMATION_TABLE, PCCONNECTION_DESCRIPTOR, PCEVENT_ITEM,
-    PCFILTER_DESCRIPTOR, PCMETHOD_ITEM, PCNODE_DESCRIPTOR, PCPIN_DESCRIPTOR, PCPROPERTY_ITEM,
-    PKSDATARANGE, PPCFILTER_DESCRIPTOR, PPCPROPERTY_REQUEST, PPORTTOPOLOGY, PRESOURCELIST,
-    PUNKNOWN, guid,
+    IMiniportTopologyVtbl, IPortEvents, JACKDESC2_PRESENCE_DETECT_CAPABILITY, KSDATAFORMAT,
+    KSDATAFORMAT__bindgen_ty_1, KSDATARANGE, KSEVENT_PINCAPS_CHANGENOTIFICATIONS,
+    KSEVENT_TYPE_BASICSUPPORT, KSEVENT_TYPE_ENABLE, KSJACK_DESCRIPTION, KSJACK_DESCRIPTION2,
+    KSPIN_COMMUNICATION, KSPIN_DATAFLOW, KSPIN_DESCRIPTOR, KSPIN_DESCRIPTOR__bindgen_ty_1,
+    KSPROPERTY_JACK, KSPROPERTY_TYPE_BASICSUPPORT, KSPROPERTY_TYPE_GET, PCAUTOMATION_TABLE,
+    PCCONNECTION_DESCRIPTOR, PCEVENT_ITEM, PCEVENT_VERB_ADD, PCFILTER_DESCRIPTOR, PCMETHOD_ITEM,
+    PCNODE_DESCRIPTOR, PCPIN_DESCRIPTOR, PCPROPERTY_ITEM, PKSDATARANGE, PPCEVENT_REQUEST,
+    PPCFILTER_DESCRIPTOR, PPCPROPERTY_REQUEST, PPORTTOPOLOGY, PRESOURCELIST, PUNKNOWN, guid,
 };
 use wdk_sys::{
     NTSTATUS, PULONG, PVOID, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS, TRUE, ULONG,
+    STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG,
 };
 
+use wdk::println;
+
 use crate::com::{self, ComObject, Unknown};
+use crate::host_link::LinkRef;
 use crate::ks::{self, PCFILTER_NODE, Shared, size_ulong};
 
 /// Pin 0: the microphone itself, the endpoint's physical side.
@@ -44,6 +53,22 @@ pub struct TopologyMiniport {
     /// `IUnknown`, `IMiniport` and `IMiniportTopology`, which extend one another.
     vtable: &'static IMiniportTopologyVtbl,
     references: AtomicU32,
+    /// The adapter's host link: whether a host is attached, and where jack events go.
+    link: LinkRef,
+    /// The port's `IPortEvents`: one reference, owned by the miniport, for the jack event's
+    /// enables; null until `Init`.
+    events: AtomicPtr<IPortEvents>,
+}
+
+impl Drop for TopologyMiniport {
+    /// Runs at `PASSIVE_LEVEL`, when PortCls releases the miniport (the filters stop or the
+    /// device goes away): the link lets go of this port's events, and so does the miniport.
+    fn drop(&mut self) {
+        let events = self.events.swap(ptr::null_mut(), Ordering::AcqRel);
+        self.link.get().clear_jack_events(events);
+        // SAFETY: the reference `init` stored, owned by this miniport (or null).
+        drop(unsafe { Unknown::from_raw(events.cast()) });
+    }
 }
 
 // SAFETY: `#[repr(C)]`, the vtable at offset 0 is `VTABLE`, whose `IUnknown` entries are the
@@ -59,10 +84,12 @@ unsafe impl ComObject for TopologyMiniport {
 
 /// Creates a topology miniport, or `None` when the pool is exhausted.
 #[must_use]
-pub fn new() -> Option<Unknown> {
+pub fn new(link: LinkRef) -> Option<Unknown> {
     com::into_unknown(TopologyMiniport {
         vtable: &VTABLE,
         references: AtomicU32::new(1),
+        link,
+        events: AtomicPtr::new(ptr::null_mut()),
     })
 }
 
@@ -104,14 +131,32 @@ unsafe extern "C" fn data_range_intersection(
     STATUS_NOT_IMPLEMENTED
 }
 
-/// `IMiniportTopology::Init`: nothing to set up. The port is not kept: M4 will keep it to
-/// signal jack changes.
+/// `IMiniportTopology::Init`: hands the port's `IPortEvents` to the host link, which reports
+/// jack changes through it.
 unsafe extern "C" fn init(
-    _this: *mut c_void,
+    this: *mut c_void,
     _unknown_adapter: PUNKNOWN,
     _resource_list: PRESOURCELIST,
-    _port: PPORTTOPOLOGY,
+    port: PPORTTOPOLOGY,
 ) -> NTSTATUS {
+    // Two references to the port's `IPortEvents`: the miniport's own, for the jack event's
+    // enables, and the link's, for jack changes.
+    // SAFETY: PortCls passes its live port for the call.
+    let own = unsafe { com::query_borrowed(port.cast(), &guid::IID_IPortEvents) };
+    // SAFETY: as above.
+    let shared = unsafe { com::query_borrowed(port.cast(), &guid::IID_IPortEvents) };
+    let (Some(own), Some(shared)) = (own, shared) else {
+        println!("hostmic: the topology port has no IPortEvents: no jack events");
+        return STATUS_SUCCESS;
+    };
+    // SAFETY: called through the miniport's vtable, at offset 0.
+    let miniport = unsafe { com::object::<TopologyMiniport, 0>(this) };
+    let old = miniport
+        .events
+        .swap(own.into_raw().cast(), Ordering::AcqRel);
+    // SAFETY: a reference a previous `Init` stored, owned by this miniport (or null).
+    drop(unsafe { Unknown::from_raw(old.cast()) });
+    miniport.link.get().set_jack_events(shared);
     STATUS_SUCCESS
 }
 
@@ -131,6 +176,9 @@ unsafe extern "C" fn jack_property(request: PPCPROPERTY_REQUEST) -> NTSTATUS {
     if request.Verb & KSPROPERTY_TYPE_GET == 0 {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
+    // SAFETY: for a filter property, `MajorTarget` is the miniport's `IUnknown`, at offset 0.
+    let miniport = unsafe { com::object::<TopologyMiniport, 0>(request.MajorTarget.cast()) };
+    let connected = miniport.link.get().is_attached();
     // SAFETY: PortCls points `PropertyItem` at the item of `FILTER_PROPERTIES` it matched.
     let Some(item) = (unsafe { request.PropertyItem.as_ref() }) else {
         return STATUS_INVALID_PARAMETER;
@@ -145,16 +193,17 @@ unsafe extern "C" fn jack_property(request: PPCPROPERTY_REQUEST) -> NTSTATUS {
                 GeoLocation: EPcxGeoLocation::eGeoLocFront,
                 GenLocation: EPcxGenLocation::eGenLocPrimaryBox,
                 PortConnection: EPxcPortConnection::ePortConnIntegratedDevice,
-                // Always connected in M3; M4 reports the host's presence here.
-                IsConnected: TRUE.cast_signed(),
+                // Connected while a host is attached.
+                IsConnected: i32::from(connected),
             },
         ),
         JACK_DESCRIPTION2 => ks::reply_multiple_item(
             request,
             KSJACK_DESCRIPTION2 {
                 DeviceStateInfo: 0,
-                // No presence detection yet (M4: JACKDESC2_PRESENCE_DETECT_CAPABILITY).
-                JackCapabilities: 0,
+                // The driver knows whether the jack is connected (the host's presence) and
+                // reports changes: Windows shows the microphone unplugged without a host.
+                JackCapabilities: JACKDESC2_PRESENCE_DETECT_CAPABILITY,
             },
         ),
         _ => STATUS_INVALID_DEVICE_REQUEST,
@@ -229,6 +278,46 @@ const fn jack_item(id: ULONG) -> PCPROPERTY_ITEM {
 static FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; 2]> =
     Shared([jack_item(JACK_DESCRIPTION), jack_item(JACK_DESCRIPTION2)]);
 
+/// `KSEVENT_PINCAPS_JACKINFOCHANGE`: the audio endpoint builder enables it on the microphone
+/// pin to learn when the jack changes (sysvad's jack events).
+static FILTER_EVENTS: Shared<[PCEVENT_ITEM; 1]> = Shared([PCEVENT_ITEM {
+    Set: &guid::KSEVENTSETID_PinCapsChange,
+    Id: KSEVENT_PINCAPS_CHANGENOTIFICATIONS::KSEVENT_PINCAPS_JACKINFOCHANGE.cast_unsigned(),
+    Flags: KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT,
+    Handler: Some(jack_event),
+}]);
+
+/// Enables and disables of the jack change event: an added entry goes to the port's list,
+/// which `HostLink` signals on attach and detach; PortCls removes entries itself.
+unsafe extern "C" fn jack_event(request: PPCEVENT_REQUEST) -> NTSTATUS {
+    // SAFETY: PortCls passes a valid request for the duration of the call.
+    let Some(request) = (unsafe { request.as_ref() }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if request.Verb != PCEVENT_VERB_ADD {
+        return STATUS_SUCCESS;
+    }
+    // SAFETY: for a filter event, `MajorTarget` is the miniport's `IUnknown`, at offset 0;
+    // PortCls holds the miniport for the request.
+    let miniport = unsafe { com::object::<TopologyMiniport, 0>(request.MajorTarget.cast()) };
+    let events = miniport.events.load(Ordering::Acquire);
+    if events.is_null() {
+        // Nothing added: PortCls must not believe the entry is in a list.
+        return STATUS_UNSUCCESSFUL;
+    }
+    // SAFETY: the miniport's own reference to its port's `IPortEvents`, alive with the
+    // miniport.
+    let vtable = unsafe { (*events).lpVtbl };
+    // SAFETY: an interface's vtable is valid for its lifetime.
+    let Some(add) = (unsafe { &*vtable }).AddEventToEventList else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    // SAFETY: a live interface and the entry of this `PCEVENT_VERB_ADD` request: it goes to
+    // the list of this miniport's own port.
+    unsafe { add(events.cast(), request.EventEntry) };
+    STATUS_SUCCESS
+}
+
 static FILTER_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(PCAUTOMATION_TABLE {
     PropertyItemSize: size_ulong::<PCPROPERTY_ITEM>(),
     PropertyCount: 2,
@@ -237,8 +326,8 @@ static FILTER_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(PCAUTOMATION_TABLE
     MethodCount: 0,
     Methods: ptr::null(),
     EventItemSize: size_ulong::<PCEVENT_ITEM>(),
-    EventCount: 0,
-    Events: ptr::null(),
+    EventCount: 1,
+    Events: FILTER_EVENTS.0.as_ptr(),
     Reserved: 0,
 });
 

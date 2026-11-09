@@ -73,10 +73,11 @@ hostmic is experimental: try it in a virtual machine only. In about an hour, fro
 3. **Install it in the VM**: copy the package and the WDK's `devcon.exe` into the VM, trust the
    test certificate, then run `devcon install hostmic_driver.inf root\hostmic` as administrator
    ([docs/test-vm.md](docs/test-vm.md), section 3).
-4. **Use it**: "Microphone (hostmic)" appears in Settings → System → Sound → Input. Record it
+4. **Use it**: without a host, "Microphone (hostmic)" shows as unplugged. Start the test host
+   (`tools/test-host`): the microphone appears in Settings → System → Sound → Input. Record it
    with any application, for example the Sound Recorder: you hear a steady 1 kHz tone (the
-   built-in test signal until the host interface exists). `tools/capture-check` measures it
-   ([docs/test-vm.md](docs/test-vm.md), section 4).
+   driver's built-in test signal, until the host feeds the audio). `tools/capture-check`
+   measures it ([docs/test-vm.md](docs/test-vm.md), sections 4 and 6).
 5. **Remove it**: `devcon remove root\hostmic`.
 
 ## Licensing
