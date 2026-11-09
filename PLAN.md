@@ -42,6 +42,14 @@ Windows audio engine period.
 - **Model:** PortCls with a WaveRT miniport, as in Microsoft's `simpleaudiosample` (capture path
   only) plus a topology miniport. ACX (the newer KMDF-based model) is set aside: Windows 11 only,
   fewer virtual-device examples; to reconsider once the WaveRT version works.
+  *Reconsidered (2026-11-09, the WaveRT version works since M5):* WaveRT stays at least through
+  M8. PortCls is not deprecated (Microsoft recommends ACX for new hardware drivers; WaveRT
+  remains supported and underlies the existing ones); ACX would drop Windows 10; windows-
+  drivers-rs has no ACX bindings either, so it would not spare the generated bindings; and
+  rewriting the driver's core now, while M6 hardens it for signing (M7), would be the riskiest
+  moment for it.
+  What ACX would bring (framework objects instead of the hand-built COM plumbing, less
+  `unsafe`) changes nothing a user sees. To weigh again after M8.
 - **Bindings:** `wdk-sys` 0.5 (windows-drivers-rs, checked 2026-11-08) covers WDM/KMDF, HID, USB,
   storage… but not `portcls.h`, `ks.h` or `ksmedia.h`. A `hostmic-sys` crate (MIT OR Apache-2.0,
   like `wdk-sys`: generated from the WDK headers, no sample code) generates them with bindgen,
@@ -834,6 +842,16 @@ SECURITY.md.
   as too small (0x52 bytes required), while refusing it cost hostmic its endpoint in M3. The
   status returned may be what matters; to investigate, not needed for M4.
 - Windows 10 support: keep it if it costs nothing (WaveRT is fine there; ACX would not be).
+- PortCls and Kernel Streaming bindings upstream: `wdk-sys` is organized by API family behind
+  Cargo features (`gpio`, `hid`, `parallel-ports`, `spb`, `storage`, `usb` in 0.5.2) and has
+  none for audio; no windows-drivers-rs issue mentions PortCls or audio (searched
+  2026-11-09). `hostmic-sys`'s generated bindings (MIT OR Apache-2.0, from Microsoft's headers,
+  depending on nothing else in hostmic) could become an `audio` feature there, where Rust
+  driver authors would find them and where they would follow the WDK; its C helper
+  (`map_user.c`) and the driver's COM plumbing are hostmic's own and would stay. Not a
+  repository of hostmic's: it would double the CI and releases for one maintainer while the
+  bindings' surface may still change (M6). After M7, with the bindings proven by a signed
+  driver: open a discussion on windows-drivers-rs (the maintainer posts it).
 - ARM64: later. The same driver rebuilt for `aarch64`, with the same signing requirement, and
   testing needs ARM64 hardware (Hyper-V on x64 does not run Windows on ARM): after signing,
   not before.
