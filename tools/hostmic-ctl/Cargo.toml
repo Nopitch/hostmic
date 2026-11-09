@@ -1,7 +1,7 @@
 [package]
 name = "hostmic-ctl"
 version = "0.1.0"
-description = "Inspects the hostmic driver through its host interface: what it offers, and later its counters"
+description = "Inspects the hostmic driver through its host interface: what it offers, the stream and the counters"
 license = "MIT OR Apache-2.0"
 edition.workspace = true
 publish.workspace = true
@@ -12,21 +12,12 @@ name = "hostmic-ctl"
 path = "src/main.rs"
 
 [dependencies]
-hostmic-abi = { path = "../../abi" }
-windows = { version = "0.62.2", features = [
-    "Win32_Devices_DeviceAndDriverInstallation",
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-] }
+hostmic = { path = "../../host" }
 
 [lints.rust]
 missing_docs = "warn"
-unsafe_op_in_unsafe_fn = "forbid"
+unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-multiple_unsafe_ops_per_block = "forbid"
-undocumented_unsafe_blocks = "forbid"

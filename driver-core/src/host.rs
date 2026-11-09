@@ -8,8 +8,7 @@
 //! The layouts are `hostmic-abi`'s; what the driver accepts is decided here.
 
 use hostmic_abi::{
-    ABI_VERSION, AdvanceRequest, AttachRequest, FormatRange, Info, Reason, SAMPLE_TYPES_ALL,
-    SampleType,
+    ABI_VERSION, AdvanceRequest, AttachRequest, FormatRange, Info, Reason, SampleType,
 };
 
 use crate::format::{BYTES_PER_SECOND, CHANNELS, SAMPLE_RATE};
@@ -195,36 +194,15 @@ pub fn attach(input: &[u8], caller_is_wow64: bool) -> Result<Attach, Rejection> 
             });
         }
     };
-    if !is_valid(&request.formats) {
+    // The range arithmetic is the ABI's, which hosts check with before attaching.
+    if !request.formats.is_valid() {
         return Err(Rejection::InvalidRange);
     }
-    let formats = intersect(&request.formats, &SUPPORTED).ok_or(Rejection::NoCommonFormat)?;
+    let formats = request
+        .formats
+        .intersect(&SUPPORTED)
+        .ok_or(Rejection::NoCommonFormat)?;
     Ok(Attach { event, formats })
-}
-
-/// Whether `range` holds at least one format and only known sample types.
-#[must_use]
-pub const fn is_valid(range: &FormatRange) -> bool {
-    range.min_rate != 0
-        && range.min_rate <= range.max_rate
-        && range.min_channels != 0
-        && range.min_channels <= range.max_channels
-        && range.sample_types != 0
-        && range.sample_types & !SAMPLE_TYPES_ALL == 0
-}
-
-/// The formats in both `a` and `b`, or `None` when there are none. Both must be valid
-/// ([`is_valid`]); the result then is.
-#[must_use]
-pub fn intersect(a: &FormatRange, b: &FormatRange) -> Option<FormatRange> {
-    let range = FormatRange {
-        min_rate: a.min_rate.max(b.min_rate),
-        max_rate: a.max_rate.min(b.max_rate),
-        min_channels: a.min_channels.max(b.min_channels),
-        max_channels: a.max_channels.min(b.max_channels),
-        sample_types: a.sample_types & b.sample_types,
-    };
-    is_valid(&range).then_some(range)
 }
 
 /// The stream's generation and position, packed in one 64-bit word so that the driver reads
@@ -394,7 +372,7 @@ mod tests {
         assert_eq!(info.abi_version, ABI_VERSION);
         assert_eq!(info.formats, SUPPORTED);
         assert_eq!(info.max_buffer_bytes, 192_000);
-        assert!(is_valid(&SUPPORTED));
+        assert!(SUPPORTED.is_valid());
     }
 
     #[test]
@@ -516,15 +494,15 @@ mod tests {
     #[test]
     fn intersections() {
         let host = valid_attach().formats;
-        assert_eq!(intersect(&host, &SUPPORTED), Some(SUPPORTED));
-        assert_eq!(intersect(&SUPPORTED, &host), Some(SUPPORTED));
-        assert_eq!(intersect(&host, &host), Some(host));
+        assert_eq!(host.intersect(&SUPPORTED), Some(SUPPORTED));
+        assert_eq!(SUPPORTED.intersect(&host), Some(SUPPORTED));
+        assert_eq!(host.intersect(&host), Some(host));
         let disjoint = FormatRange {
             min_rate: 8_000,
             max_rate: 16_000,
             ..host
         };
-        assert_eq!(intersect(&disjoint, &SUPPORTED), None);
+        assert_eq!(disjoint.intersect(&SUPPORTED), None);
     }
 
     #[test]

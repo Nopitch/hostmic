@@ -11,25 +11,8 @@
 
 use std::{env, process::ExitCode};
 
-use hostmic_abi::{
-    GUID_DEVINTERFACE_HOSTMIC_HOST, IOCTL_ADVANCE, IOCTL_ATTACH, IOCTL_DETACH, IOCTL_GET_INFO,
-    IOCTL_GET_STATS, IOCTL_GET_STREAM, Info, Reason, SampleType, State, Stats, StreamState,
-    function,
-};
-use windows::{
-    Win32::{
-        Devices::DeviceAndDriverInstallation::{
-            CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
-            CM_Get_Device_Interface_ListW, CR_SUCCESS,
-        },
-        Foundation::{CloseHandle, GENERIC_READ, HANDLE},
-        Storage::FileSystem::{
-            CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING,
-        },
-        System::IO::DeviceIoControl,
-    },
-    core::{GUID, HSTRING, PCWSTR},
+use hostmic::{
+    Device, Error, Info, Reason, SampleType, State, Stats, StreamState, interfaces, request_name,
 };
 
 const USAGE: &str = "usage: hostmic-ctl info | status";
@@ -53,7 +36,7 @@ fn main() -> ExitCode {
 
 /// `hostmic-ctl info`.
 fn info() -> ExitCode {
-    let paths = match interface_paths() {
+    let paths = match interfaces() {
         Ok(paths) => paths,
         Err(error) => {
             eprintln!("cannot list host interfaces: {error}");
@@ -61,7 +44,7 @@ fn info() -> ExitCode {
         }
     };
     if paths.is_empty() {
-        eprintln!("no hostmic host interface: is the driver installed and started?");
+        eprintln!("{}", Error::NotInstalled);
         return ExitCode::FAILURE;
     }
     let mut failed = false;
@@ -85,7 +68,7 @@ fn info() -> ExitCode {
 
 /// `hostmic-ctl status`.
 fn status() -> ExitCode {
-    let paths = match interface_paths() {
+    let paths = match interfaces() {
         Ok(paths) => paths,
         Err(error) => {
             eprintln!("cannot list host interfaces: {error}");
@@ -93,7 +76,7 @@ fn status() -> ExitCode {
         }
     };
     if paths.is_empty() {
-        eprintln!("no hostmic host interface: is the driver installed and started?");
+        eprintln!("{}", Error::NotInstalled);
         return ExitCode::FAILURE;
     }
     let mut failed = false;
@@ -157,9 +140,12 @@ fn print_stats(stats: &Stats) {
             || format!("code {}", stats.last_reason),
             |r| format!("{r:?}"),
         );
+        let request = request_name(stats.last_request).map_or_else(
+            || format!("function {:#x}", stats.last_request),
+            str::to_owned,
+        );
         println!(
-            "  last refusal  {}: {reason}, status {:#010x}",
-            request_name(stats.last_request),
+            "  last refusal  {request}: {reason}, status {:#010x}",
             stats.last_status
         );
     }
@@ -209,156 +195,5 @@ fn sample_types(mask: u32) -> String {
         format!("none ({mask:#x})")
     } else {
         names.join(", ")
-    }
-}
-
-/// The paths of the present host interfaces.
-fn interface_paths() -> Result<Vec<String>, String> {
-    let guid = GUID::from_values(
-        GUID_DEVINTERFACE_HOSTMIC_HOST.data1,
-        GUID_DEVINTERFACE_HOSTMIC_HOST.data2,
-        GUID_DEVINTERFACE_HOSTMIC_HOST.data3,
-        GUID_DEVINTERFACE_HOSTMIC_HOST.data4,
-    );
-    // The list may grow between the two calls: retry a few times, as Microsoft's samples do.
-    for _ in 0..4 {
-        let mut length = 0u32;
-        // SAFETY: a writable length and a valid GUID; no device instance filter.
-        let status = unsafe {
-            CM_Get_Device_Interface_List_SizeW(
-                &raw mut length,
-                &raw const guid,
-                PCWSTR::null(),
-                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
-            )
-        };
-        if status != CR_SUCCESS {
-            return Err(format!(
-                "CM_Get_Device_Interface_List_SizeW: CONFIGRET {}",
-                status.0
-            ));
-        }
-        let mut buffer = vec![0u16; length as usize];
-        // SAFETY: a valid GUID and a buffer of the size just returned.
-        let status = unsafe {
-            CM_Get_Device_Interface_ListW(
-                &raw const guid,
-                PCWSTR::null(),
-                &mut buffer,
-                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
-            )
-        };
-        if status == CR_SUCCESS {
-            return Ok(buffer
-                .split(|&unit| unit == 0)
-                .filter(|path| !path.is_empty())
-                .map(String::from_utf16_lossy)
-                .collect());
-        }
-    }
-    Err("the interface list kept changing".to_owned())
-}
-
-/// An open host interface.
-struct Device(HANDLE);
-
-impl Device {
-    /// Opens `path` for reading: enough for the requests that only read.
-    fn open(path: &str) -> Result<Self, windows::core::Error> {
-        let path = HSTRING::from(path);
-        // SAFETY: a NUL-terminated path; no security attributes or template.
-        let handle = unsafe {
-            CreateFileW(
-                &path,
-                GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            )
-        }?;
-        Ok(Self(handle))
-    }
-
-    /// A request without input whose reply is exactly `N` bytes.
-    fn read<const N: usize>(&self, code: u32) -> Result<[u8; N], windows::core::Error> {
-        let mut reply = [0u8; N];
-        let mut returned = 0u32;
-        // SAFETY: an open handle; no input; an output buffer of `N` bytes that lives through
-        // the synchronous call; a writable byte count.
-        unsafe {
-            DeviceIoControl(
-                self.0,
-                code,
-                None,
-                0,
-                Some(reply.as_mut_ptr().cast()),
-                u32::try_from(N).unwrap_or(u32::MAX),
-                Some(&raw mut returned),
-                None,
-            )
-        }?;
-        if returned as usize != N {
-            return Err(windows::core::Error::new(
-                windows::core::HRESULT(0x8000_FFFF_u32.cast_signed()),
-                format!(
-                    "{} returned {returned} bytes, expected {N}",
-                    request_name(function(code))
-                ),
-            ));
-        }
-        Ok(reply)
-    }
-
-    /// `IOCTL_GET_INFO`.
-    fn info(&self) -> Result<Info, windows::core::Error> {
-        self.read(IOCTL_GET_INFO)
-            .map(|bytes| Info::from_bytes(&bytes))
-    }
-
-    /// `IOCTL_GET_STREAM`.
-    fn stream(&self) -> Result<StreamState, windows::core::Error> {
-        self.read(IOCTL_GET_STREAM)
-            .map(|bytes| StreamState::from_bytes(&bytes))
-    }
-
-    /// `IOCTL_GET_STATS`.
-    fn stats(&self) -> Result<Stats, windows::core::Error> {
-        self.read(IOCTL_GET_STATS)
-            .map(|bytes| Stats::from_bytes(&bytes))
-    }
-}
-
-/// The name of a request by its control code's function number.
-fn request_name(function_number: u16) -> String {
-    [
-        IOCTL_GET_INFO,
-        IOCTL_ATTACH,
-        IOCTL_GET_STREAM,
-        IOCTL_ADVANCE,
-        IOCTL_DETACH,
-        IOCTL_GET_STATS,
-    ]
-    .into_iter()
-    .zip([
-        "GET_INFO",
-        "ATTACH",
-        "GET_STREAM",
-        "ADVANCE",
-        "DETACH",
-        "GET_STATS",
-    ])
-    .find(|(code, _)| function(*code) == function_number)
-    .map_or_else(
-        || format!("function {function_number:#x}"),
-        |(_, name)| name.to_owned(),
-    )
-}
-
-impl Drop for Device {
-    fn drop(&mut self) {
-        // SAFETY: a handle this value owns, closed once.
-        let _ = unsafe { CloseHandle(self.0) };
     }
 }

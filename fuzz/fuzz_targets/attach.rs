@@ -22,7 +22,7 @@ fuzz_target!(|data: &[u8]| {
     assert!(attach.event != 0 && u64::from(attach.event) <= EVENT_MAX);
 
     let formats = attach.formats;
-    assert!(host::is_valid(&formats));
+    assert!(formats.is_valid());
     assert!(formats.min_rate >= SUPPORTED.min_rate && formats.max_rate <= SUPPORTED.max_rate);
     assert!(
         formats.min_channels >= SUPPORTED.min_channels
@@ -30,5 +30,5 @@ fuzz_target!(|data: &[u8]| {
     );
     assert_eq!(formats.sample_types & !SUPPORTED.sample_types, 0);
     // The offered formats are also ones the host asked for.
-    assert_eq!(host::intersect(&formats, &request.formats), Some(formats));
+    assert_eq!(formats.intersect(&request.formats), Some(formats));
 });
