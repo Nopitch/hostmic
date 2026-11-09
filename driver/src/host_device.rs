@@ -393,7 +393,7 @@ pub unsafe fn dispatch(device: PDEVICE_OBJECT, irp: *mut IRP) -> NTSTATUS {
             // was still in flight when the handle was closed.
             // SAFETY: the caller's contract.
             let this = unsafe { this(device) };
-            this.shared.get().detach(stack.FileObject);
+            this.shared.get().detach(stack.FileObject, None);
             if u32::from(stack.MajorFunction) == IRP_MJ_CLOSE {
                 // The last request on this handle: it no longer holds the device back.
                 this.open_files.fetch_sub(1, Ordering::SeqCst);
@@ -858,7 +858,10 @@ unsafe fn device_control(
                 host::no_input(input)
                     .map_err(Refusal::Rejected)
                     .and_then(|()| {
-                        if shared.detach(file) {
+                        // SAFETY: any IRQL; the requestor's process (this runs in the calling
+                        // thread, the host interface being the top of its stack).
+                        let requestor = unsafe { IoGetCurrentProcess() };
+                        if shared.detach(file, Some(requestor)) {
                             Ok(Reply::EMPTY)
                         } else {
                             Err(Refusal::NotHost)
@@ -948,7 +951,7 @@ fn count_refusal(shared: &HostLink, code: u32, name: &str, refusal: &Refusal) ->
             current_process()
         ),
         Refusal::NotHost => println!(
-            "hostmic: {name} refused: not the attached host's handle, process {}",
+            "hostmic: {name} refused: not the attached host's handle and process, process {}",
             current_process()
         ),
     }

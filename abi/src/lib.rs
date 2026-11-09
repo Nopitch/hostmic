@@ -83,7 +83,8 @@ pub const IOCTL_GET_INFO: u32 = ctl_code(
 );
 
 /// Attaches the calling process as the host: [`AttachRequest`] in, [`AttachReply`] out. One
-/// host at a time; the attachment ends with [`IOCTL_DETACH`] or when the handle is closed.
+/// host at a time; the attachment ends with [`IOCTL_DETACH`] from the host's process, when every
+/// handle to the host's file object is closed, or when the host's process ends.
 pub const IOCTL_ATTACH: u32 = ctl_code(
     FILE_DEVICE_UNKNOWN,
     FUNCTION_BASE + 1,
@@ -117,7 +118,8 @@ pub const IOCTL_ADVANCE: u32 = ctl_code(
 );
 
 /// Ends the attachment: the buffer is unmapped from the host and the microphone shows
-/// unplugged. No input, no output. Attached host only.
+/// unplugged. No input, no output. Attached host only (its handle and process): another process
+/// holding a duplicate of the host's handle cannot unmap the buffer from under the host.
 pub const IOCTL_DETACH: u32 = ctl_code(
     FILE_DEVICE_UNKNOWN,
     FUNCTION_BASE + 4,
@@ -401,7 +403,10 @@ impl AttachRequest {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AttachReply {
-    /// The buffer's address in the host's process; it stays mapped until the host detaches.
+    /// The buffer's address in the host's process. It stays mapped while the host may write into
+    /// it: until `DETACH` from the host's process, or until every handle to the host's file
+    /// object is closed (or the host's process ends); nothing else undoes it. A host that closes
+    /// its handle while its `ATTACH` is in flight receives an address already unmapped.
     pub buffer: u64,
     /// The buffer's size in bytes; a stream uses its first [`StreamState::buffer_frames`]
     /// frames.

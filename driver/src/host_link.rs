@@ -14,11 +14,20 @@
 //!
 //! The link holds the adapter's reference to the shared buffer ([`crate::shared_buffer`]), and
 //! the attached host's mapping of it. A user mapping must be undone in its process before the
-//! process ends: on `DETACH`, on the handle's cleanup or close (in whatever process closes it,
-//! attaching to the host's), and, for a host that dies while another process holds a duplicate
-//! of its handle, from the process notification routine ([`driver_init`]), which runs in the
-//! context of the dying process's last thread. Attaching and detaching are serialized by a
-//! guarded mutex, so that the notification routine returns only once the mapping is undone.
+//! process ends: on `DETACH` from the host's own process, on the handle's cleanup or close (in
+//! whatever process closes it, attaching to the host's), and, for a host that dies while
+//! another process holds a duplicate of its handle, from the process notification routine
+//! ([`driver_init`]), which runs in the context of the dying process's last thread. Attaching
+//! and detaching are serialized by a guarded mutex, so that the notification routine returns
+//! only once the mapping is undone.
+//!
+//! Nothing else undoes the mapping while the host lives and holds its handle: the host writes
+//! into it without asking the driver, so it must stay mapped for as long as the host may
+//! write (`hostmic_abi::AttachReply::buffer`). The adapter's removal ([`HostLink::shutdown`])
+//! cannot find such a host: the PnP manager sends `IRP_MN_REMOVE_DEVICE` to a device's
+//! children before the device itself, and the host interface's device gets it only once every
+//! handle to it is closed (it refuses a query-remove while one is open, and after a surprise
+//! removal the PnP manager waits for the handles).
 //!
 //! The link lives in the adapter's device extension, whose memory outlives its holders: an
 //! open pin keeps the adapter's device object alive until the stream is released; the host
@@ -219,6 +228,9 @@ impl HostLink {
         let (detached, buffer) = with_lock(&self.host_lock, || {
             // `attach` checks this under the same lock.
             self.registered.store(false, Ordering::Release);
+            // Not expected (see the module documentation): every handle to the host interface
+            // is closed, hence its host detached, before the adapter's removal. Undone anyway
+            // rather than left behind, and logged.
             let attached = !self.host.load(Ordering::Acquire).is_null();
             if attached {
                 println!("hostmic: adapter removed with a host attached");
@@ -691,9 +703,19 @@ impl HostLink {
 
     /// Detaches the host behind `file`, if it is the attached one; returns whether it was.
     /// `PASSIVE_LEVEL`, in any process: the mapping is undone in the host's.
-    pub fn detach(&self, file: *mut FILE_OBJECT) -> bool {
+    ///
+    /// `requestor` is the process that sent `DETACH`, which must be the host's: a process
+    /// holding a duplicate of the host's handle (an inherited one, say) may not unmap the
+    /// buffer while the host still writes into it. `None` for the handle's cleanup and close,
+    /// which run once every handle to `file` is closed, in whatever process closed the last.
+    pub fn detach(&self, file: *mut FILE_OBJECT, requestor: Option<PEPROCESS>) -> bool {
         let detached = with_lock(&self.host_lock, || {
             if file.is_null() || self.host.load(Ordering::Acquire) != file {
+                return false;
+            }
+            if let Some(requestor) = requestor
+                && self.process.load(Ordering::Acquire) != requestor
+            {
                 return false;
             }
             self.release_host();
