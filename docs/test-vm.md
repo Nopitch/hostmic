@@ -173,11 +173,12 @@ Expected: the interface is listed, and opening it fails with `Access is denied.
 (0x80070005)`. Disabling the child device (`Disable-PnpDevice`) makes the interface disappear
 (`hostmic-ctl info` exits with 1); enabling it again makes it answer again.
 
-`tools/test-host` attaches as the host and plays a 1 kHz tone at -6.02 dBFS: while the stream
-runs, a thread registered with MMCSS writes the frames due by the performance counter into the
-shared buffer and advances the position (`ADVANCE`) about once a millisecond. It prints the
-stream's state at each change, its progress once a second, and the driver's counters at the
-end. Build it on the host (`cargo build -p hostmic-test-host --release`), copy
+`tools/test-host` attaches as the host and plays a 1 kHz tone at -6.02 dBFS with the `hostmic`
+crate's reference loop (`hostmic::Player`): while the stream runs, a thread registered with
+MMCSS writes the frames due by the performance counter into the shared buffer, about a
+millisecond per `ADVANCE`. It prints the stream (through a second, read-only handle) when it
+changed since the last second, the player's counters once a second, and the driver's counters
+at the end. Build it on the host (`cargo build -p hostmic-test-host --release`), copy
 `target\release\test-host.exe` to `C:\hostmic\`, then in the VM run it in the background while
 recording:
 
@@ -190,38 +191,45 @@ Start-Sleep 12; C:\hostmic\hostmic-ctl.exe status
 Receive-Job $c -Wait; $p | Wait-Process; Get-Content C:\hostmic\h.txt
 ```
 
-Expected: the second `test-host` fails with `ATTACH: The requested resource is in use.
-(0x800700AA)` (one host at a time). `capture-check` passes as in section 4.
-`hostmic-ctl status` shows the stream `running` with its buffer (960 frames, packets of 480 in
-shared mode), its position, and the counters: frames advanced, packets completed, none
-skipped, no request refused. The first host prints `attached` with the address of the shared
-buffer in its process (page-aligned, 192000 bytes), `thread MMCSS Pro Audio`, one line per
-change with a growing generation (`stopped`, `paused`, `running`, `paused`, `stopped`, `no
-stream`), `playing` lines with `0 late` and a longest gap of a few milliseconds, the driver's
-counters, then `detached`. A `late` line means the host was not scheduled for more than a
-buffer (20 ms in shared mode): the engine loses those frames, and `capture-check` reports a
-discontinuity. A host killed with `Stop-Process`, or one that exits without detaching
-(`--no-detach`), is detached when its handle closes: the next `test-host` attaches.
+Expected: the second `test-host` fails with `another host is attached to this microphone` (one
+host at a time). `capture-check` passes as in section 4. `hostmic-ctl status` shows the stream
+`running` with its buffer (960 frames, packets of 480 in shared mode), its position, and the
+counters: frames advanced, packets completed, none skipped, no request refused. The first host
+prints `attached` with the buffer's size (192000 bytes) and the formats offered, `stream` lines
+with a growing generation (`stopped`, `running`, `stopped`…), `playing` lines with `0 late`, a
+longest gap of a few milliseconds and no `(no MMCSS)`, the driver's counters, then `detached`.
+A nonzero `late` means the host was not scheduled for more than a buffer (20 ms in shared
+mode): the engine loses those frames, and `capture-check` reports a discontinuity. A host killed
+with `Stop-Process` is detached when its handle closes: the next `test-host` attaches.
 
-The host's mapping must never outlive it, whoever holds its handle. `--holder` starts a process
-(`ping`) that inherits the host's handle; `--close-own-handle` also closes the host's own:
+The driver's handle rules are checked with `tools/handle-check` (raw requests: the crate's
+`Host` always detaches on drop). Build it (`cargo build -p hostmic-handle-check --release`) and
+copy `target\release\handle-check.exe` to `C:\hostmic\`. Closing the host's handle detaches it;
+the host's mapping must never outlive it, whoever holds its handle; and it must last while the
+host lives:
 
 ```powershell
-# The host dies, the holder keeps the handle: the host is detached at its exit.
-$p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','60','--holder' -RedirectStandardOutput C:\hostmic\a.txt -PassThru -WindowStyle Hidden
+# The host closes its only handle without DETACH: its mapping goes.
+C:\hostmic\handle-check.exe --seconds 3 --close
+# The host dies, a holder (ping) keeps an inherited handle: the host is detached at its exit.
+$p = Start-Process C:\hostmic\handle-check.exe -ArgumentList '--seconds','60','--holder' -RedirectStandardOutput C:\hostmic\a.txt -PassThru -WindowStyle Hidden
 Start-Sleep 3; Stop-Process $p -Force; Start-Sleep 2
 C:\hostmic\test-host.exe --seconds 1
 Get-Process ping | Stop-Process -Force
 # The holder closes the last handle while the host lives: the host's mapping goes.
-$p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','8','--holder','--close-own-handle' -RedirectStandardOutput C:\hostmic\b.txt -PassThru -WindowStyle Hidden
+$p = Start-Process C:\hostmic\handle-check.exe -ArgumentList '--seconds','8','--holder','--close-own-handle' -RedirectStandardOutput C:\hostmic\b.txt -PassThru -WindowStyle Hidden
 Start-Sleep 3; Get-Process ping | Stop-Process -Force; $p | Wait-Process; Get-Content C:\hostmic\b.txt
+# A child that inherits the host's handle sends DETACH: refused, the mapping stays.
+C:\hostmic\handle-check.exe --seconds 3 --detach-from-child
 ```
 
-Expected: after the first kill, the driver logs `the host's process exited with its handle
-still open elsewhere` and `host detached`, the microphone is unplugged, and the next
-`test-host` attaches; in the second case `b.txt` shows the mapping `mapped`, then `unmapped`
-once the holder is killed, while the host still runs. A holder left running keeps a handle to
-the interface open, which makes `devcon remove` answer "Removed on reboot" (below).
+Expected: `--close` shows the mapping `unmapped` right after the close. After the kill, the
+driver logs `the host's process exited with its handle still open elsewhere` and `host
+detached`, the microphone is unplugged, and the next `test-host` attaches; `b.txt` shows the
+mapping `mapped`, then `unmapped` once the holder is killed, while the host still runs.
+`--detach-from-child` prints the child's `DETACH` refused, the mapping `mapped`, then
+`detached` (its own `DETACH`). A holder left running keeps a handle to the interface open,
+which makes `devcon remove` answer "Removed on reboot" (below).
 
 The microphone's jack follows the host. The endpoint's state is in the registry, under
 `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{…}` (the key whose

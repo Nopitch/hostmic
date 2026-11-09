@@ -3,18 +3,24 @@
 //! Feeds the hostmic virtual microphone from a user-mode application, the host: Windows
 //! applications then record what the host writes, at the host's pace.
 //!
-//! This is the low layer: the host interface of `hostmic-abi` made safe.
+//! Two layers:
 //!
-//! - [`interfaces`] lists the microphones' host interfaces; [`Device`] reads one (what the
-//!   driver offers, the stream, the counters), from any process allowed to open it.
-//! - [`Host::attach`] makes this process a microphone's host. The driver maps a ring buffer
+//! - **[`Player`], the reference loop**, for most hosts: it runs a real-time thread (MMCSS,
+//!   paced by the performance counter) that has a callback fill `f32` blocks and writes them
+//!   in the stream's format. `examples/tone.rs` plays a tone with it.
+//! - **The low layer**, the host interface of `hostmic-abi` made safe, for hosts with a loop
+//!   of their own: [`interfaces`] lists the microphones' host interfaces; [`Device`] reads
+//!   one (what the driver offers, the stream, the counters), from any process allowed to open
+//!   it; [`Host::attach`] makes this process a microphone's host. The driver maps a ring buffer
 //!   into it; [`Host::write`] copies frames into the ring and advances the stream position,
 //!   [`Host::stream`] and [`Host::wait`] follow the stream's state. Dropping the [`Host`]
 //!   detaches.
 //!
 //! A host writes in real time: call [`Host::write`] from a thread that does not allocate, lock
 //! or perform I/O while the stream runs (PLAN.md, "Real-time rule"). `write` itself allocates
-//! nothing.
+//! nothing, nor does the [`Player`]'s loop around its callback.
+//!
+//! The low layer by hand:
 //!
 //! ```no_run
 //! use hostmic::{Advance, FormatRange, Host, SampleType};
@@ -57,16 +63,21 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("hostmic hosts are 64-bit processes: the driver refuses to attach 32-bit ones");
 
+mod clock;
+mod convert;
 mod device;
 mod error;
+mod player;
 mod ring;
 pub mod stream;
 
 pub use device::{Advance, Device, Host, first_interface, interfaces};
 pub use error::Error;
 pub use hostmic_abi::{
-    ABI_VERSION, Format, FormatRange, Info, Reason, SampleType, State, Stats, StreamState,
+    ABI_VERSION, Format, FormatRange, Info, Reason, SAMPLE_TYPES_ALL, SampleType, State, Stats,
+    StreamState,
 };
+pub use player::{Block, Player, PlayerStats};
 
 /// The name of a request by its control code's function number (as
 /// [`Stats::last_request`] reports it), or `None` for an unknown one.

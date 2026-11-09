@@ -309,6 +309,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostmic-handle-check"
+version = "0.1.0"
+dependencies = [
+ "hostmic-abi",
+ "windows",
+]
+
+[[package]]
 name = "hostmic-sys"
 version = "0.1.0"
 dependencies = [
@@ -322,8 +330,7 @@ dependencies = [
 name = "hostmic-test-host"
 version = "0.1.0"
 dependencies = [
- "hostmic-abi",
- "windows",
+ "hostmic",
 ]
 
 [[package]]

@@ -528,6 +528,31 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   with `Disable-PnpDevice` and `Enable-PnpDevice`: `main`'s driver refuses `hostmic-ctl info`
   after the enable (access denied), the fixed one answers, and `test-host` attaches and
   detaches; `devcon remove` unloads both.
+  *The reference loop (2026-11-09):* `hostmic::Player` (`host/src/player.rs`) runs a thread
+  registered with MMCSS ("Pro Audio", reverted on every exit, a panic included) that owns the
+  `Host` and waits on the stop event, the stream's event and a high-resolution waitable timer
+  (Windows 10 1803 and later, required), armed at 1 ms only while the stream accepts frames.
+  Each tick it computes the frames due by the performance counter (`clock`), has the callback
+  fill them in one `f32` block (`Block`: format, position, the performance counter value its
+  first frame is due at, for a host comparing clocks), converts them (`convert`: clamped, NaN
+  as 0) and writes them in near-equal parts of one to two milliseconds, each copied just before
+  its own `ADVANCE`: the driver takes the size of the last `ADVANCE` as how far the host writes
+  ahead, so a late tick sent as one large request made it skip a packet the engine could still
+  read (the independent review's main finding; the first split, into fixed 1 ms chunks plus a
+  remainder, doubled the requests with 1-frame tails). `PlayerStats` (atomic counters, read from
+  any thread): frames written, advances, stale refusals, late events, longest gap between two
+  writing wake-ups, stream state, MMCSS, finished. `examples/tone.rs` plays a tone;
+  `tools/test-host` plays capture-check's tone through the `Player` and follows the stream
+  through a read-only `Device`; its handle-rule modes moved to `tools/handle-check` (raw
+  requests: the crate's `Host` always detaches on drop), with a new `--close` (the only handle
+  closed without `DETACH`, while the host lives) replacing `test-host --no-detach`;
+  `--close` and `--detach-from-child` now check their own outcome. In the VM, three runs of
+  `test-host` with a 30 s `capture-check`: `PASS` each time (1000.00 Hz, 0 glitch, no
+  discontinuity), 0 late, no packet skipped, no request refused, about 70 frames per `ADVANCE`
+  with the final split; the longest gap was 2.5, 2.6 and 8.7 ms. The "below 2.6 ms" criterion
+  is therefore not met reliably: a single maximum in a VM measures the hypervisor's scheduling
+  as much as the loop (the 8.7 ms gap cost nothing: the shared-mode buffer is 20 ms). The
+  measurements pull request reports the gap's distribution instead of one maximum.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
