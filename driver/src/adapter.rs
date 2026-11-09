@@ -23,6 +23,7 @@ use wdk_sys::{
 };
 
 use crate::com::Unknown;
+use crate::host_link::{HostLink, LinkRef};
 use crate::ks::size_ulong;
 use crate::{host_device, topology, wave};
 
@@ -30,9 +31,14 @@ use crate::{host_device, topology, wave};
 /// `PORT_CLASS_DEVICE_EXTENSION_SIZE`, `64 * sizeof(ULONG_PTR)`.
 const PORT_CLASS_DEVICE_EXTENSION_SIZE: usize = 64 * size_of::<usize>();
 
-/// Device extension size: PortCls's part, then [`Adapter`].
-const DEVICE_EXTENSION_SIZE: ULONG =
-    size_ulong::<[u8; PORT_CLASS_DEVICE_EXTENSION_SIZE]>() + size_ulong::<Adapter>();
+/// Offset of the [`HostLink`] in the device extension, after PortCls's part and [`Adapter`]. Kept
+/// out of [`Adapter`], which PnP requests borrow mutably, because the stream and the host
+/// interface share it.
+const LINK_OFFSET: usize = PORT_CLASS_DEVICE_EXTENSION_SIZE + size_of::<Adapter>();
+const _: () = assert!(LINK_OFFSET.is_multiple_of(align_of::<HostLink>()));
+
+/// Device extension size: PortCls's part, [`Adapter`], then [`HostLink`].
+const DEVICE_EXTENSION_SIZE: ULONG = size_ulong::<[u8; LINK_OFFSET]>() + size_ulong::<HostLink>();
 
 /// Subdevices of the adapter: the topology filter and the wave filter.
 const MAX_SUBDEVICES: ULONG = 2;
@@ -75,6 +81,25 @@ unsafe fn adapter<'a>(device: PDEVICE_OBJECT) -> &'a mut Adapter {
     unsafe { &mut *adapter }
 }
 
+/// The adapter's [`HostLink`].
+///
+/// # Safety
+///
+/// `device` is the FDO created by `PcAddAdapterDevice` in [`add_device`]. The link lives as
+/// long as the device object's extension.
+pub(crate) unsafe fn link(device: PDEVICE_OBJECT) -> LinkRef {
+    // SAFETY: `device` is a valid device object (caller's contract).
+    let extension = unsafe { (*device).DeviceExtension };
+    // The extension holds a `HostLink` at `LINK_OFFSET`, zeroed by `IoCreateDevice` (its
+    // initial state) and only ever accessed through shared references.
+    // Never null: `PcAddAdapterDevice` allocated the extension (`DEVICE_EXTENSION_SIZE` bytes).
+    let link = NonNull::new(extension.wrapping_byte_add(LINK_OFFSET).cast::<HostLink>())
+        .unwrap_or(NonNull::dangling());
+    // SAFETY: the adapter's link, in the extension, which outlives the stream and the host
+    // interface's device (`host_link` module documentation).
+    unsafe { LinkRef::new(link) }
+}
+
 /// `AddDevice`: PnP hands the driver a new device; PortCls creates its FDO.
 ///
 /// # Safety
@@ -105,8 +130,11 @@ unsafe extern "C" fn start_device(
     irp: PIRP,
     resources: PRESOURCELIST,
 ) -> NTSTATUS {
+    // SAFETY: `device` is the adapter's FDO.
+    let link = unsafe { link(device) };
+    link.get().init();
     // SAFETY: `device`, `irp` and `resources` come from PortCls for this start request.
-    let status = match unsafe { install_filters(device, irp, resources) } {
+    let status = match unsafe { install_filters(device, irp, resources, link) } {
         Ok((topology_port, wave_port)) => {
             // SAFETY: `device` is the adapter's FDO, in a PnP request.
             let adapter = unsafe { adapter(device) };
@@ -114,7 +142,7 @@ unsafe extern "C" fn start_device(
             adapter.wave_port = Some(wave_port);
             if adapter.host.is_none() {
                 // SAFETY: `device` is the adapter's FDO, at PASSIVE_LEVEL.
-                match unsafe { host_device::create(device) } {
+                match unsafe { host_device::create(device, link) } {
                     Ok(host) => {
                         adapter.host = Some(host);
                         // SAFETY: as above.
@@ -145,6 +173,7 @@ unsafe fn install_filters(
     device: PDEVICE_OBJECT,
     irp: PIRP,
     resources: PRESOURCELIST,
+    link: LinkRef,
 ) -> Result<(Unknown, Unknown), NTSTATUS> {
     let topology_miniport = topology::new().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     // SAFETY: the caller's contract.
@@ -158,7 +187,7 @@ unsafe fn install_filters(
             &topology_miniport,
         )
     }?;
-    let wave_miniport = wave::new().ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    let wave_miniport = wave::new(link).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     // SAFETY: the caller's contract.
     let wave_port = unsafe {
         install_subdevice(

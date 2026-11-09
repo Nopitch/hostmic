@@ -71,7 +71,10 @@ of the build.
    with its own security descriptor (`IoCreateDeviceSecure`, `FILE_DEVICE_SECURE_OPEN`); opens
    relative to another handle refused; its requests, IRPs and fast I/O alike, never reach
    PortCls. IOCTL input validation in pure Rust, unit-tested and fuzzed (PLAN.md, M4); user
-   buffers copied once (`METHOD_BUFFERED`), then validated.
+   buffers copied once (`METHOD_BUFFERED`), then validated. `ATTACH` references the host's
+   event only for a user-mode request in the requesting process, with `EVENT_MODIFY_STATE`;
+   one host at a time; only the attached handle detaches; the interface refuses removal while
+   a handle to it is open, so no request reaches a deleted device.
 3. **Shared memory** (M4): the ring buffer mapped into the host; the driver never reads data back
    from it to make decisions.
 4. **PortCls → miniport**: COM-style calls, possibly concurrent; reference counting and the

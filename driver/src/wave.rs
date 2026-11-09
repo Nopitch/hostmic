@@ -34,6 +34,7 @@ use wdk_sys::{
 };
 
 use crate::com::{self, ComObject, Unknown};
+use crate::host_link::LinkRef;
 use crate::ks::{self, PCFILTER_NODE, Shared, size_ulong};
 use crate::stream;
 
@@ -50,6 +51,8 @@ pub struct WaveMiniport {
     /// `IUnknown`, `IMiniport` and `IMiniportWaveRT`, which extend one another.
     vtable: &'static IMiniportWaveRTVtbl,
     references: AtomicU32,
+    /// The adapter's host link, handed to each stream.
+    link: LinkRef,
 }
 
 // SAFETY: `#[repr(C)]`, the vtable at offset 0 is `VTABLE`, whose `IUnknown` entries are the
@@ -65,10 +68,11 @@ unsafe impl ComObject for WaveMiniport {
 
 /// Creates a WaveRT miniport, or `None` when the pool is exhausted.
 #[must_use]
-pub fn new() -> Option<Unknown> {
+pub fn new(link: LinkRef) -> Option<Unknown> {
     com::into_unknown(WaveMiniport {
         vtable: &VTABLE,
         references: AtomicU32::new(1),
+        link,
     })
 }
 
@@ -240,7 +244,7 @@ unsafe extern "C" fn init(
 
 /// `IMiniportWaveRT::NewStream`: a capture stream on the host pin, in the one format.
 unsafe extern "C" fn new_stream(
-    _this: *mut c_void,
+    this: *mut c_void,
     out_stream: *mut PMINIPORTWAVERTSTREAM,
     port_stream: PPORTWAVERTSTREAM,
     pin: ULONG,
@@ -266,8 +270,10 @@ unsafe extern "C" fn new_stream(
     if !audio_format::is_supported(bytes) {
         return STATUS_NO_MATCH;
     }
+    // SAFETY: called through the miniport's vtable, at offset 0.
+    let link = unsafe { com::object::<WaveMiniport, 0>(this) }.link;
     // SAFETY: `port_stream` is the port's stream for this new stream, valid for its life.
-    let Some(stream) = (unsafe { stream::new(port_stream) }) else {
+    let Some(stream) = (unsafe { stream::new(port_stream, link) }) else {
         return STATUS_INSUFFICIENT_RESOURCES;
     };
     // The stream's reference passes to PortCls.

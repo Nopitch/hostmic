@@ -420,7 +420,7 @@ impl State {
 pub struct StreamState {
     /// Changes with every state change or new buffer of the stream; an [`AdvanceRequest`]
     /// names the generation it was computed for, and the driver refuses any other. An opaque
-    /// value: compare it for equality only.
+    /// value: compare it for equality only (the driver uses 16 bits of it, which wrap).
     pub generation: u32,
     /// A [`State`] code.
     pub state: u32,

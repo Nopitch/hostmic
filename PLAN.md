@@ -292,6 +292,22 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   adapter's `BusRelations` query down untouched, so adding the child before calling
   `PcDispatchIrp` is enough; an independent review found that the first version forgot fast
   I/O, relative opens and re-enabling, and could leak a child never enumerated.
+  *Attach, detach and the stream state done (2026-11-09):* the adapter's device extension
+  holds a `HostLink` (`driver/src/host_link.rs`) that the capture stream and the host
+  interface share: the stream publishes its format, buffer geometry and state under the
+  `Cursor` protocol and signals the host's event on every change; `ATTACH` references that
+  event (`ObReferenceObjectByHandle`, user mode, in the requesting process only) and records
+  the host's handle, `DETACH` or the handle's cleanup and close release it, `GET_STREAM`
+  reads a consistent snapshot. No buffer is mapped yet (`ATTACH` replies with a null buffer).
+  `tools/test-host` attaches and prints every change. In the VM: a second host is refused
+  with `STATUS_DEVICE_BUSY`; the host sees stopped, paused (960-frame buffer in packets of
+  480), running, paused, stopped while `capture-check` records (still `PASS`); a killed host
+  and a host exiting without `DETACH` are detached. Lessons from the independent review: a
+  request can still arrive on a device object after the adapter's removal deleted it, so the
+  host interface now refuses removal while a handle to it is open (removing the driver with a
+  host attached is "removed on reboot"; forcing a detach instead is for M6), and an `ATTACH`
+  racing a `DETACH` on the same handle needed an "attaching" state not to leak the event.
+  Open: the generation is 16 bits wide in the driver while the ABI carries 32.
 - **M5, the host crate:** `hostmic` API, reference host loop, examples; latency and load tests
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and

@@ -168,6 +168,30 @@ Expected: the interface is listed, and opening it fails with `Access is denied.
 (0x80070005)`. Disabling the child device (`Disable-PnpDevice`) makes the interface disappear
 (`hostmic-ctl info` exits with 1); enabling it again makes it answer again.
 
+`tools/test-host` attaches as the host and prints the capture stream's state each time the
+driver signals a change. Build it on the host (`cargo build -p hostmic-test-host --release`),
+copy `target\release\test-host.exe` to `C:\hostmic\`, then in the VM run it in the background
+while recording:
+
+```powershell
+$p = Start-Process C:\hostmic\test-host.exe -ArgumentList '--seconds','12' -RedirectStandardOutput C:\hostmic\h.txt -PassThru -WindowStyle Hidden
+Start-Sleep 2
+C:\hostmic\test-host.exe --seconds 1
+C:\hostmic\capture-check.exe --seconds 4
+$p | Wait-Process; Get-Content C:\hostmic\h.txt
+```
+
+Expected: the second `test-host` fails with `ATTACH: The requested resource is in use.
+(0x800700AA)` (one host at a time); the first prints `attached`, then one line per change with
+a growing generation: `stopped` (stream created, 48000 Hz 2 ch int16), `paused` with its buffer
+(960 frames, packets of 480 in shared mode), `running`, `paused`, `stopped`, `no stream`, then
+`detached`. A host killed with `Stop-Process`, or one that exits without detaching
+(`--no-detach`), is detached when its handle closes: the next `test-host` attaches.
+
+Removing the driver while a host is attached is refused (the host interface vetoes the
+removal: `devcon` answers "Removed on reboot" and the driver stays loaded until the VM
+restarts). Close the host first.
+
 ## 7. Remove the driver (VM, elevated)
 
 ```powershell

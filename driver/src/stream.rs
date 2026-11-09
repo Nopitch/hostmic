@@ -22,9 +22,10 @@ use core::{
     sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
+use hostmic_abi::{Format, SampleType, State};
 use hostmic_driver_core::{
     clock,
-    format::{FRAME_BYTES, SAMPLE_RATE},
+    format::{CHANNELS, FRAME_BYTES, SAMPLE_RATE},
     packet, ring,
 };
 use hostmic_sys::{
@@ -45,6 +46,7 @@ use wdk_sys::{
 };
 
 use crate::com::{self, ComObject, Unknown};
+use crate::host_link::LinkRef;
 
 /// Timer period: 1 ms, in 100 ns units (the sample's).
 const TIMER_PERIOD: i64 = 10_000;
@@ -95,6 +97,8 @@ pub struct Stream {
     frames_per_packet: AtomicU64,
     /// The notification event of event-driven mode.
     event: AtomicPtr<wdk_sys::_KEVENT>,
+    /// The adapter's host link, where the stream publishes its state for the host.
+    link: LinkRef,
 }
 
 /// Offset of the `IMiniportWaveRTInputStream` vtable field.
@@ -126,6 +130,7 @@ impl Drop for Stream {
         }
         // SAFETY: PASSIVE_LEVEL; waits for any DPC still queued.
         unsafe { KeFlushQueuedDpcs() };
+        self.link.get().stream_closed();
     }
 }
 
@@ -134,7 +139,7 @@ impl Drop for Stream {
 /// # Safety
 ///
 /// `port_stream` is the port's stream for the new stream, valid for its whole life.
-pub unsafe fn new(port_stream: PPORTWAVERTSTREAM) -> Option<Unknown> {
+pub unsafe fn new(port_stream: PPORTWAVERTSTREAM, link: LinkRef) -> Option<Unknown> {
     let mut frequency = LARGE_INTEGER::default();
     // SAFETY: any IRQL; `frequency` is a valid out-parameter.
     unsafe { KeQueryPerformanceCounter(&raw mut frequency) };
@@ -158,6 +163,7 @@ pub unsafe fn new(port_stream: PPORTWAVERTSTREAM) -> Option<Unknown> {
         buffer_bytes: AtomicUsize::new(0),
         frames_per_packet: AtomicU64::new(0),
         event: AtomicPtr::new(ptr::null_mut()),
+        link,
     })?;
     let object = stream.as_ptr().cast::<Stream>();
     // SAFETY: `tick` matches `EXT_CALLBACK`; its context is the stream, which deletes the
@@ -168,6 +174,11 @@ pub unsafe fn new(port_stream: PPORTWAVERTSTREAM) -> Option<Unknown> {
     }
     // SAFETY: `object` is the live stream `stream` owns.
     unsafe { &*object }.timer.store(timer, Ordering::Release);
+    link.get().stream_opened(Format {
+        rate: SAMPLE_RATE,
+        channels: CHANNELS,
+        sample_type: SampleType::Int16.code(),
+    });
     Some(stream)
 }
 
@@ -266,6 +277,10 @@ impl Stream {
         );
         self.buffer_bytes.store(bytes, Ordering::Relaxed);
         self.buffer.store(base.as_ptr(), Ordering::Release);
+        self.link.get().set_buffer(
+            u32::try_from(frames).unwrap_or(u32::MAX),
+            u32::try_from(self.frames_per_packet.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
+        );
         // SAFETY: the out-parameters are writable (checked not null above).
         unsafe { mdl_out.write(mdl) };
         // SAFETY: as above.
@@ -284,6 +299,7 @@ impl Stream {
         self.frames_per_packet.store(0, Ordering::Relaxed);
         // The timer may no longer touch the buffer.
         self.stop_timer();
+        self.link.get().set_buffer(0, 0);
         if mdl.is_null() {
             return;
         }
@@ -316,6 +332,7 @@ impl Stream {
                     // SAFETY: a live timer of this stream; relative due time, 1 ms period, no
                     // parameters (optional).
                     unsafe { ExSetTimer(timer, -TIMER_PERIOD, TIMER_PERIOD, ptr::null_mut()) };
+                    self.link.get().set_state(State::Running);
                 }
             }
             KSSTATE::KSSTATE_PAUSE | KSSTATE::KSSTATE_ACQUIRE => {
@@ -324,8 +341,12 @@ impl Stream {
                     self.paused_frames.store(position, Ordering::Relaxed);
                     self.state.store(state, Ordering::Release);
                     self.stop_timer();
+                    self.link.get().set_state(State::Paused);
                 } else {
                     self.state.store(state, Ordering::Release);
+                    if previous == KSSTATE::KSSTATE_STOP {
+                        self.link.get().set_state(State::Paused);
+                    }
                 }
             }
             KSSTATE::KSSTATE_STOP => {
@@ -336,6 +357,9 @@ impl Stream {
                 self.written.store(0, Ordering::Release);
                 self.signaled_packets.store(0, Ordering::Relaxed);
                 self.last_read_packet.store(NO_PACKET, Ordering::Relaxed);
+                if previous != KSSTATE::KSSTATE_STOP {
+                    self.link.get().set_state(State::Stopped);
+                }
             }
             _ => return STATUS_INVALID_PARAMETER,
         }
