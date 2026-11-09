@@ -153,6 +153,13 @@ impl Device {
     pub fn stats(&self) -> Result<Stats, Error> {
         read(&self.handle, IOCTL_GET_STATS).map(|bytes| Stats::from_bytes(&bytes))
     }
+
+    /// The handle to the host interface, for a removal notification registered on it
+    /// (`CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE`), which outlives the handle. Only the crate sees
+    /// it.
+    pub(crate) fn file_handle(&self) -> HANDLE {
+        HANDLE(self.handle.as_raw_handle())
+    }
 }
 
 /// What [`Host::write`] did.
@@ -370,13 +377,6 @@ impl Host {
     /// [`event`](Self::event) for the `windows` crate's calls.
     fn event_handle(&self) -> HANDLE {
         HANDLE(self.event.as_raw_handle())
-    }
-
-    /// The handle to the host interface, for a removal notification registered on it
-    /// (`CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE`). Only the crate sees it: closing or duplicating
-    /// it would end the attachment under a writer.
-    pub(crate) fn file_handle(&self) -> HANDLE {
-        HANDLE(self.handle.as_raw_handle())
     }
 
     /// Writes `frames` (interleaved samples in `stream`'s format, little-endian, whole frames)

@@ -573,7 +573,7 @@ fn report(
             }
         };
     println!(
-        "player     {} frames, {} advances, {} stale, {} late, longest gap {:.1} ms, {} attachment(s), {} release(s){}",
+        "player     {} frames, {} advances, {} stale, {} late, longest gap {:.1} ms, {} attachment(s), {} release(s), {} registration failure(s){}",
         stats.frames_written,
         stats.advances,
         stats.stale,
@@ -581,6 +581,7 @@ fn report(
         stats.longest_gap.as_secs_f64() * 1_000.0,
         stats.attachments,
         stats.releases,
+        stats.registration_failures,
         if stats.mmcss { "" } else { ", no MMCSS" }
     );
     let mut gaps = String::new();

@@ -40,7 +40,7 @@ use windows::{
 };
 
 use crate::{
-    Advance, Error, Host,
+    Advance, Device, Error, Host,
     clock::{self, Anchor, Due},
     convert, interfaces, stream,
 };
@@ -145,6 +145,9 @@ pub struct PlayerStats {
     /// Times a following player let the microphone go: Windows asked to remove it, or the
     /// driver detached it ([`Player::follow`] only).
     pub releases: u64,
+    /// Times a following player could not register for the microphone's removal requests,
+    /// and so did not attach; it tried again a second later ([`Player::follow`] only).
+    pub registration_failures: u64,
     /// Whether the thread runs under MMCSS ("Pro Audio").
     pub mmcss: bool,
     /// Whether the thread has ended: stopped, on an error that [`Player::stop`] returns, or on
@@ -187,6 +190,7 @@ struct Shared {
     attached: AtomicBool,
     attachments: AtomicU64,
     releases: AtomicU64,
+    registration_failures: AtomicU64,
     mmcss: AtomicBool,
     finished: AtomicBool,
     /// Set by the thread as it ends, before it answers a waiting request one last time: a
@@ -266,15 +270,18 @@ impl Player {
     /// attaches with `formats` as soon as the microphone's host interface is there (now or
     /// later), plays with `callback` while attached, detaches and closes its handle when
     /// Windows asks to remove the microphone, so that the removal goes through, and attaches
-    /// again when the microphone comes back or the removal is cancelled. Another host attached
-    /// meanwhile is retried every second.
+    /// again when the microphone comes back or the removal is cancelled. It registers for the
+    /// microphone's removal requests before attaching, and never attaches without that
+    /// registration; one that fails (the driver short of memory) is retried every second
+    /// ([`PlayerStats::registration_failures`]), as is another host attached meanwhile.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidRange`] for an empty, inverted or unknown range; [`Error::Os`] when an
     /// event, the timer or the thread cannot be created. Errors met later end the loop, and
-    /// [`stop`](Self::stop) returns them: another ABI version, no common format, a registration
-    /// for notifications refused by the configuration manager.
+    /// [`stop`](Self::stop) returns them: another ABI version, no common format, the
+    /// registration for interface arrivals refused by the configuration manager, the
+    /// registration for removal requests refused for a minute in a row.
     pub fn follow<F>(formats: FormatRange, callback: F) -> Result<Self, Error>
     where
         F: FnMut(&mut Block<'_>) + Send + 'static,
@@ -330,6 +337,7 @@ impl Player {
             attached: AtomicBool::new(attached),
             attachments: AtomicU64::new(u64::from(attached)),
             releases: AtomicU64::new(0),
+            registration_failures: AtomicU64::new(0),
             mmcss: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -348,6 +356,7 @@ impl Player {
                 let mut work = Work {
                     handle_notification: None,
                     interface_notification: None,
+                    failed_registrations: 0,
                     host,
                     follow,
                     timer,
@@ -400,6 +409,7 @@ impl Player {
             attached: shared.attached.load(Ordering::Relaxed),
             attachments: shared.attachments.load(Ordering::Relaxed),
             releases: shared.releases.load(Ordering::Relaxed),
+            registration_failures: shared.registration_failures.load(Ordering::Relaxed),
             mmcss: shared.mmcss.load(Ordering::Relaxed),
             finished: shared.finished.load(Ordering::Acquire),
         }
@@ -577,6 +587,11 @@ unsafe extern "system" fn on_interface(
 /// the removal, and nothing retries it: the user repeats the removal or reboots.
 const RELEASE_WAIT_MS: u32 = 2_000;
 
+/// Registrations on a device's notifications that may fail in a row, a second apart, before
+/// the failure counts as lasting and ends a following player: a minute, enough for memory
+/// pressure to pass, short enough for a defect to show.
+const MAX_REGISTRATION_FAILURES: u32 = 60;
+
 /// The device handle notification callback. On a removal request, the player detaches and
 /// closes its handle before this returns, as the configuration manager requires: the player's
 /// thread writes into the mapping, so it must stop before the handle goes, and this callback
@@ -643,6 +658,8 @@ struct Work {
     /// with the interface path it was made for.
     handle_notification: Option<(Notification, String)>,
     interface_notification: Option<Notification>,
+    /// Registrations on the device that failed in a row (see [`Work::register`]).
+    failed_registrations: u32,
     host: Option<Host>,
     /// The formats to attach with, when following the microphone.
     follow: Option<FormatRange>,
@@ -736,18 +753,12 @@ impl Work {
     }
 
     /// Attaches to the first hostmic microphone with `formats`, if there is one and it is
-    /// free; registers for its removal requests unless already registered on that device.
-    /// Returns whether it attached.
+    /// free, once registered for its removal requests (unless already registered on that
+    /// device). Returns whether it attached.
     fn try_attach(&mut self, formats: FormatRange) -> Result<bool, Error> {
         // The configuration manager's list may fail while devices change: later.
         let Some(path) = interfaces().ok().and_then(|paths| paths.into_iter().next()) else {
             return Ok(false);
-        };
-        let host = match Host::attach(&path, formats) {
-            Ok(host) => host,
-            // Another host, a device being removed or restarted: later.
-            Err(Error::Busy | Error::Os { .. } | Error::NotHost) => return Ok(false),
-            Err(error) => return Err(error),
         };
         // A registration on the device stays valid after its handle closes (Microsoft's
         // "Registering for Notification of Device Interface Arrival and Device Removal"): one
@@ -766,11 +777,18 @@ impl Work {
                 self.handle_notification = None;
             }
             self.shared.gone.store(false, Ordering::Release);
-            self.handle_notification = Some((
-                Notification::handle(host.file_handle(), &self.shared)?,
-                path,
-            ));
+            // A removal requested while registering (the callback set `removing`): not now,
+            // or the new handle would make the driver refuse it.
+            if !self.register(&path)? || self.shared.removing.load(Ordering::Acquire) {
+                return Ok(false);
+            }
         }
+        let host = match Host::attach(&path, formats) {
+            Ok(host) => host,
+            // Another host, a device being removed or restarted: later.
+            Err(Error::Busy | Error::Os { .. } | Error::NotHost) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         // Sized once per attachment, outside the real-time loop.
         let buffer_bytes = host.buffer_bytes();
         if self.bytes.len() < buffer_bytes {
@@ -781,6 +799,49 @@ impl Work {
         self.shared.attached.store(true, Ordering::Relaxed);
         self.shared.attachments.fetch_add(1, Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Registers for the removal requests of the device behind `path`, before attaching: the
+    /// player never holds a host's handle without being told when Windows wants it closed.
+    /// The registration is made on a handle of its own, opened without `ATTACH` and closed
+    /// here (the registration outlives it), so that a failure leaves the microphone alone. A
+    /// removal requested while that handle is open (between its open and the registration) is
+    /// still refused by the driver, as for any open handle; the window is a few milliseconds.
+    ///
+    /// It can fail for a while: the driver answers the configuration manager's query with an
+    /// allocation, which may fail under memory pressure. Then it returns `false`, and the
+    /// player tries again a second later; after [`MAX_REGISTRATION_FAILURES`] failures in a
+    /// row, a lasting one rather than a passing one, it returns the error, which ends the loop.
+    /// A handle that cannot be opened (the interface gone or restarting) is not counted, and
+    /// breaks the row.
+    fn register(&mut self, path: &str) -> Result<bool, Error> {
+        let result = Device::open(path)
+            .and_then(|device| Notification::handle(device.file_handle(), &self.shared));
+        match result {
+            Ok(notification) => {
+                self.handle_notification = Some((notification, path.to_owned()));
+                self.failed_registrations = 0;
+                Ok(true)
+            }
+            // The interface went away, or is being restarted: later, as an attach would.
+            Err(Error::Os {
+                call: "CreateFileW",
+                ..
+            }) => {
+                self.failed_registrations = 0;
+                Ok(false)
+            }
+            Err(error) => {
+                self.shared
+                    .registration_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                self.failed_registrations += 1;
+                if self.failed_registrations >= MAX_REGISTRATION_FAILURES {
+                    return Err(error);
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// Lets the microphone go: stops the timer, detaches and closes the handle (if still
