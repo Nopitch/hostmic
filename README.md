@@ -28,9 +28,11 @@ host application ──writes into the shared ring buffer──▶ [hostmic micr
 
 **Experimental, not usable yet.** The driver already exposes a working capture endpoint,
 "Microphone (hostmic)", fed by a host application through a buffer it shares with the Windows
-audio engine; the host sets the pace (milestone M4, done: verified in a test VM with the test
-host playing a 1 kHz tone). The host library is the next milestone. See [PLAN.md](PLAN.md) for the
-roadmap. There is no release. Until the driver is signed through Microsoft attestation, it can
+audio engine; the host sets the pace (milestone M4). The host library, the `hostmic` crate,
+finds the microphone, runs a real-time loop that feeds it, and lets it go when Windows removes
+the driver (milestone M5). Measured in a test VM: 10.1 ms median from the host's write to an
+application's read, and no crackle with 16 threads saturating the CPU. Hardening is the next
+milestone. See [PLAN.md](PLAN.md) for the roadmap. There is no release. Until the driver is signed through Microsoft attestation, it can
 only be loaded with test signing enabled, which requires Secure Boot to be disabled: use a
 virtual machine, never your everyday machine ([docs/test-vm.md](docs/test-vm.md)).
 
