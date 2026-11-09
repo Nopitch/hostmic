@@ -731,6 +731,15 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   Lesson from the fixes' first run: a removed endpoint is "not present" (`DeviceState` 4),
   never "unplugged" (8); a scenario that fails between a removal and a reinstall now reinstalls
   the driver, so that one failure does not fail every scenario after it.
+  *Overflow checks in release (2026-11-09):* `overflow-checks = true` in `[profile.release]`,
+  so the build a release ships checks arithmetic as the tested debug build always did. A panic
+  in the driver is `wdk-panic`'s bug check `RPNC` with the file and line in its parameters, so
+  a wrapped size or position stops the system where it happened instead of corrupting memory
+  further on; the tools and hosts built in release abort. The checks stay only where the
+  compiler cannot prove the operation in range: the release driver grows from 72192 to 73728
+  bytes and gains two panic locations, `hostmic-driver-core`'s `packet.rs` and the driver's
+  `com.rs` (reference counts). In the VM, the campaign passes 10 of 10 on this release package
+  (latency median 10.8 ms, 0 crackle under load).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

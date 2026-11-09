@@ -125,7 +125,7 @@ of the build.
 |---|---|
 | Improper input validation (CWE-20) | Allowlist checks of formats and sizes in pure, unit-tested Rust (`format::is_supported`); IOCTL validation the same way; both fuzzed |
 | Out-of-bounds read or write (CWE-125, CWE-787) | Size checks before every access to a caller's buffer; ring writes through bounded slices; unaligned-safe reads and writes |
-| Integer overflow (CWE-190) | 128-bit intermediates for clock arithmetic, saturating and checked operations; overflow checks in tests and debug builds |
+| Integer overflow (CWE-190) | 128-bit intermediates for clock arithmetic, saturating and checked operations; overflow checks in every build, release included (an overflow stops the system with a bug check naming its place instead of wrapping) |
 | Use after free (CWE-416) | Atomic reference counting with `Arc`-like orderings, including the shared buffer's pages (the adapter, each stream buffer and the host's mapping hold one); timers deleted and DPCs flushed before a stream is freed; the notification event dropped and callbacks flushed before unregistration returns |
 | Race conditions (CWE-362) | One writer per stream (its timer), positions published with release/acquire atomics, state changes serialized by PortCls |
 | Double fetch, TOCTOU on user memory (CWE-367) | User input copied once, then validated (M4) |
