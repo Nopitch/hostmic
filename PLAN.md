@@ -72,7 +72,8 @@ Windows audio engine period.
   ("Pro Audio"). Later: let the caller drive the clock (Résonnance wants to follow its physical
   microphone, to remove clock drift), with a clock correction ratio the caller can read and
   adjust at run time, as Virtual Audio Cable offers.
-- A C header next to the Rust API: professional hosts are often C++ applications.
+- A C header next to the Rust API: professional hosts are often C++ applications (after M8,
+  once a real host has settled the API).
 - Tools in the style of Virtual Audio Cable's control panel: plain text, every setting and
   counter visible with its unit (formats, stream state, overflows, underflows, rejected
   requests), factual messages; no decoration.
@@ -427,6 +428,53 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   ported from Résonnance (`tag_micro`): write → read, discontinuities under load, endurance.
   The reference loop follows M4's lessons (above): `tools/test-host`'s player is its first
   draft.
+  *Design (2026-11-09):*
+  - **What the first draft gets wrong for a library:** its real-time thread reports through an
+    `mpsc` channel (which allocates, as does its `Note::Thread(String)`); it paces itself with
+    `WaitForSingleObject(event, 1)` under `timeBeginPeriod(1)` (2.6 ms longest gap in M4's
+    run); its errors are strings; its format (48 kHz, 16-bit, stereo) and its tone writer are
+    hard-coded; it never reverts its MMCSS registration.
+  - **Crate `hostmic`** (`host/`, MIT OR Apache-2.0, on `hostmic-abi`), Windows only for now,
+    its names free of Windows terms so that a PipeWire backend can come later (open question
+    below). Two layers.
+  - **Low layer, the protocol made safe**, for hosts with a loop of their own (Résonnance
+    later, clocked by its physical microphone): `interfaces()` lists the host interfaces;
+    `Device::open` opens one, `info()` and `stats()` read it; `attach(FormatRange)` returns a
+    `Host` that owns the handle, the event and the mapping, and detaches on drop;
+    `Host::stream()` reads `GET_STREAM`; `Host::write(&stream, from, samples)` copies the
+    samples into the ring at the position, wrapping, then sends `ADVANCE`, and returns
+    `Advanced(position)` or `Stale` (`ERROR_NOT_READY`: read the stream again). Writes into the
+    shared pages are volatile, never through a `&mut [T]`: the audio engine reads them at the
+    same time. Errors are typed: `NotInstalled`, `Busy` (another host is attached),
+    `Version { driver, host }`, `NoCommonFormat`, `Refused(Reason)`, `Os`.
+  - **High layer, the reference loop:** `Player::start(host, callback)` runs a thread
+    registered with MMCSS ("Pro Audio"), reverted on exit, paced by the performance counter
+    and a high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`), waiting on
+    the stream's event, the timer and a stop event at once. Each period it calls the caller's
+    `FnMut(&mut Block)` with the format, the position and a preallocated `f32` block of the
+    frames due, converts it to the stream's sample type (clamped) and writes it with the low
+    layer, about a millisecond per `ADVANCE` as the ABI asks. More than a buffer late, it
+    counts the event and anchors its clock again. No allocation, lock or I/O in that thread:
+    it publishes atomic counters (frames written, advances, stale refusals, late events,
+    longest gap between two writes, stream state) that `Player::stats()` reads from any
+    thread. `Player::stop()` signals the stop event.
+  - **Device notifications** (`CM_Register_Notification`): wait for the interface to arrive;
+    on a query-remove of the host interface, detach and close the handle, so that removing or
+    updating the driver no longer waits for a reboot while a host runs (the forced detach of
+    M6 covers hosts that do not use the crate); attach again when it comes back.
+  - **Pure parts** (frames due, re-anchoring, the ring's wrap, sample conversion) in a module
+    without system calls, unit-tested by the `driver` workflow's `cargo test` on Windows, as
+    `hostmic-driver-core` is for the driver.
+  - **Measurements**, in the test VM: write → read latency, discontinuities under load (16
+    saturated threads, 30 s), endurance. The target table (above) was measured on a real
+    machine; until a signed driver can run there (M7), VM figures are indicative.
+  - **Not in M5:** the C header (after M8, once a real host has settled the API); a
+    caller-driven clock with a correction ratio; the PipeWire backend.
+  Pull requests, one at a time: this design; the low layer, with `tools/hostmic-ctl` moved
+  onto it; the reference loop and an example, with `tools/test-host` rewritten on it (done
+  when `capture-check` passes and the longest gap is below M4's 2.6 ms); device
+  notifications (done when `devcon remove` unloads the driver while a host is attached, and the
+  host attaches again after reinstallation); the measurements; the closing notes.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
