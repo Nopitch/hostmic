@@ -45,9 +45,6 @@ use crate::com::{self, ComObject, Unknown};
 use crate::host_link::LinkRef;
 use crate::shared_buffer::BufferRef;
 
-/// No packet read yet.
-const NO_PACKET: u64 = u64::MAX;
-
 /// [`FRAME_BYTES`] as the `u32` the buffer geometry takes.
 #[allow(clippy::cast_possible_truncation, reason = "a frame is a few bytes")]
 const FRAME_BYTES_U32: u32 = FRAME_BYTES as u32;
@@ -63,9 +60,9 @@ pub struct Stream {
     references: AtomicU32,
     /// `KSSTATE`.
     state: AtomicI32,
-    /// The last packet `GetReadPacket` returned, or [`NO_PACKET`]. Only `GetReadPacket` (which
-    /// the audio engine calls from one thread) and the stop transition change it.
-    last_read_packet: AtomicU64,
+    /// The packed [`packet::ReadMark`]: the last packet `GetReadPacket` returned and the run it
+    /// belongs to. `GetReadPacket` moves it with a compare-and-exchange; a stop starts a new run.
+    read_mark: AtomicU64,
     /// The buffer, mapped in system space (non-null while the stream has a buffer), and its
     /// size in bytes (whole frames).
     buffer: AtomicPtr<u8>,
@@ -123,7 +120,7 @@ pub fn new(link: LinkRef) -> Option<Unknown> {
         input: &INPUT_VTABLE,
         references: AtomicU32::new(1),
         state: AtomicI32::new(KSSTATE::KSSTATE_STOP),
-        last_read_packet: AtomicU64::new(NO_PACKET),
+        read_mark: AtomicU64::new(0),
         buffer: AtomicPtr::new(ptr::null_mut()),
         buffer_bytes: AtomicUsize::new(0),
         shared: AtomicPtr::new(ptr::null_mut()),
@@ -255,11 +252,17 @@ impl Stream {
             }
             KSSTATE::KSSTATE_STOP => {
                 self.state.store(state, Ordering::Release);
-                // A stopped stream starts again from position 0 (`Cursor::stopped`).
-                self.last_read_packet.store(NO_PACKET, Ordering::Relaxed);
+                // A stopped stream starts again from position 0 (`Cursor::stopped`), then the
+                // packet numbering starts a new run: a `GetReadPacket` that sees the new run's
+                // mark (`Acquire`) also sees the reset position.
                 if previous != KSSTATE::KSSTATE_STOP {
                     link.set_state(State::Stopped);
                 }
+                let _ = self
+                    .read_mark
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                        Some(packet::ReadMark::unpack(word).stopped().pack())
+                    });
             }
             _ => return STATUS_INVALID_PARAMETER,
         }
@@ -458,23 +461,32 @@ unsafe extern "C" fn get_read_packet(
         return STATUS_INVALID_DEVICE_STATE;
     }
     let link = stream.link.get();
-    let last = stream.last_read_packet.load(Ordering::Relaxed);
+    // The mark first, then the position: a stop resets the position before it starts a new
+    // run's mark, so a position read after an old run's mark may be either run's, but the
+    // exchange below then fails if a stop came in between (the epoch changed).
+    let word = stream.read_mark.load(Ordering::Acquire);
+    let mark = packet::ReadMark::unpack(word);
     let Some(read) = packet::next_read(
         link.position(),
         per_packet,
         stream.buffer_frames(),
-        (last != NO_PACKET).then_some(last),
+        mark.last,
         link.advance_frames(),
     ) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    // A stop that raced this call reset the numbering: its reset wins, and the packet read
-    // here belongs to the stopped run.
     if stream
-        .last_read_packet
-        .compare_exchange(last, read.packet, Ordering::AcqRel, Ordering::Acquire)
+        .read_mark
+        .compare_exchange(
+            word,
+            mark.read(read.packet).pack(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
+        // A stop raced this call: its new run wins, and the packet found here belonged to the
+        // stopped one.
         return STATUS_DEVICE_NOT_READY;
     }
     if read.skipped != 0 {

@@ -17,6 +17,64 @@ pub struct Read {
     pub skipped: u64,
 }
 
+/// The last packet the engine read, and the stream run it belongs to, packed in one 64-bit
+/// word so that one compare-and-exchange moves both: a stop starts a new `epoch`, and a
+/// `GetReadPacket` that read the old run's position cannot store its packet into the new run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadMark {
+    /// Incremented (wrapping) by each stop.
+    pub epoch: u16,
+    /// The last packet read in this run; `None` before the first.
+    pub last: Option<u64>,
+}
+
+impl ReadMark {
+    /// Packet numbers fit in 48 bits: positions do (`host::POSITION_MAX`).
+    const PACKET_BITS: u32 = 48;
+    const PACKET_MASK: u64 = (1 << Self::PACKET_BITS) - 1;
+
+    /// The packed word: the epoch in the top 16 bits, then the last packet plus one (0: none).
+    /// A packet number that does not fit (never the case for a stream position) packs as none.
+    #[must_use]
+    pub const fn pack(self) -> u64 {
+        let last = match self.last {
+            Some(packet) if packet < Self::PACKET_MASK => packet + 1,
+            _ => 0,
+        };
+        ((self.epoch as u64) << Self::PACKET_BITS) | last
+    }
+
+    /// The inverse of [`ReadMark::pack`].
+    #[must_use]
+    pub const fn unpack(word: u64) -> Self {
+        #[allow(clippy::cast_possible_truncation, reason = "the top 16 bits")]
+        let epoch = (word >> Self::PACKET_BITS) as u16;
+        let last = word & Self::PACKET_MASK;
+        Self {
+            epoch,
+            last: if last == 0 { None } else { Some(last - 1) },
+        }
+    }
+
+    /// The mark of the next run: nothing read yet.
+    #[must_use]
+    pub const fn stopped(self) -> Self {
+        Self {
+            epoch: self.epoch.wrapping_add(1),
+            last: None,
+        }
+    }
+
+    /// The same run, with `packet` read.
+    #[must_use]
+    pub const fn read(self, packet: u64) -> Self {
+        Self {
+            epoch: self.epoch,
+            last: Some(packet),
+        }
+    }
+}
+
 /// The packet `GetReadPacket` returns at stream `position`, after the engine last read
 /// `last_read` (`None`: nothing read yet), with packets of `frames_per_packet` frames in a
 /// buffer of `buffer_frames` frames, when the host may already have written `ahead` frames
@@ -26,7 +84,9 @@ pub struct Read {
 ///
 /// The host writes frame `n` where frame `n - buffer_frames` was, before it advances past it:
 /// a packet is intact while its first frame is at least a buffer behind the frames the host
-/// may be writing.
+/// may be writing. The driver takes `ahead` to be the size of the host's last `ADVANCE`, an
+/// estimate: a host that writes more at once than it usually advances (catching up after a
+/// stall) can overwrite a packet this still calls intact.
 #[must_use]
 pub const fn next_read(
     position: u64,
@@ -169,6 +229,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn read_marks_round_trip_and_stops_change_the_epoch() {
+        for mark in [
+            ReadMark {
+                epoch: 0,
+                last: None,
+            },
+            ReadMark {
+                epoch: 7,
+                last: Some(0),
+            },
+            ReadMark {
+                epoch: u16::MAX,
+                last: Some((1 << 48) - 2),
+            },
+        ] {
+            assert_eq!(ReadMark::unpack(mark.pack()), mark);
+        }
+        let mark = ReadMark {
+            epoch: u16::MAX,
+            last: Some(41),
+        };
+        assert_eq!(
+            mark.stopped(),
+            ReadMark {
+                epoch: 0,
+                last: None
+            }
+        );
+        assert_ne!(mark.stopped().pack(), mark.pack());
+        // A stop after nothing was read still changes the word: no ABA.
+        let fresh = ReadMark {
+            epoch: 3,
+            last: None,
+        };
+        assert_ne!(fresh.stopped().pack(), fresh.pack());
+        assert_eq!(fresh.read(5).last, Some(5));
+        // Out of range packs as none instead of corrupting the epoch.
+        assert_eq!(
+            ReadMark::unpack(
+                ReadMark {
+                    epoch: 2,
+                    last: Some(u64::MAX)
+                }
+                .pack()
+            ),
+            ReadMark {
+                epoch: 2,
+                last: None
+            }
+        );
     }
 
     /// The host writes the frames of its next `ADVANCE` before sending it: they may already

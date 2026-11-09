@@ -133,8 +133,12 @@ pub struct HostLink {
     advance_qpc: AtomicU64,
     advance_word: AtomicU64,
     /// Frames of the last `ADVANCE`: how far ahead of the position the host may already be
-    /// writing (it writes the frames of an advance before sending it).
+    /// writing (it writes the frames of an advance before sending it). An estimate, stored on
+    /// its own: an advance preempted across a stop may leave a stale value for one packet.
     advance_frames: AtomicU64,
+    /// The generation at which the current run started (the last stop): frame numbers, hence
+    /// advance pairs, are comparable from there on, across pauses.
+    run_start: AtomicU32,
     /// The counters [`HostLink::stats`] reports (`hostmic_abi::Stats`).
     frames_advanced: AtomicU64,
     packets_completed: AtomicU64,
@@ -256,9 +260,19 @@ impl HostLink {
             });
     }
 
+    /// Stops the cursor (position 0): a new run starts, from the stopped generation on. That
+    /// generation is recorded first; `ADVANCE`, the only concurrent writer, never changes the
+    /// generation.
+    fn stop(&self) {
+        let next = Cursor::unpack(self.cursor.load(Ordering::Acquire)).stopped();
+        self.run_start
+            .store(u32::from(next.generation), Ordering::Release);
+        self.update(Cursor::stopped);
+    }
+
     /// A stream was created in `format`.
     pub fn stream_opened(&self, format: Format) {
-        self.update(Cursor::stopped);
+        self.stop();
         self.state.store(State::Stopped.code(), Ordering::Release);
         self.format
             .store(u64::from_le_bytes(format.to_bytes()), Ordering::Release);
@@ -267,7 +281,7 @@ impl HostLink {
 
     /// The stream was freed.
     pub fn stream_closed(&self) {
-        self.update(Cursor::stopped);
+        self.stop();
         self.state.store(State::Stopped.code(), Ordering::Release);
         self.buffer_frames.store(0, Ordering::Release);
         self.frames_per_packet.store(0, Ordering::Release);
@@ -298,7 +312,7 @@ impl HostLink {
                 self.state.store(state.code(), Ordering::Release);
             }
             State::Stopped => {
-                self.update(Cursor::stopped);
+                self.stop();
                 self.state.store(state.code(), Ordering::Release);
             }
         }
@@ -428,15 +442,20 @@ impl HostLink {
     }
 
     /// The performance counter value at which stream frame `frame` was written: counted back
-    /// at the stream's rate from the last `ADVANCE` of the current generation, or from now and
-    /// the current position when there is none (an advance of an earlier run that finished
-    /// late). Any IRQL; reads atomics.
+    /// at the stream's rate from the last `ADVANCE` of the current run (pauses included), or
+    /// from now and the current position when there is none (no advance yet, or one of an
+    /// earlier run that finished late). Any IRQL; reads atomics.
     pub fn frame_qpc(&self, frame: u64) -> u64 {
         let advanced = Cursor::unpack(self.advance_word.load(Ordering::Acquire));
         let at = self.advance_qpc.load(Ordering::Relaxed);
         let current = Cursor::unpack(self.cursor.load(Ordering::Acquire));
+        #[allow(clippy::cast_possible_truncation, reason = "stored from a u16")]
+        let run_start = self.run_start.load(Ordering::Acquire) as u16;
         let frequency = self.qpc_frequency.load(Ordering::Relaxed);
-        if advanced.generation == current.generation {
+        // Generations wrap: compare distances back from the current one.
+        let this_run = current.generation.wrapping_sub(advanced.generation)
+            <= current.generation.wrapping_sub(run_start);
+        if this_run {
             clock::sampling_instant(frame, advanced.position, at, frequency, SAMPLE_RATE)
         } else {
             clock::sampling_instant(frame, current.position, qpc(), frequency, SAMPLE_RATE)
@@ -455,12 +474,17 @@ impl HostLink {
 
     /// A request of control code function `request` was refused, for `reason`, with `status`.
     /// Any IRQL.
-    pub fn refused(&self, request: u16, reason: Reason, status: NTSTATUS) {
-        self.requests_refused.fetch_add(1, Ordering::Relaxed);
+    /// Returns how many requests were refused so far, this one included.
+    pub fn refused(&self, request: u16, reason: Reason, status: NTSTATUS) -> u64 {
+        let count = self
+            .requests_refused
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let packed = u64::from(request)
             | u64::from(reason.code()) << 16
             | u64::from(status.cast_unsigned()) << 32;
         self.last_refusal.store(packed, Ordering::Relaxed);
+        count
     }
 
     /// What `IOCTL_GET_STATS` replies.

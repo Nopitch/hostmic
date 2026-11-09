@@ -43,9 +43,9 @@ use wdk_sys::{
     IRP_MN_REMOVE_DEVICE, IRP_MN_SET_POWER, IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE,
     IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS, PDEVICE_OBJECT, POOL_FLAG_PAGED, PVOID,
     STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_DELETE_PENDING, STATUS_DEVICE_BUSY,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE,
-    STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS,
-    STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
+    STATUS_DEVICE_NOT_READY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE,
+    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
     ntddk::{
         ExAllocatePool2, ExFreePool, IoDeleteDevice, IoGetCurrentProcess, IoGetRequestorProcess,
         IoIs32bitProcess, IoRegisterDeviceInterface, IoSetDeviceInterfaceState, IofCompleteRequest,
@@ -885,15 +885,18 @@ unsafe fn device_control(
                     .map_err(Refusal::Rejected),
             ),
             code => {
-                println!(
-                    "hostmic: unknown control code {code:#010x}, process {}",
-                    current_process()
-                );
-                shared.refused(
+                let count = shared.refused(
                     function(code),
                     Reason::Status,
                     STATUS_INVALID_DEVICE_REQUEST,
                 );
+                // Rate-limited as `count_refusal` does.
+                if count <= 16 || count.is_power_of_two() {
+                    println!(
+                        "hostmic: unknown control code {code:#010x}, process {}",
+                        current_process()
+                    );
+                }
                 // SAFETY: the caller's contract.
                 return unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) };
             }
@@ -921,16 +924,18 @@ unsafe fn device_control(
 /// Counts a refused request and logs why; returns the status it completes with.
 fn count_refusal(shared: &HostLink, code: u32, name: &str, refusal: &Refusal) -> NTSTATUS {
     let status = refusal.status();
-    shared.refused(function(code), refusal.reason(), status);
+    let count = shared.refused(function(code), refusal.reason(), status);
     // `ADVANCE`s refused because a state change raced the host (stale generation or position,
     // stream no longer running) are part of the protocol and may come by the hundred: counted,
-    // not logged. Every other refusal, a foreign process's included, is logged.
-    if code == IOCTL_ADVANCE
+    // not logged. Other refusals are logged, a foreign process's included, but any process
+    // allowed to open the interface may send them in a loop: the first 16, then at every power
+    // of two; the counters keep the totals.
+    let race = code == IOCTL_ADVANCE
         && matches!(
             refusal.reason(),
             Reason::Generation | Reason::Position | Reason::NotRunning
-        )
-    {
+        );
+    if race || (count > 16 && !count.is_power_of_two()) {
         return status;
     }
     match refusal {
@@ -1023,6 +1028,10 @@ const USER_MODE: i8 = 1;
 fn rejection_status(rejection: Rejection) -> NTSTATUS {
     match rejection {
         Rejection::OutputSize { .. } => STATUS_BUFFER_TOO_SMALL,
+        // A state change raced the host: it reads the stream again (`ERROR_NOT_READY`).
+        Rejection::Generation { .. } | Rejection::Position { .. } | Rejection::NotRunning => {
+            STATUS_DEVICE_NOT_READY
+        }
         _ => STATUS_INVALID_PARAMETER,
     }
 }

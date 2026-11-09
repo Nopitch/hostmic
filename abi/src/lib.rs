@@ -99,7 +99,14 @@ pub const IOCTL_GET_STREAM: u32 = ctl_code(
 );
 
 /// Tells the driver that the host wrote more frames: [`AdvanceRequest`] in, [`AdvanceReply`]
-/// out. Attached host only.
+/// out. Attached host only (its handle and process). A request computed for a stream state that
+/// has changed since (generation, position, not running) fails with `ERROR_NOT_READY`: the host
+/// reads [`IOCTL_GET_STREAM`] again. Any other refusal is a host bug or a lost attachment.
+///
+/// The host writes the frames of a request just before sending it, and keeps requests short
+/// (about a millisecond of audio): the driver takes the size of the last request as how far the
+/// host may be writing ahead of the position when it hands packets to the audio engine.
+/// Requests are serial: the next one starts from the position the last one returned.
 pub const IOCTL_ADVANCE: u32 = ctl_code(
     FILE_DEVICE_UNKNOWN,
     FUNCTION_BASE + 3,

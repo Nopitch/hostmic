@@ -43,8 +43,8 @@ use windows::{
             CM_Get_Device_Interface_ListW, CR_SUCCESS,
         },
         Foundation::{
-            CloseHandle, ERROR_INVALID_PARAMETER, GENERIC_READ, GENERIC_WRITE, HANDLE,
-            HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+            CloseHandle, ERROR_NOT_READY, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
+            SetHandleInformation, WAIT_OBJECT_0,
         },
         Media::{timeBeginPeriod, timeEndPeriod},
         Storage::FileSystem::{
@@ -333,6 +333,8 @@ fn qpc() -> i64 {
 /// What the player thread tells the main thread, which prints it: the player itself never
 /// writes to the console or a file, which can block for tens of milliseconds.
 enum Note {
+    /// The player thread's scheduling (MMCSS).
+    Thread(String),
     /// The stream changed.
     Stream(StreamState),
     /// More than a buffer of frames was due at `position`: the host was not scheduled for
@@ -396,6 +398,7 @@ unsafe fn play(
 
 fn print_note(note: &Note) {
     match note {
+        Note::Thread(text) => println!("thread     {text}"),
         Note::Stream(stream) => print_state(stream),
         Note::Late {
             position,
@@ -439,7 +442,11 @@ impl Player<'_> {
     fn run(&mut self, event: &Handle, duration: Duration) -> Result<(), String> {
         let mut task = 0u32;
         // SAFETY: a static task name and a writable task index. Failure only loses priority.
-        let _ = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task) };
+        let mmcss = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &raw mut task) };
+        let _ = self.notes.send(Note::Thread(match mmcss {
+            Ok(_) => "MMCSS Pro Audio".to_owned(),
+            Err(error) => format!("no MMCSS: {error}"),
+        }));
         // SAFETY: no precondition; undone below.
         unsafe { timeBeginPeriod(1) };
         let result = self.play_for(event, duration);
@@ -489,6 +496,7 @@ impl Player<'_> {
                 continue;
             };
             let frames_in_buffer = u64::from(stream.buffer_frames);
+            // Not while `running` requires a buffer; kept against a division by zero below.
             if frames_in_buffer == 0 {
                 anchor = None;
                 continue;
@@ -561,7 +569,7 @@ impl Player<'_> {
     }
 
     /// `ADVANCE` by `frames` from `from`: the new position, or `None` when the request no longer
-    /// matches the stream (a state change raced it: `ERROR_INVALID_PARAMETER`).
+    /// matches the stream (a state change raced it: `ERROR_NOT_READY`, see `IOCTL_ADVANCE`).
     ///
     /// # Errors
     ///
@@ -581,7 +589,7 @@ impl Player<'_> {
                 Ok(Some(AdvanceReply::from_bytes(&answer).position))
             }
             Ok(returned) => Err(format!("ADVANCE returned {returned} bytes")),
-            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => Ok(None),
+            Err(error) if error.code() == ERROR_NOT_READY.to_hresult() => Ok(None),
             Err(error) => Err(format!("ADVANCE: {error}")),
         }
     }
