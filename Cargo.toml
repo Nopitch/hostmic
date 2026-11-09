@@ -8,6 +8,7 @@ members = [
     "tools/capture-check",
     "tools/handle-check",
     "tools/hostmic-ctl",
+    "tools/measure",
     "tools/test-host",
 ]
 resolver = "3"

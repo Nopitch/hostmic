@@ -108,6 +108,13 @@ impl Block<'_> {
     }
 }
 
+/// The edges, in microseconds, of the buckets of [`PlayerStats::gaps`]: below 1.5 ms (on time:
+/// the timer ticks every millisecond), 1.5 to 2 ms, 2 to 3, 3 to 4, 4 to 5, 5 to 7, 7 to 10,
+/// 10 to 15, 15 to 20, and 20 ms or more.
+pub const GAP_EDGES_US: [u32; 9] = [
+    1_500, 2_000, 3_000, 4_000, 5_000, 7_000, 10_000, 15_000, 20_000,
+];
+
 /// What a [`Player`] has done so far. Each counter is read on its own: they agree with one
 /// another only to within a period.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,6 +131,9 @@ pub struct PlayerStats {
     /// The longest time between two wake-ups that wrote while the stream ran: how late the
     /// player ever was.
     pub longest_gap: Duration,
+    /// Every such time, counted by bucket ([`GAP_EDGES_US`]): its distribution, which says
+    /// more than one maximum (a single preemption makes the maximum).
+    pub gaps: [u64; GAP_EDGES_US.len() + 1],
     /// The stream's state as the player last read it; `None` before the first read and while
     /// detached.
     pub state: Option<State>,
@@ -171,6 +181,7 @@ struct Shared {
     stale: AtomicU64,
     late: AtomicU64,
     longest_gap_ticks: AtomicU64,
+    gaps: [AtomicU64; GAP_EDGES_US.len() + 1],
     /// A [`State`] code, or `u32::MAX` before the first read and while detached.
     state: AtomicU32,
     attached: AtomicBool,
@@ -314,6 +325,7 @@ impl Player {
             stale: AtomicU64::new(0),
             late: AtomicU64::new(0),
             longest_gap_ticks: AtomicU64::new(0),
+            gaps: [const { AtomicU64::new(0) }; GAP_EDGES_US.len() + 1],
             state: AtomicU32::new(u32::MAX),
             attached: AtomicBool::new(attached),
             attachments: AtomicU64::new(u64::from(attached)),
@@ -383,6 +395,7 @@ impl Player {
             stale: shared.stale.load(Ordering::Relaxed),
             late: shared.late.load(Ordering::Relaxed),
             longest_gap: Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)),
+            gaps: core::array::from_fn(|bucket| shared.gaps[bucket].load(Ordering::Relaxed)),
             state: State::from_code(shared.state.load(Ordering::Relaxed)),
             attached: shared.attached.load(Ordering::Relaxed),
             attachments: shared.attachments.load(Ordering::Relaxed),
@@ -909,10 +922,7 @@ impl Work {
                 }
             };
             if let Some(previous) = last_write {
-                let gap = u64::try_from(now.saturating_sub(previous)).unwrap_or(0);
-                self.shared
-                    .longest_gap_ticks
-                    .fetch_max(gap, Ordering::Relaxed);
+                self.count_gap(now.saturating_sub(previous));
             }
             last_write = Some(now);
             // By the clock the frames were due by (before any re-anchoring for lateness).
@@ -929,6 +939,16 @@ impl Work {
                 read = true;
             }
         }
+    }
+
+    /// Counts a gap of `ticks` between two writing wake-ups: the longest, and its bucket.
+    fn count_gap(&self, ticks: i64) {
+        let gap = u64::try_from(ticks).unwrap_or(0);
+        self.shared
+            .longest_gap_ticks
+            .fetch_max(gap, Ordering::Relaxed);
+        let bucket = clock::gap_bucket(gap, self.shared.frequency, &GAP_EDGES_US);
+        self.shared.gaps[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Has the callback fill `frames` frames from `position`, encodes them, and writes them in

@@ -217,6 +217,21 @@ printing `waiting for the microphone`; after the reinstall it attaches again and
 `capture-check` passes; disabling and enabling the host interface makes it let go and attach
 again (`attachments` and `releases` grow by one each time).
 
+`tools/measure` measures the microphone as a communication application sees it (build
+`cargo build -p hostmic-measure --release`, copy `target\release\measure.exe`): it plays with
+the crate's reference loop and records in the same process. No other host may be attached.
+
+```powershell
+C:\hostmic\measure.exe latency --seconds 30
+C:\hostmic\measure.exe load --seconds 30 --threads 16
+C:\hostmic\measure.exe load --seconds 1800 --threads 16
+```
+
+Expected: `latency` reads every click due (a click every half second) with a write → read
+median near 10 ms (the engine's period); `load` counts 0 crackle with 16 spinning threads,
+over 30 s and over the long endurance run; both report the player's gaps by bucket, mostly
+below 2 ms, and end with `PASS`.
+
 The driver's handle rules are checked with `tools/handle-check` (raw requests: the crate's
 `Host` always detaches on drop). Build it (`cargo build -p hostmic-handle-check --release`) and
 copy `target\release\handle-check.exe` to `C:\hostmic\`. Closing the host's handle detaches it;
