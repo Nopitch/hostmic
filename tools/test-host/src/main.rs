@@ -1,7 +1,7 @@
 //! `test-host`: a test host for the hostmic driver.
 //!
 //! ```text
-//! test-host [--seconds N] [--no-detach] [--holder [--close-own-handle]]
+//! test-host [--seconds N] [--no-detach] [--holder [--close-own-handle] | --detach-from-child]
 //! ```
 //!
 //! Attaches to the first host interface, then prints the capture stream's state each time the
@@ -14,6 +14,11 @@
 //! the holder keeps the handle open); `--close-own-handle` also closes the host's own handle,
 //! so that the holder's is the last one, then watches its mapping without touching it (kill the
 //! holder: the driver must undo the mapping in this process, from the holder's).
+//!
+//! `--detach-from-child` checks the reverse: that the mapping lasts while the host lives. It
+//! starts a copy of this program that inherits the host's handle and sends `DETACH` with it
+//! (`--send-detach`, internal); the driver must refuse it (only the host's own process may
+//! detach), and the host then plays as usual.
 //!
 //! While the stream runs, the host plays a 1 kHz tone at -6.02 dBFS: it writes the frames due
 //! by the performance counter into the shared buffer the driver mapped on attach, and advances
@@ -43,8 +48,8 @@ use windows::{
             CM_Get_Device_Interface_ListW, CR_SUCCESS,
         },
         Foundation::{
-            CloseHandle, ERROR_NOT_READY, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
-            SetHandleInformation, WAIT_OBJECT_0,
+            CloseHandle, ERROR_BAD_COMMAND, ERROR_NOT_READY, GENERIC_READ, GENERIC_WRITE, HANDLE,
+            HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
         },
         Media::{timeBeginPeriod, timeEndPeriod},
         Storage::FileSystem::{
@@ -57,30 +62,46 @@ use windows::{
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
             Threading::{
                 AvSetMmThreadCharacteristicsW, CREATE_NO_WINDOW, CreateEventW, CreateProcessW,
-                PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
+                GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
             },
         },
     },
     core::{GUID, HSTRING, PCWSTR, PWSTR, w},
 };
 
-const USAGE: &str = "usage: test-host [--seconds N] [--no-detach] [--holder [--close-own-handle]]";
+const USAGE: &str = "usage: test-host [--seconds N] [--no-detach] [--holder [--close-own-handle] | --detach-from-child]";
+
+/// What the host does with its handle besides playing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Nothing.
+    Plain,
+    /// `--holder`.
+    Holder,
+    /// `--holder --close-own-handle`.
+    HolderOnly,
+    /// `--detach-from-child`.
+    DetachFromChild,
+}
 
 /// Command-line options.
 struct Options {
     seconds: u64,
     detach: bool,
-    holder: bool,
-    close_own_handle: bool,
+    mode: Mode,
+    /// Internal (`--detach-from-child`'s child): the inherited handle value to send `DETACH`
+    /// with.
+    send_detach: Option<u64>,
 }
 
 fn parse() -> Result<Options, String> {
     let mut options = Options {
         seconds: 30,
         detach: true,
-        holder: false,
-        close_own_handle: false,
+        mode: Mode::Plain,
+        send_detach: None,
     };
+    let (mut holder, mut close_own_handle, mut detach_from_child) = (false, false, false);
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -91,14 +112,30 @@ fn parse() -> Result<Options, String> {
                     .map_err(|_| format!("--seconds: not a number: {value}"))?;
             }
             "--no-detach" => options.detach = false,
-            "--holder" => options.holder = true,
-            "--close-own-handle" => options.close_own_handle = true,
+            "--holder" => holder = true,
+            "--close-own-handle" => close_own_handle = true,
+            "--detach-from-child" => detach_from_child = true,
+            "--send-detach" => {
+                let value = args.next().ok_or("--send-detach needs a handle value")?;
+                options.send_detach = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--send-detach: not a number: {value}"))?,
+                );
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
-    if options.close_own_handle && !options.holder {
-        return Err("--close-own-handle needs --holder".to_owned());
-    }
+    options.mode = match (holder, close_own_handle, detach_from_child) {
+        (false, false, false) => Mode::Plain,
+        (true, false, false) => Mode::Holder,
+        (true, true, false) => Mode::HolderOnly,
+        (false, false, true) => Mode::DetachFromChild,
+        (false, true, _) => return Err("--close-own-handle needs --holder".to_owned()),
+        (true, _, true) => {
+            return Err("--detach-from-child and --holder are exclusive".to_owned());
+        }
+    };
     Ok(options)
 }
 
@@ -110,6 +147,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(handle) = options.send_detach {
+        return send_detach(handle);
+    }
     match run(&options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -160,15 +200,19 @@ fn run(options: &Options) -> Result<(), String> {
             reply.buffer
         ));
     }
-    if options.holder {
-        let holder = spawn_holder(&device)?;
-        println!("holder     pid {holder} inherited the host's handle");
-        if options.close_own_handle {
-            drop(device);
-            println!("host       closed its own handle: the holder's is the last");
-            watch_mapping(&reply, options.seconds);
-            return Ok(());
+    match options.mode {
+        Mode::Plain => {}
+        Mode::Holder | Mode::HolderOnly => {
+            let holder = spawn_holder(&device)?;
+            println!("holder     pid {holder} inherited the host's handle");
+            if options.mode == Mode::HolderOnly {
+                drop(device);
+                println!("host       closed its own handle: the holder's is the last");
+                watch_mapping(&reply, options.seconds);
+                return Ok(());
+            }
         }
+        Mode::DetachFromChild => detach_from_child(&device)?,
     }
 
     // SAFETY: the driver mapped `buffer_bytes` bytes at `buffer` into this process until
@@ -201,10 +245,80 @@ fn run(options: &Options) -> Result<(), String> {
 
 /// Starts a process that inherits `device`'s handle and lives for an hour; returns its id.
 fn spawn_holder(device: &Handle) -> Result<u32, String> {
+    let (pid, process) = spawn_inheriting(device, "ping.exe -n 3600 127.0.0.1")?;
+    // The holder runs on its own.
+    drop(process);
+    Ok(pid)
+}
+
+/// `--detach-from-child`: a copy of this program inherits `device`'s handle and sends `DETACH`
+/// with it from its own process; the driver must refuse it. Waits for the child's verdict, its
+/// exit code (see [`send_detach`]).
+fn detach_from_child(device: &Handle) -> Result<(), String> {
+    let program = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let command = format!(
+        "\"{}\" --send-detach {}",
+        program.display(),
+        device.0.0.addr()
+    );
+    let (pid, process) = spawn_inheriting(device, &command)?;
+    // SAFETY: a process handle this program owns.
+    let wait = unsafe { WaitForSingleObject(process.0, 10_000) };
+    if wait != WAIT_OBJECT_0 {
+        return Err(format!("the child (pid {pid}) did not finish"));
+    }
+    let mut code = 0u32;
+    // SAFETY: a process handle with query access (from `CreateProcessW`); a writable code.
+    unsafe { GetExitCodeProcess(process.0, &raw mut code) }
+        .map_err(|e| format!("GetExitCodeProcess: {e}"))?;
+    match code {
+        0 => {
+            println!("child      pid {pid}: DETACH with the inherited handle refused, as it must");
+            Ok(())
+        }
+        1 => Err(format!(
+            "child pid {pid}: DETACH with the inherited handle succeeded: the driver let another process detach the host"
+        )),
+        _ => Err(format!("child pid {pid}: exit code {code}")),
+    }
+}
+
+/// `--send-detach`: sends `DETACH` with the inherited handle `value`. Exit code 0 when the
+/// driver refuses it as from another process than the host's (`ERROR_BAD_COMMAND`), 1 when it
+/// accepts it, 2 on any other outcome. The child has no console: its exit code is its report.
+fn send_detach(value: u64) -> ExitCode {
+    let Ok(value) = usize::try_from(value) else {
+        return ExitCode::from(2);
+    };
+    let handle = HANDLE(core::ptr::without_provenance_mut(value));
+    let mut returned = 0u32;
+    // SAFETY: a handle value inherited from the parent, used for one synchronous request
+    // without buffers; a writable byte count. A wrong value only fails the call.
+    let result = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_DETACH,
+            None,
+            0,
+            None,
+            0,
+            Some(&raw mut returned),
+            None,
+        )
+    };
+    match result {
+        Ok(()) => ExitCode::from(1),
+        Err(error) if error.code() == ERROR_BAD_COMMAND.to_hresult() => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(2),
+    }
+}
+
+/// Starts `command` with `device`'s handle inheritable; returns the process's id and handle.
+fn spawn_inheriting(device: &Handle, command: &str) -> Result<(u32, Handle), String> {
     // SAFETY: an open handle this process owns.
     unsafe { SetHandleInformation(device.0, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
         .map_err(|e| format!("SetHandleInformation: {e}"))?;
-    let mut command: Vec<u16> = "ping.exe -n 3600 127.0.0.1\0".encode_utf16().collect();
+    let mut command: Vec<u16> = command.encode_utf16().chain([0]).collect();
     let startup = STARTUPINFOW {
         cb: u32::try_from(size_of::<STARTUPINFOW>()).unwrap_or(0),
         ..Default::default()
@@ -227,10 +341,8 @@ fn spawn_holder(device: &Handle) -> Result<u32, String> {
         )
     }
     .map_err(|e| format!("CreateProcessW: {e}"))?;
-    // The holder runs on its own; its handles here are not needed.
     drop(Handle(process.hThread));
-    drop(Handle(process.hProcess));
-    Ok(process.dwProcessId)
+    Ok((process.dwProcessId, Handle(process.hProcess)))
 }
 
 /// Prints whether the shared buffer is still mapped at the address `ATTACH` returned, each time

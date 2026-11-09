@@ -257,7 +257,8 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   - **Mapping into the host:** `MmMapLockedPagesSpecifyCache` in user mode raises an exception
     on failure and Rust cannot catch structured exceptions, so a C function of a few lines,
     compiled with `cc`, wraps it in `__try`/`__except`; user mappings are never executable. The
-    mapping is undone in the host's process: on `DETACH`, on the handle's cleanup or close (in
+    mapping is undone in the host's process: on `DETACH` from the host's own process (since
+    M5: a duplicate of its handle in another process may not), on the handle's cleanup or close (in
     whatever process closes it last, attaching to the host's), and from a process notification
     routine (`PsSetCreateProcessNotifyRoutineEx`, hence `/INTEGRITYCHECK`) when the host's
     process exits while another process holds a duplicate of its handle; it runs in the dying
@@ -419,8 +420,11 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   - to M5: the host library enforces the real-time rule the test host had to learn (no I/O,
     lock or allocation in its audio loop; an MMCSS thread; pacing by the performance counter;
     `ERROR_NOT_READY` means "read the stream again"), and reports how late it ever was;
-  - to M6: forcing a detach when the adapter is removed while a handle to the host interface
-    stays open (today the removal waits for a reboot); Driver Verifier over attach, advance,
+  - to M6: a removal while a handle to the host interface stays open waits for a reboot. A
+    forced detach is ruled out since M5: the host writes into the mapping without asking the
+    driver, so the mapping lasts until `DETACH` from the host or the handle's close
+    (`AttachReply::buffer`); hosts on the crate release their handle on a query-remove (M5's
+    device notifications), others keep the removal waiting. Driver Verifier over attach, advance,
     detach and host death; one isolated `capture-check` `FAIL` after a killed host (clean
     level, no glitch, reason not kept, not reproduced in five runs);
   - open question: the `PROPOSEDATAFORMAT` probe (below).
@@ -460,8 +464,9 @@ A driver that maps memory into a user process is a classic source of vulnerabili
     thread. `Player::stop()` signals the stop event.
   - **Device notifications** (`CM_Register_Notification`): wait for the interface to arrive;
     on a query-remove of the host interface, detach and close the handle, so that removing or
-    updating the driver no longer waits for a reboot while a host runs (the forced detach of
-    M6 covers hosts that do not use the crate); attach again when it comes back.
+    updating the driver no longer waits for a reboot while a host runs (a host that keeps its
+    handle keeps the removal waiting: the driver never unmaps under a live host); attach again
+    when it comes back.
   - **Pure parts** (frames due, re-anchoring, the ring's wrap, sample conversion) in a module
     without system calls, unit-tested by the `driver` workflow's `cargo test` on Windows, as
     `hostmic-driver-core` is for the driver.
@@ -496,6 +501,24 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   process holding the host's handle, which can unmap the buffer from under a live host (its
   own pull request), and the host interface refusing every open after a disable and enable
   in Device Manager (its own pull request).
+  *Only the host's process detaches (2026-11-09):* the host writes into the mapping without
+  asking the driver, so the ABI now states how long it lasts (`AttachReply::buffer`): until
+  `DETACH` from the host's own process, the close of every handle to its file object, or the
+  host's exit; nothing else undoes it. `DETACH` was accepted from any process holding the
+  host's handle (an inherited one, say) and now requires the host's process, as `ADVANCE`
+  does; the handle's cleanup and close still detach from whatever process closes the last
+  handle. The adapter's removal cannot find a host whose handle is open: the PnP manager sends
+  `IRP_MN_REMOVE_DEVICE` to a device's children first ("Handling an IRP_MN_REMOVE_DEVICE
+  Request"), and the host interface's device gets it only once its handles are closed (it
+  refuses a query-remove while one is open; after a surprise removal the PnP manager waits for
+  the handles); `HostLink::shutdown` still undoes such a mapping and logs it, should it ever
+  happen. M4's forced detach for M6 is dropped (above). New `test-host --detach-from-child`: a
+  copy of `test-host` inherits the host's handle and sends `DETACH` with it. In the VM, three
+  runs: the child's `DETACH` refused (`NotHost`, `0xC0000184`, one request refused), the host
+  playing to the end and detaching itself; `capture-check` `PASS` twice (0 discontinuity, 0
+  packet skipped) and `FAIL` once, on the first run, 15 s after restoring the VM's checkpoint
+  (15 discontinuities, 17 packets skipped: the host got more than a buffer ahead of the engine),
+  with the same binaries; like M4's isolated `FAIL`, to watch with M5's measurements.
 - **M6, hardening:** security review against the rules above, Driver Verifier, HVCI, sleep and
   resume, host crash, several hours of endurance; M4's carried-over items (above).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine

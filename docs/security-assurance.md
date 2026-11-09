@@ -76,8 +76,8 @@ of the build.
    PortCls. IOCTL input validation in pure Rust, unit-tested and fuzzed (PLAN.md, M4); user
    buffers copied once (`METHOD_BUFFERED`), then validated. `ATTACH` references the host's
    event only for a user-mode request in the requesting process, with `EVENT_MODIFY_STATE`;
-   one host at a time; only the attached handle detaches, and only the attached handle, in the
-   host's own process, advances the position (a duplicated handle in another process cannot);
+   one host at a time; only the attached handle, in the host's own process, detaches or
+   advances the position (a duplicated handle in another process cannot);
    `ADVANCE` is checked against the stream's packed generation and position and committed with
    one compare-and-exchange, so a request computed for an earlier state cannot move the
    position; the interface refuses removal while a handle to it is open, so no request reaches
