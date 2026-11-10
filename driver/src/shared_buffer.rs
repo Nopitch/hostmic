@@ -183,6 +183,15 @@ impl BufferRef {
         }
     }
 
+    /// Writes zeroes over the whole pages that hold the first `bytes` bytes (at most the whole
+    /// buffer): what a client maps when it is given those bytes, since a mapping is made of
+    /// whole pages. A stream's buffer of 3840 bytes, say, shows its client the 256 bytes after
+    /// it too, which an earlier, larger stream may have filled with the host's audio.
+    pub fn zero_pages(&self, bytes: usize) {
+        let page = PAGE_SIZE as usize;
+        self.zero(bytes.div_ceil(page).saturating_mul(page));
+    }
+
     /// A new MDL over the buffer's first `bytes` bytes, for a stream; freed with
     /// [`BufferRef::free_stream_mdl`] while `self` lives. `None` when `bytes` is 0 or exceeds
     /// the buffer, or when memory is short.
