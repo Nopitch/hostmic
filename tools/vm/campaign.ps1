@@ -498,8 +498,8 @@ function Test-Disable {
         Disable-PnpDevice -InstanceId $interface.InstanceId -Confirm:$false
         Check ((Invoke-Tool 'hostmic-ctl' @('info') 10).Code -ne 0) 'the host interface answered while disabled'
         # Removed: it declares D3; started again: D0.
-        $off = Get-PowerState $interface.InstanceId
-        Check ($off -eq 'D3') "the host interface is not in D3 while disabled (state $off)"
+        $id = $interface.InstanceId
+        Check (Wait-Until { (Get-PowerState $id) -eq 'D3' } 5) "the host interface is not in D3 while disabled (state $(Get-PowerState $id))"
         Enable-PnpDevice -InstanceId $interface.InstanceId -Confirm:$false
         Check (Wait-InterfaceAnswers 15) 'the host interface did not answer after a disable and enable'
         $on = Get-PowerState $interface.InstanceId

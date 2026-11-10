@@ -880,8 +880,9 @@ unsafe fn unmap_in(process: PEPROCESS, buffer: &BufferRef, mapping: NonNull<c_vo
 
 /// Runs `f` holding `lock`, a guarded mutex. `PASSIVE_LEVEL` or `APC_LEVEL`; a control path,
 /// never per audio period.
-fn with_lock<R>(lock: &UnsafeCell<KGUARDED_MUTEX>, f: impl FnOnce() -> R) -> R {
-    // SAFETY: an initialized guarded mutex (`init`, `driver_init`), at IRQL <= APC_LEVEL.
+pub(crate) fn with_lock<R>(lock: &UnsafeCell<KGUARDED_MUTEX>, f: impl FnOnce() -> R) -> R {
+    // SAFETY: an initialized guarded mutex (`init`, `driver_init`, `host_device::create`), at
+    // IRQL <= APC_LEVEL.
     unsafe { KeAcquireGuardedMutex(lock.get()) };
     let result = f();
     // SAFETY: acquired above by this thread.

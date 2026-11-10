@@ -22,7 +22,7 @@
 
 use core::{
     cell::UnsafeCell,
-    mem::{offset_of, size_of},
+    mem::{MaybeUninit, offset_of, size_of},
     ptr::{self, NonNull},
     slice,
     sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering},
@@ -47,23 +47,23 @@ use wdk_sys::{
     IRP_MN_QUERY_CAPABILITIES, IRP_MN_QUERY_DEVICE_RELATIONS, IRP_MN_QUERY_DEVICE_TEXT,
     IRP_MN_QUERY_ID, IRP_MN_QUERY_POWER, IRP_MN_QUERY_REMOVE_DEVICE, IRP_MN_QUERY_STOP_DEVICE,
     IRP_MN_REMOVE_DEVICE, IRP_MN_SET_POWER, IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE,
-    IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS, PACCESS_TOKEN, PDEVICE_OBJECT, PIO_STATUS_BLOCK,
-    POOL_FLAG_PAGED, POWER_STATE, PVOID, SL_PENDING_RETURNED, STATUS_ACCESS_DENIED,
-    STATUS_BUFFER_TOO_SMALL, STATUS_DELETE_PENDING, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY,
-    STATUS_DEVICE_REMOVED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE,
-    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_PENDING, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
-    SYSTEM_POWER_STATE, ULONG, UNICODE_STRING,
+    IRP_MN_SURPRISE_REMOVAL, KGUARDED_MUTEX, NT_SUCCESS, NTSTATUS, PACCESS_TOKEN, PDEVICE_OBJECT,
+    PIO_STATUS_BLOCK, POOL_FLAG_PAGED, POWER_STATE, PVOID, SL_PENDING_RETURNED,
+    STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_DELETE_PENDING, STATUS_DEVICE_BUSY,
+    STATUS_DEVICE_NOT_READY, STATUS_DEVICE_REMOVED, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER,
+    STATUS_NO_SUCH_DEVICE, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_PENDING, STATUS_SUCCESS,
+    STATUS_UNSUCCESSFUL, SYSTEM_POWER_STATE, ULONG, UNICODE_STRING,
     ntddk::{
         ExAllocatePool2, ExFreePool, IoDeleteDevice, IoGetCurrentProcess, IoGetRequestorProcess,
         IoIs32bitProcess, IoRegisterDeviceInterface, IoSetDeviceInterfaceState, IofCompleteRequest,
-        ObReferenceObjectByHandle, ObfReferenceObject, PoRequestPowerIrp, PoSetPowerState,
-        PsGetCurrentProcessId, RtlFreeUnicodeString, SeQueryInformationToken,
+        KeInitializeGuardedMutex, ObReferenceObjectByHandle, ObfReferenceObject, PoRequestPowerIrp,
+        PoSetPowerState, PsGetCurrentProcessId, RtlFreeUnicodeString, SeQueryInformationToken,
     },
 };
 
 use crate::adapter::{current_stack_location, wide};
-use crate::host_link::{AdvanceError, HostLink, LinkRef};
+use crate::host_link::{AdvanceError, HostLink, LinkRef, with_lock};
 use crate::ks::size_ulong;
 
 /// The child's device type.
@@ -134,6 +134,10 @@ pub struct HostDevice {
     /// The device power state last declared to the power manager ([`declare_power`]):
     /// `PowerDeviceUnspecified` until the first start.
     power: AtomicI32,
+    /// Serializes the declarations of [`declare_power`] with the checks that decide them, so
+    /// that a device power request handled while the device is being removed cannot declare D0
+    /// after the removal's D3. Initialized by [`create`]; `PASSIVE_LEVEL` only.
+    power_lock: UnsafeCell<KGUARDED_MUTEX>,
     /// The interface's symbolic link name, registered on the first start. Only PnP requests
     /// for this child and [`delete`] (once nothing else can reach it) touch it, and the PnP
     /// manager serializes them.
@@ -190,6 +194,8 @@ pub unsafe fn create(
         return Err(status);
     }
     let device = NonNull::new(device).ok_or(STATUS_UNSUCCESSFUL)?;
+    // SAFETY: plain data, all zeroes until `KeInitializeGuardedMutex` below.
+    let mutex: KGUARDED_MUTEX = unsafe { MaybeUninit::zeroed().assume_init() };
     // SAFETY: a device object just created and not reported to anyone yet: unique access.
     let object = unsafe { &mut *device.as_ptr() };
     // SAFETY: the extension is `size_of::<HostDevice>()` bytes, aligned for pointers, unused.
@@ -206,6 +212,7 @@ pub unsafe fn create(
                 open_files: AtomicU32::new(0),
                 remove_pending: AtomicBool::new(false),
                 power: AtomicI32::new(_DEVICE_POWER_STATE::PowerDeviceUnspecified),
+                power_lock: UnsafeCell::new(mutex),
                 link: UnsafeCell::new(UNICODE_STRING {
                     Length: 0,
                     MaximumLength: 0,
@@ -214,6 +221,13 @@ pub unsafe fn create(
                 shared,
             });
     };
+    {
+        // SAFETY: the extension was just written and is not shared yet.
+        let this = unsafe { &*object.DeviceExtension.cast::<HostDevice>() };
+        // SAFETY: a guarded mutex in the device extension, which does not move while the
+        // device object lives; PASSIVE_LEVEL.
+        unsafe { KeInitializeGuardedMutex(this.power_lock.get()) };
+    }
     // Power requests at PASSIVE_LEVEL; the device is ready for requests.
     object.Flags |= DO_POWER_PAGABLE;
     object.Flags &= !DO_DEVICE_INITIALIZING;
@@ -530,11 +544,13 @@ unsafe fn pnp(device: PDEVICE_OBJECT, irp: *mut IRP, stack: &IO_STACK_LOCATION) 
             STATUS_SUCCESS
         }
         IRP_MN_REMOVE_DEVICE => {
-            // SAFETY: a PnP request for this device.
-            unsafe { stop(device) };
             // SAFETY: a live device of this module.
             let this = unsafe { this(device) };
+            // Removed before `stop` declares D3, as a surprise removal is: a device power
+            // request handled meanwhile then sees the device gone (`power_lock`).
             this.removed.store(true, Ordering::Release);
+            // SAFETY: a PnP request for this device.
+            unsafe { stop(device) };
             if !this.present.load(Ordering::Acquire) {
                 // SAFETY: removed and no longer reported by the adapter. As in Microsoft's
                 // bus samples, deleted before the request completes: the I/O manager keeps
@@ -616,7 +632,11 @@ unsafe fn start(device: PDEVICE_OBJECT) -> NTSTATUS {
     if NT_SUCCESS(status) {
         // Started: in D0, as the power manager must be told by the device's bus driver.
         // SAFETY: a live device of this module, PASSIVE_LEVEL.
-        unsafe { declare_power(device, this, _DEVICE_POWER_STATE::PowerDeviceD0) };
+        unsafe {
+            declare_power(device, this, _DEVICE_POWER_STATE::PowerDeviceD0, |_, _| {
+                true
+            });
+        };
         // A device disabled and enabled again in Device Manager is queried for removal,
         // removed, then started, with no cancellation in between: both flags go back here,
         // before opens are allowed again.
@@ -645,31 +665,49 @@ unsafe fn stop(device: PDEVICE_OBJECT) {
         let status = unsafe { IoSetDeviceInterfaceState(link, 0) };
         println!("hostmic: host interface disabled: {status:#010x}");
     }
-    let power = this.power.load(Ordering::Acquire);
-    if power != _DEVICE_POWER_STATE::PowerDeviceUnspecified
-        && power != _DEVICE_POWER_STATE::PowerDeviceD3
-    {
-        // SAFETY: a live device of this module, PASSIVE_LEVEL.
-        unsafe { declare_power(device, this, _DEVICE_POWER_STATE::PowerDeviceD3) };
+    // Not for a device never started, nor a second time after a surprise removal.
+    // SAFETY: a live device of this module, PASSIVE_LEVEL.
+    unsafe {
+        declare_power(
+            device,
+            this,
+            _DEVICE_POWER_STATE::PowerDeviceD3,
+            |_, current| {
+                current != _DEVICE_POWER_STATE::PowerDeviceUnspecified
+                    && current != _DEVICE_POWER_STATE::PowerDeviceD3
+            },
+        );
     }
 }
 
-/// Declares `state` as the device's power state to the power manager (`PoSetPowerState`), and
-/// records it.
+/// Declares `state` as the device's power state to the power manager (`PoSetPowerState`) and
+/// records it, if `when` (given the device and the state last declared) allows it: both under
+/// the device's `power_lock`, so that what `when` checks holds for the declaration.
 ///
 /// # Safety
 ///
-/// `device` is a live host interface PDO, whose extension is `this`; `IRQL <= DISPATCH_LEVEL`.
-unsafe fn declare_power(device: PDEVICE_OBJECT, this: &HostDevice, state: DEVICE_POWER_STATE) {
-    // SAFETY: the caller's contract. The previous state it returns is not needed.
-    unsafe {
-        PoSetPowerState(
-            device,
-            _POWER_STATE_TYPE::DevicePowerState,
-            POWER_STATE { DeviceState: state },
-        )
-    };
-    this.power.store(state, Ordering::Release);
+/// `device` is a live host interface PDO, whose extension is `this`; `PASSIVE_LEVEL`.
+unsafe fn declare_power(
+    device: PDEVICE_OBJECT,
+    this: &HostDevice,
+    state: DEVICE_POWER_STATE,
+    when: impl FnOnce(&HostDevice, DEVICE_POWER_STATE) -> bool,
+) {
+    with_lock(&this.power_lock, || {
+        if !when(this, this.power.load(Ordering::Acquire)) {
+            return;
+        }
+        // SAFETY: the caller's contract (PoSetPowerState: IRQL <= APC_LEVEL). The previous
+        // state it returns is not needed.
+        unsafe {
+            PoSetPowerState(
+                device,
+                _POWER_STATE_TYPE::DevicePowerState,
+                POWER_STATE { DeviceState: state },
+            )
+        };
+        this.power.store(state, Ordering::Release);
+    });
 }
 
 /// `IRP_MN_QUERY_CAPABILITIES`: a raw device, installed silently, without wake.
@@ -764,9 +802,10 @@ unsafe fn reply_target_relation(irp: *mut IRP, device: PDEVICE_OBJECT) -> NTSTAT
 }
 
 /// Power requests, as the child's bus driver and power policy owner. The device has no
-/// hardware: it accepts every state; a system power change becomes a device power request
-/// ([`set_system_power`]), and a device power change is declared ([`declare_power`]). No wake
-/// (`IRP_MN_WAIT_WAKE` keeps the I/O manager's `STATUS_NOT_SUPPORTED`).
+/// hardware: it accepts every state; a system power request (set or query) becomes a device
+/// power request of the same kind ([`system_power`]), and a device power change is declared
+/// ([`declare_power`]). No wake (`IRP_MN_WAIT_WAKE` keeps the I/O manager's
+/// `STATUS_NOT_SUPPORTED`).
 ///
 /// # Safety
 ///
@@ -776,26 +815,30 @@ unsafe fn power(device: PDEVICE_OBJECT, irp: *mut IRP, stack: &IO_STACK_LOCATION
     // SAFETY: the parameters of a power request.
     let parameters = unsafe { stack.Parameters.Power };
     match (u32::from(stack.MinorFunction), parameters.Type) {
-        (IRP_MN_SET_POWER, _POWER_STATE_TYPE::SystemPowerState) => {
+        (IRP_MN_SET_POWER | IRP_MN_QUERY_POWER, _POWER_STATE_TYPE::SystemPowerState) => {
             // SAFETY: a system power request: `SystemState` is the union's member.
             let system = unsafe { parameters.State.SystemState };
             // SAFETY: the caller's contract.
-            unsafe { set_system_power(device, irp, system) }
+            unsafe { system_power(device, irp, stack.MinorFunction, system) }
         }
         (IRP_MN_SET_POWER, _POWER_STATE_TYPE::DevicePowerState) => {
             // SAFETY: a device power request: `DeviceState` is the union's member.
             let state = unsafe { parameters.State.DeviceState };
             // SAFETY: a live device of this module.
             let this = unsafe { this(device) };
-            // Declared only for a device in place: a request that a system power change sent
-            // just before a (surprise) removal leaves the removal's D3.
             let valid = (_DEVICE_POWER_STATE::PowerDeviceD0..=_DEVICE_POWER_STATE::PowerDeviceD3)
                 .contains(&state);
-            let gone = this.removed.load(Ordering::Acquire)
-                || this.surprise_removed.load(Ordering::Acquire);
-            if valid && !gone {
+            if valid {
+                // Declared only for a device in place: a request that a system power change
+                // sent just before a (surprise) removal leaves the removal's D3. A bus driver
+                // may even fail a power-up of a removed device; this one has nothing to fail.
                 // SAFETY: a live device of this module, PASSIVE_LEVEL.
-                unsafe { declare_power(device, this, state) };
+                unsafe {
+                    declare_power(device, this, state, |this, _| {
+                        !this.removed.load(Ordering::Acquire)
+                            && !this.surprise_removed.load(Ordering::Acquire)
+                    });
+                };
             }
             // SAFETY: the caller's contract.
             unsafe { complete_status(irp, STATUS_SUCCESS) }
@@ -817,24 +860,26 @@ fn device_state_for(system: SYSTEM_POWER_STATE) -> DEVICE_POWER_STATE {
     }
 }
 
-/// `IRP_MN_SET_POWER` for a system power state. As the power policy owner, the device requests
-/// a device power request for the matching state from the power manager (`PoRequestPowerIrp`),
+/// `IRP_MN_SET_POWER` or `IRP_MN_QUERY_POWER` (`minor`) for a system power state. As the power
+/// policy owner, the device requests a device power request of the same kind for the matching
+/// state from the power manager (`PoRequestPowerIrp`), even when it is already in that state,
 /// and completes the system request once that one is done ([`system_power_done`]). Nothing to
-/// request when the device is not started (the next start declares D0) or already in that
-/// state. A system power request cannot fail: it completes with success either way.
+/// request when the device is not started (the next start declares D0). A system set-power
+/// request cannot fail: it completes with success either way; a query, with its device query's
+/// status (success: nothing here can refuse a state).
 ///
 /// # Safety
 ///
 /// A power request owned by this driver for `device`; `PASSIVE_LEVEL`.
-unsafe fn set_system_power(
+unsafe fn system_power(
     device: PDEVICE_OBJECT,
     irp: *mut IRP,
+    minor: u8,
     system: SYSTEM_POWER_STATE,
 ) -> NTSTATUS {
     // SAFETY: a live device of this module.
     let this = unsafe { this(device) };
-    let target = device_state_for(system);
-    if !this.started.load(Ordering::Acquire) || this.power.load(Ordering::Acquire) == target {
+    if !this.started.load(Ordering::Acquire) {
         // SAFETY: the caller's contract.
         return unsafe { complete_status(irp, STATUS_SUCCESS) };
     }
@@ -843,11 +888,6 @@ unsafe fn set_system_power(
     // `PoRequestPowerIrp` returns.
     // SAFETY: the caller's contract; not completed yet.
     unsafe { mark_pending(irp) };
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "a minor function code, 0x02"
-    )]
-    let minor = IRP_MN_SET_POWER as u8;
     // SAFETY: a live device object; a completion routine of the required type, whose context
     // is `irp`, which this driver owns until that routine completes it; no IRP pointer wanted.
     let status = unsafe {
@@ -855,47 +895,56 @@ unsafe fn set_system_power(
             device,
             minor,
             POWER_STATE {
-                DeviceState: target,
+                DeviceState: device_state_for(system),
             },
             Some(system_power_done),
             irp.cast(),
             ptr::null_mut(),
         )
     };
-    if !NT_SUCCESS(status) {
+    // Any other status: no request was sent, and the completion routine will not be called.
+    if status != STATUS_PENDING {
         println!("hostmic: host interface device power request failed: {status:#010x}");
-        // SAFETY: the completion routine is only called for a request that was sent: `irp` is
-        // still this driver's. Marked pending, it may complete here and return STATUS_PENDING.
+        // SAFETY: `irp` is still this driver's (above). Marked pending, it may complete here and
+        // return STATUS_PENDING.
         unsafe { complete_status(irp, STATUS_SUCCESS) };
     }
     STATUS_PENDING
 }
 
-/// Completion routine of the device power request [`set_system_power`] sent: completes the
-/// system power request, its `context`, with success.
+/// Completion routine of the device power request [`system_power`] sent: completes the system
+/// power request, its `context`: a set-power one with success, a query with the device query's
+/// status.
 ///
 /// # Safety
 ///
-/// Called by the power manager, at `IRQL <= DISPATCH_LEVEL`, once that request is done;
-/// `context` is the system power request, owned by this driver and not completed yet.
+/// Called by the power manager, at `PASSIVE_LEVEL` or `DISPATCH_LEVEL`, once that request is
+/// done; `context` is the system power request, owned by this driver and not completed yet.
 unsafe extern "C" fn system_power_done(
     _device: PDEVICE_OBJECT,
-    _minor: u8,
+    minor: u8,
     _state: POWER_STATE,
     context: PVOID,
     io_status: PIO_STATUS_BLOCK,
 ) {
     // SAFETY: the power manager passes the device request's status block, valid for the call,
     // possibly null.
-    if let Some(io_status) = unsafe { io_status.as_ref() } {
+    let status = match unsafe { io_status.as_ref() } {
         // SAFETY: `Status` is the union's member for a completed request.
-        let status = unsafe { io_status.__bindgen_anon_1.Status };
-        if !NT_SUCCESS(status) {
-            println!("hostmic: host interface device power request completed with {status:#010x}");
-        }
+        Some(io_status) => unsafe { io_status.__bindgen_anon_1.Status },
+        None => STATUS_SUCCESS,
+    };
+    if !NT_SUCCESS(status) {
+        println!("hostmic: host interface device power request completed with {status:#010x}");
     }
-    // SAFETY: the caller's contract; nothing touches it afterwards.
-    unsafe { complete_status(context.cast(), STATUS_SUCCESS) };
+    let status = if u32::from(minor) == IRP_MN_QUERY_POWER {
+        status
+    } else {
+        STATUS_SUCCESS
+    };
+    // SAFETY: the caller's contract; nothing touches it afterwards. `IofCompleteRequest` runs
+    // at either IRQL.
+    unsafe { complete_status(context.cast(), status) };
 }
 
 /// `IoMarkIrpPending`, an inline function of `wdm.h` that `wdk-sys` does not bind.
