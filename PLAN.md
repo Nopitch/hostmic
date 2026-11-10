@@ -887,15 +887,19 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   *IOCTL fuzzer (2026-11-10):* `tools/ioctl-fuzz` (docs/test-vm.md, section 6; the campaign's
   `fuzz` scenario) sends every vendor control code with every method and access, the six codes
   with every size around theirs and invalid buffer addresses, `ATTACH` with handles that are not
-  a usable event, other requests (read, write, flush, lock, information, cancelled overlapped
-  requests), and runs threads and processes that attach, advance with valid and stale positions,
-  detach, hand their handles to short-lived processes and die while attached, some killed; every
-  process must end and the interface be free afterwards. In the VM under Driver Verifier, 60 s
-  runs (about 175000 operations, 200 processes) find no crash and nothing unexpected but one: a
+  a usable event, other requests (read, write, flush, lock, information, overlapped requests each
+  followed by `CancelIoEx`), and runs threads and processes that attach, advance with valid,
+  stale and random positions (all refused: no capture stream runs then; the `tone`, `load` and
+  `kills` scenarios cover advancing), detach, hand their handles to short-lived processes and
+  die while attached, some killed; every process must end and the interface be free afterwards.
+  It checks that its requests reach the driver (the driver's refusal counter grows by the vendor
+  codes sent; relative and trailing-name opens fail with the driver's statuses). In the VM under
+  Driver Verifier, 60 s runs (about 175000 operations in four threads, about 200 worker
+  processes) find no crash and nothing unexpected but one: a
   process at low integrity (checked: level 0x1000) opens the host interface for writing, and so
   could attach as the host. The device object has no integrity label (`IoCreateDeviceSecure`
   takes a DACL only), and despite Microsoft's "objects that lack an integrity label are treated
-  as medium", the open succeeds; the fix is the next pull request.
+  as medium", the open succeeds; the fix is #83.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

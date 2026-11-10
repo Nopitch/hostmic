@@ -18,9 +18,11 @@
 //! - `sizes`: the six codes with every input and output size around theirs, invalid buffer
 //!   addresses, and `ATTACH` with handle values that are not a usable event.
 //! - `requests`: other requests on the handle (read, write, flush, lock, query and set
-//!   information), and overlapped requests cancelled at once.
+//!   information), and overlapped requests, each followed by `CancelIoEx` (the driver completes
+//!   its requests at once: nothing is left to cancel, and nothing may hang).
 //! - `stress`, for `N` seconds (default 30): `T` threads here and `P` processes, each with its
-//!   own handles, attach, advance, detach, read the state and counters, open and close handles,
+//!   own handles, attach, advance (refused unless a capture stream runs), detach, read the
+//!   state and counters, open and close handles,
 //!   hand handles to short-lived processes and exit abruptly while attached; this program kills
 //!   a process at random every few hundred milliseconds and starts another. Meanwhile it reads
 //!   the counters, which must never go back.
@@ -62,8 +64,9 @@ use windows::{
         },
         Foundation::{
             CloseHandle, DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, ERROR_ACCESS_DENIED,
-            ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
-            HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation, UNICODE_STRING, WAIT_OBJECT_0,
+            ERROR_IO_PENDING, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, HANDLE,
+            HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, STATUS_ACCESS_DENIED,
+            SetHandleInformation, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::{
             Authorization::ConvertStringSidToSidW, DuplicateTokenEx, GetLengthSid,
@@ -79,10 +82,12 @@ use windows::{
             ReadFile, SetFileInformationByHandle, WriteFile,
         },
         System::{
-            IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED},
+            IO::{CancelIoEx, DeviceIoControl, GetOverlappedResultEx, IO_STATUS_BLOCK, OVERLAPPED},
             JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-                JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
             },
             Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc},
             SystemServices::SE_GROUP_INTEGRITY,
@@ -227,10 +232,12 @@ fn run(options: &Options) -> Result<u32, String> {
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
     };
-    if event.is_some() && control(&device, IOCTL_DETACH, &[], &mut []).is_err() {
-        findings.note("end: DETACH after the final ATTACH failed");
+    if event.is_some() {
+        if control(&device, IOCTL_DETACH, &[], &mut []).is_err() {
+            findings.note("end: DETACH after the final ATTACH failed");
+        }
+        println!("end        the interface is free");
     }
-    println!("end        the interface is free");
     Ok(findings.count)
 }
 
@@ -268,16 +275,27 @@ fn opens(path: &str, findings: &mut Findings) -> Result<(), String> {
     {
         findings.note("opens: ATTACH not refused as access denied on a read-only handle");
     }
-    // A name after the device's: FILE_DEVICE_SECURE_OPEN and the driver refuse it.
-    if open(&format!("{path}\\x"), GENERIC_READ.0, false).is_ok() {
-        findings.note("opens: an open with a name in the device's namespace succeeded");
+    // A name after the device's: the driver refuses it (STATUS_OBJECT_PATH_NOT_FOUND).
+    let path_not_found = ERROR_PATH_NOT_FOUND.to_hresult().0;
+    match open(&format!("{path}\\x"), GENERIC_READ.0, false) {
+        Err(error) if error.code().0 == path_not_found => {}
+        Err(error) => findings.note(&format!(
+            "opens: an open with a name in the device's namespace failed with {:#010x}, not as the driver refuses it",
+            error.code().0
+        )),
+        Ok(_) => findings.note("opens: an open with a name in the device's namespace succeeded"),
     }
-    // Relative to an open handle, with and without a name: the driver refuses both.
+    // Relative to an open handle, with and without a name: the driver refuses both with
+    // STATUS_ACCESS_DENIED (any other failure means the request never reached it).
     for name in ["", "x"] {
-        if relative_open(&both, name).is_ok() {
-            findings.note(&format!(
+        match relative_open(&both, name) {
+            Err(status) if status == STATUS_ACCESS_DENIED.0 => {}
+            Err(status) => findings.note(&format!(
+                "opens: an open relative to a handle ({name:?}) failed with {status:#010x}, not as the driver refuses it"
+            )),
+            Ok(_) => findings.note(&format!(
                 "opens: an open relative to a handle ({name:?}) succeeded"
-            ));
+            )),
         }
     }
     drop((both, read, write));
@@ -286,7 +304,9 @@ fn opens(path: &str, findings: &mut Findings) -> Result<(), String> {
         Ok(code) => findings.note(&format!(
             "opens: the low-integrity probe reported {code:#x}"
         )),
-        Err(error) => println!("opens      low integrity: not run ({error})"),
+        Err(error) => findings.note(&format!(
+            "opens: the low-integrity probe did not run: {error}"
+        )),
     }
     println!("opens      done");
     Ok(())
@@ -313,7 +333,9 @@ fn relative_open(root: &Handle, name: &str) -> Result<Handle, i32> {
     let result = unsafe {
         NtCreateFile(
             &raw mut handle,
-            FILE_ACCESS_RIGHTS(GENERIC_READ.0),
+            // SYNCHRONIZE (0x0010_0000): required with FILE_SYNCHRONOUS_IO_NONALERT, or the I/O manager fails
+            // the open before it reaches the driver.
+            FILE_ACCESS_RIGHTS(GENERIC_READ.0 | 0x0010_0000),
             &raw const attributes,
             &raw mut status,
             None,
@@ -487,7 +509,7 @@ fn codes(path: &str, rng: &mut Rng, findings: &mut Findings) -> Result<(), Strin
     let mut sent = 0u32;
     let mut try_code = |code: u32, rng: &mut Rng, findings: &mut Findings| {
         if CODES.iter().any(|&(known, ..)| known == code) {
-            return;
+            return false;
         }
         let in_len = rng.size();
         let out_len = rng.size();
@@ -498,19 +520,37 @@ fn codes(path: &str, rng: &mut Rng, findings: &mut Findings) -> Result<(), Strin
                 "codes: {code:#010x} succeeded ({in_len} in, {out_len} out)"
             ));
         }
+        true
     };
+    // The driver counts every refused device control request: the counter must grow by as many
+    // as were sent, which shows they reached it (no other process runs during this phase).
+    let before = read_stats(&device).map(|stats| stats.requests_refused);
+    let mut vendor = 0u64;
     for function in 0x800..=0xFFF_u32 {
         for method in 0..4 {
             for access in 0..4 {
-                try_code(ctl_code(0x22, function, method, access), rng, findings);
+                if try_code(ctl_code(0x22, function, method, access), rng, findings) {
+                    vendor += 1;
+                }
             }
         }
     }
+    let after = read_stats(&device).map(|stats| stats.requests_refused);
+    match (before, after) {
+        (Some(before), Some(after)) if after.wrapping_sub(before) == vendor => {}
+        _ => findings.note(&format!(
+            "codes: the driver counted {:?} refusals for {vendor} requests sent",
+            after
+                .zip(before)
+                .map(|(after, before)| after.wrapping_sub(before))
+        )),
+    }
+    // Random codes of any device type (file system control codes among them).
     for _ in 0..4096 {
         let code = u32::try_from(rng.next() >> 32).unwrap_or(0);
         try_code(code, rng, findings);
     }
-    println!("codes      {sent} requests");
+    println!("codes      {sent} requests, {vendor} of them vendor codes counted by the driver");
     Ok(())
 }
 
@@ -540,7 +580,7 @@ fn sizes(path: &str, rng: &mut Rng, findings: &mut Findings) -> Result<(), Strin
                     ));
                 }
                 if code == IOCTL_ATTACH && result.is_ok() {
-                    let _ = control(&device, IOCTL_DETACH, &[], &mut []);
+                    detach(&device, "sizes", findings);
                 }
             }
         }
@@ -548,6 +588,9 @@ fn sizes(path: &str, rng: &mut Rng, findings: &mut Findings) -> Result<(), Strin
     // Buffers at addresses that are reserved but not committed, in the kernel's half, or null.
     // SAFETY: reserves address space only; never touched by this program.
     let reserved = unsafe { VirtualAlloc(None, BUFFER, MEM_RESERVE, PAGE_NOACCESS) };
+    if reserved.is_null() {
+        return Err("VirtualAlloc: no address space reserved".to_owned());
+    }
     let bad: [*mut c_void; 3] = [
         reserved,
         core::ptr::without_provenance_mut(0xFFFF_8000_0000_1000),
@@ -572,59 +615,34 @@ fn sizes(path: &str, rng: &mut Rng, findings: &mut Findings) -> Result<(), Strin
                 // only ever written within `output`.
                 let result =
                     unsafe { raw_control(&device, code, in_ptr, in_len, out_ptr, out_len) };
-                // A null buffer is sent as no buffer (Windows sets its length to 0): a request
-                // without input may succeed with it. Any other address must fail.
-                if result.is_ok() && !address.is_null() {
+                // A null buffer is sent as no buffer (Windows sets its length to 0): the request
+                // may succeed only if that side's size is 0 in its contract (a request without
+                // input, or `DETACH`'s empty reply). Any other address must fail.
+                let nulled_size = if in_ptr.is_null() { in_size } else { out_size };
+                if result.is_ok() && (!address.is_null() || nulled_size != 0) {
                     findings.note(&format!(
                         "sizes: {name} succeeded with an invalid buffer at {address:p}"
                     ));
                 }
                 if result.is_ok() && code == IOCTL_ATTACH {
-                    let _ = control(&device, IOCTL_DETACH, &[], &mut []);
+                    detach(&device, "sizes", findings);
                 }
             }
         }
     }
-    // ATTACH with handle values that are not a usable event: closed, a mutex, an event without
-    // EVENT_MODIFY_STATE, the device itself, pseudo-handles, values with high bits.
-    let closed = new_event()?.value();
-    // SAFETY: an unnamed mutex, no security attributes.
-    let mutex = Handle(
-        unsafe { CreateMutexW(None, false, PCWSTR::null()) }
-            .map_err(|e| format!("CreateMutexW: {e}"))?,
-    );
-    let synchronize_only = duplicate(&event, 0x0010_0000)?;
-    let values = [
-        0,
-        closed,
-        mutex.value(),
-        synchronize_only.value(),
-        device.value(),
-        0xFFFF_FFFF,
-        0xFFFF_FFFE,
-        0x8000_0004,
-        0x1_0000_0004,
-        u64::MAX,
-    ];
-    for value in values {
-        sent += 1;
-        let mut reply = [0u8; AttachReply::SIZE];
-        if control(
-            &device,
-            IOCTL_ATTACH,
-            &attach_request(value).to_bytes(),
-            &mut reply,
-        )
-        .is_ok()
-        {
-            findings.note(&format!(
-                "sizes: ATTACH succeeded with the event handle value {value:#x}"
-            ));
-            let _ = control(&device, IOCTL_DETACH, &[], &mut []);
-        }
-    }
+    sent += bad_events(&device, &event, findings)?;
     println!("sizes      {sent} requests");
     Ok(())
+}
+
+/// `DETACH` after an `ATTACH` that succeeded; a failure is a finding of `phase` (later
+/// `ATTACH`es would all be refused as busy, testing nothing).
+fn detach(device: &impl AsRawHandle, phase: &str, findings: &mut Findings) {
+    if let Err(code) = control(device, IOCTL_DETACH, &[], &mut []) {
+        findings.note(&format!(
+            "{phase}: DETACH after an ATTACH failed with {code:#010x}"
+        ));
+    }
 }
 
 /// The sizes to try around `size`.
@@ -669,7 +687,9 @@ fn requests(path: &str, rng: &mut Rng, findings: &mut Findings) -> Result<(), St
         )
     };
 
-    // Overlapped requests, cancelled as soon as they are sent.
+    // Overlapped requests, each followed by CancelIoEx. The driver completes its requests at
+    // once, so the cancellation normally finds nothing pending: this checks that overlapped
+    // handles and cancellation attempts are handled, not a cancel routine (it has none).
     let overlapped_device = open(path, GENERIC_READ.0 | GENERIC_WRITE.0, true)
         .map_err(|e| format!("overlapped open: {e}"))?;
     let event = new_event()?;
@@ -683,59 +703,84 @@ fn requests(path: &str, rng: &mut Rng, findings: &mut Findings) -> Result<(), St
         } else {
             rng.fill(&mut input);
         }
-        let mut output = [0u8; 64];
-        let mut overlapped = OVERLAPPED {
-            hEvent: event.0,
-            ..Default::default()
-        };
         sent += 1;
-        // SAFETY: an overlapped handle; buffers and the OVERLAPPED live until the request is
-        // over (GetOverlappedResult waits below).
-        let started = unsafe {
-            DeviceIoControl(
-                overlapped_device.0,
-                code,
-                Some(input.as_ptr().cast()),
-                u32::try_from(in_size).unwrap_or(0),
-                Some(output.as_mut_ptr().cast()),
-                u32::try_from(out_size).unwrap_or(0),
-                None,
-                Some(&raw mut overlapped),
-            )
-        };
-        let pending = matches!(&started, Err(e) if e.code() == ERROR_IO_PENDING.to_hresult());
-        if started.is_ok() || pending {
-            // SAFETY: the handle and the OVERLAPPED of the request just sent.
-            let _ = unsafe { CancelIoEx(overlapped_device.0, Some(&raw const overlapped)) };
-            let mut transferred = 0u32;
-            // SAFETY: waits for that request to be over before its buffers go.
-            let _ = unsafe {
-                GetOverlappedResult(
-                    overlapped_device.0,
-                    &raw const overlapped,
-                    &raw mut transferred,
-                    true,
-                )
-            };
-        }
-        if code == IOCTL_ATTACH {
-            // This driver completes requests at once, so a request on the overlapped handle
-            // without an OVERLAPPED waits as on a synchronous one.
-            let _ = control(&overlapped_device, IOCTL_DETACH, &[], &mut []);
+        let attached = overlapped_control(
+            &overlapped_device,
+            &event,
+            code,
+            &input[..in_size],
+            out_size,
+        );
+        if code == IOCTL_ATTACH && attached {
+            overlapped_control(&overlapped_device, &event, IOCTL_DETACH, &[], 0);
         }
     }
     println!("requests   other requests and {sent} overlapped ones");
     Ok(())
 }
 
+/// An overlapped device control request on `device`, followed by `CancelIoEx`; waits up to 10 s
+/// for it to be over. Whether it succeeded. A request still pending then is a finding that ends
+/// this program at once (its buffers cannot be released while the kernel may write them; the
+/// process's end cancels it).
+fn overlapped_control(
+    device: &Handle,
+    event: &Handle,
+    code: u32,
+    input: &[u8],
+    out_len: usize,
+) -> bool {
+    let mut output = [0u8; 64];
+    let mut overlapped = OVERLAPPED {
+        hEvent: event.0,
+        ..Default::default()
+    };
+    // SAFETY: an overlapped handle; buffers (out_len is at most 40) and the OVERLAPPED live
+    // until the request is over (waited for below).
+    let started = unsafe {
+        DeviceIoControl(
+            device.0,
+            code,
+            (!input.is_empty()).then_some(input.as_ptr().cast()),
+            u32::try_from(input.len()).unwrap_or(0),
+            Some(output.as_mut_ptr().cast()),
+            u32::try_from(out_len.min(output.len())).unwrap_or(0),
+            None,
+            Some(&raw mut overlapped),
+        )
+    };
+    let pending = matches!(&started, Err(e) if e.code() == ERROR_IO_PENDING.to_hresult());
+    if started.is_err() && !pending {
+        return false;
+    }
+    // SAFETY: the handle and the OVERLAPPED of the request just sent.
+    let _ = unsafe { CancelIoEx(device.0, Some(&raw const overlapped)) };
+    let mut transferred = 0u32;
+    // SAFETY: waits for that request to be over before its buffers go.
+    let done = unsafe {
+        GetOverlappedResultEx(
+            device.0,
+            &raw const overlapped,
+            &raw mut transferred,
+            10_000,
+            false,
+        )
+    };
+    if let Err(error) = &done
+        && error.code() == windows::core::HRESULT::from_win32(WAIT_TIMEOUT.0)
+    {
+        println!(
+            "UNEXPECTED requests: an overlapped request ({code:#010x}) was still pending after 10 s"
+        );
+        println!("FAIL       stopped");
+        std::process::exit(1);
+    }
+    done.is_ok()
+}
+
 /// `stress`: threads here and processes that attach, advance, detach and die.
 fn stress(path: &str, options: &Options, seed: u64, findings: &mut Findings) -> Result<(), String> {
-    // SAFETY: an unnamed job, no security attributes.
-    let job = Handle(
-        unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-            .map_err(|e| format!("CreateJobObjectW: {e}"))?,
-    );
-    let _ = JOB.set(job.0.0.addr());
+    let job = new_job()?;
     let end = Instant::now() + Duration::from_secs(options.seconds);
     let operations = Arc::new(AtomicU64::new(0));
     let threads: Vec<_> = (0..options.threads)
@@ -797,25 +842,13 @@ fn stress(path: &str, options: &Options, seed: u64, findings: &mut Findings) -> 
     for thread in threads {
         let _ = thread.join();
     }
-    // Every process started (workers, holders, their children) must end: within a few seconds
-    // on its own, or once killed. One that cannot end even then is stuck in the kernel.
-    let waited = Instant::now();
-    let mut left = wait_job_empty(&job, 10);
-    if left > 0 {
-        println!("stress     {left} process(es) still running after 10 s: killing them");
-        // SAFETY: the job this program created.
-        let _ = unsafe { TerminateJobObject(job.0, KILLED) };
-        left = wait_job_empty(&job, 20);
-        if left > 0 {
-            findings.note(&format!(
-                "stress: {left} process(es) could not end, even killed"
-            ));
-        }
+    wait_processes(&job, findings);
+    let attached = ATTACHED.load(Ordering::Relaxed);
+    if attached == 0 {
+        findings.note(
+            "stress: no ATTACH succeeded in this program's threads: nothing attached was tested",
+        );
     }
-    println!(
-        "stress     every process ended {} ms after the last operation",
-        waited.elapsed().as_millis()
-    );
     for process in &processes {
         if let Some(code) = wait_exit(process, 0)
             && code != 0
@@ -830,11 +863,39 @@ fn stress(path: &str, options: &Options, seed: u64, findings: &mut Findings) -> 
         ));
     }
     println!(
-        "stress     {} operations in {} threads, {spawned} processes ({killed} killed)",
+        "stress     {} operations in {} threads ({attached} attachments), {spawned} worker processes ({killed} killed)",
         operations.load(Ordering::Relaxed),
         options.threads
     );
     Ok(())
+}
+
+/// The `ATTACH`es that succeeded in this process's stress threads.
+static ATTACHED: AtomicU64 = AtomicU64::new(0);
+
+/// The job object of the processes `stress` starts, set as [`JOB`].
+fn new_job() -> Result<Handle, String> {
+    // SAFETY: an unnamed job, no security attributes.
+    let job = Handle(
+        unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+            .map_err(|e| format!("CreateJobObjectW: {e}"))?,
+    );
+    // Its processes die with this one (when the campaign kills it on a time-out, say), so that
+    // none keeps a handle that would make the next scenario's removal wait.
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: a job this program owns; a structure of the given size.
+    unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            u32::try_from(size_of_val(&limits)).unwrap_or(0),
+        )
+    }
+    .map_err(|e| format!("SetInformationJobObject: {e}"))?;
+    let _ = JOB.set(job.0.0.addr());
+    Ok(job)
 }
 
 /// `--worker SEED SECONDS`: a stress process; ends abruptly at a random point, sometimes
@@ -921,6 +982,7 @@ impl Worker {
         let mut reply = [0u8; AttachReply::SIZE];
         let request = attach_request(event.value()).to_bytes();
         if control(handle, IOCTL_ATTACH, &request, &mut reply).is_ok() {
+            ATTACHED.fetch_add(1, Ordering::Relaxed);
             self.events.push(event);
             if self.events.len() > 4 {
                 self.events.remove(0);
@@ -1369,5 +1431,93 @@ impl Rng {
             let bytes = self.next().to_le_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
+    }
+}
+
+/// `ATTACH` with handle values that are not a usable event; how many requests were sent.
+fn bad_events(device: &Handle, event: &Handle, findings: &mut Findings) -> Result<u32, String> {
+    let mut sent = 0u32;
+    // ATTACH with handle values that are not a usable event: closed, a mutex, an event without
+    // EVENT_MODIFY_STATE, the device itself, pseudo-handles, values with high bits. The mutex
+    // and the duplicate first, so that the closed event's value is not reused by them.
+    // SAFETY: an unnamed mutex, no security attributes.
+    let mutex = Handle(
+        unsafe { CreateMutexW(None, false, PCWSTR::null()) }
+            .map_err(|e| format!("CreateMutexW: {e}"))?,
+    );
+    let synchronize_only = duplicate(event, 0x0010_0000)?;
+    let closed = new_event()?.value();
+    // A positive control: a valid ATTACH succeeds here, so the refusals below are the event's.
+    let mut reply = [0u8; AttachReply::SIZE];
+    if control(
+        device,
+        IOCTL_ATTACH,
+        &attach_request(event.value()).to_bytes(),
+        &mut reply,
+    )
+    .is_ok()
+    {
+        detach(device, "sizes", findings);
+    } else {
+        findings.note("sizes: a valid ATTACH failed before the bad events: they test nothing");
+    }
+    let values = [
+        0,
+        closed,
+        mutex.value(),
+        synchronize_only.value(),
+        device.value(),
+        0xFFFF_FFFF,
+        0xFFFF_FFFE,
+        0x8000_0004,
+        0x1_0000_0004,
+        u64::MAX,
+    ];
+    for value in values {
+        sent += 1;
+        let mut reply = [0u8; AttachReply::SIZE];
+        if control(
+            device,
+            IOCTL_ATTACH,
+            &attach_request(value).to_bytes(),
+            &mut reply,
+        )
+        .is_ok()
+        {
+            findings.note(&format!(
+                "sizes: ATTACH succeeded with the event handle value {value:#x}"
+            ));
+            detach(device, "sizes", findings);
+        }
+    }
+    Ok(sent)
+}
+
+/// Waits for every process of `job` to end, killing them after 10 s; a process still
+/// running then, or one that cannot end even killed, is a finding.
+fn wait_processes(job: &Handle, findings: &mut Findings) {
+    // Every process started (workers, holders, their children) must end: within a few seconds
+    // on its own, or once killed. One that cannot end even then is stuck in the kernel.
+    let waited = Instant::now();
+    // Workers live 5 s at most and holders half a second: one still running after 10 s is
+    // stuck, most likely in a request.
+    let left = wait_job_empty(job, 10);
+    if left > 0 {
+        findings.note(&format!(
+            "stress: {left} process(es) still running 10 s after the last operation: killing them"
+        ));
+        // SAFETY: the job this program created.
+        let _ = unsafe { TerminateJobObject(job.0, KILLED) };
+        let still = wait_job_empty(job, 20);
+        if still > 0 {
+            findings.note(&format!(
+                "stress: {still} process(es) could not end, even killed"
+            ));
+        }
+    } else {
+        println!(
+            "stress     every process ended {} ms after the last operation",
+            waited.elapsed().as_millis()
+        );
     }
 }

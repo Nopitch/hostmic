@@ -182,7 +182,7 @@ of the build.
   state; the device's own idle transitions to D3 and back are tested in the VM, section 2.5).
   A process at low integrity can open the host interface for writing, and so attach as the
   host: the device object has no integrity label, and `IoCreateDeviceSecure` takes a DACL only
-  (found by `tools/ioctl-fuzz`, M6; the fix is the security review's next pull request).
+  (found by `tools/ioctl-fuzz`, M6; fixed by #83).
 
 - A single maintainer: no second human reviewer yet (GOVERNANCE.md).
 - Release signing and provenance attestations (M7).

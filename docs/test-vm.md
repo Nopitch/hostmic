@@ -283,9 +283,11 @@ to a handle, refused; a low-integrity process may read, not write), `codes` (eve
 control code, method and access, and random ones: only the six host interface codes succeed),
 `sizes` (the six codes with every size around theirs, invalid buffer addresses, and `ATTACH`
 with handle values that are not a usable event), `requests` (read, write, flush, lock,
-information requests, and overlapped requests cancelled at once), `stress` (threads and
-processes that open, attach, advance with valid and stale positions, detach, hand handles to
-short-lived processes and die while attached, while some are killed; every process must end),
+information requests, and overlapped requests each followed by `CancelIoEx`), `stress` (threads
+and processes that open, attach, advance with valid, stale and random positions, detach, hand
+handles to short-lived processes and die while attached, while some are killed; every process
+must end). No capture stream runs meanwhile, so every `ADVANCE` is refused: the advancing path
+itself is the `tone`, `load` and `kills` scenarios',
 and `end`: the interface is free. Expected: `PASS`; each `UNEXPECTED` line names what happened.
 A bug check or a Driver Verifier stop is the other way it fails.
 

@@ -453,10 +453,12 @@ function Test-Handles {
 # The host interface fuzzed from user mode (tools/ioctl-fuzz); its seed is in the log.
 function Test-Fuzz {
     $fuzz = Invoke-Tool 'ioctl-fuzz' @('--seconds', "$Seconds") ($Seconds + 300)
-    Check ($fuzz.Code -eq 0) "$(Find-Line $fuzz.Text '^(UNEXPECTED|FAIL|error)') (log $(Split-Path $fuzz.Log -Leaf))"
+    # The first unexpected result names the problem; the FAIL line only counts them.
+    $first = ($fuzz.Text -split "`r?`n") | Where-Object { $_ -match '^(UNEXPECTED|error)' } | Select-Object -First 1
+    Check ($fuzz.Code -eq 0) "$(if ($first) { $first.Trim() } else { Find-Line $fuzz.Text '^FAIL' }) (log $(Split-Path $fuzz.Log -Leaf))"
     $codes = if ((Find-Line $fuzz.Text '^codes') -match '(\d+) requests') { $Matches[1] } else { '?' }
-    $stress = if ((Find-Line $fuzz.Text '^stress +\d+ operations') -match '(\d+) operations in (\d+) threads, (\d+) processes \((\d+) killed\)') {
-        "$($Matches[1]) operations in $($Matches[2]) threads and $($Matches[3]) processes ($($Matches[4]) killed)"
+    $stress = if ((Find-Line $fuzz.Text '^stress +\d+ operations') -match '(\d+) operations in (\d+) threads \((\d+) attachments\), (\d+) worker processes \((\d+) killed\)') {
+        "$($Matches[1]) operations in $($Matches[2]) threads ($($Matches[3]) attachments) and $($Matches[4]) worker processes ($($Matches[5]) killed)"
     } else { '?' }
     "$codes control codes, sizes, other requests; $stress; the interface free at the end ($(Find-Line $fuzz.Text '^seed'))"
 }
