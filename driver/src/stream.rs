@@ -9,8 +9,10 @@
 //! - `GetPosition` reads the position (an atomic); `GetReadPacket` also moves the number of the
 //!   packet the engine read last (a compare-and-exchange, so that a racing stop's reset wins)
 //!   and counts skipped packets: no lock, no allocation, any IRQL up to `DISPATCH_LEVEL`.
-//! - State changes, buffer allocation and event registration run at `PASSIVE_LEVEL`,
-//!   serialized by PortCls, and publish what changes to the host link.
+//! - State changes, buffer allocation and event registration run at `PASSIVE_LEVEL` and
+//!   publish what changes to the host link. State changes are serialized by PortCls; buffer
+//!   allocation and release are not documented to be, and serialize themselves
+//!   (`Stream::allocate`).
 //!
 //! The stream's buffer is the start of the adapter's shared buffer ([`crate::shared_buffer`]):
 //! `AllocateAudioBuffer` returns a partial MDL over it, sized up from the request
@@ -20,7 +22,7 @@
 use core::{
     ffi::c_void,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use hostmic_abi::{Format, SampleType, State};
@@ -35,11 +37,13 @@ use hostmic_sys::{
     KSRTAUDIO_HWLATENCY, KSRTAUDIO_HWREGISTER, KSSTATE, PKSAUDIO_POSITION, PKSDATAFORMAT, guid,
 };
 use wdk_sys::{
-    _MEMORY_CACHING_TYPE, DWORD, FALSE, MDL, MEMORY_CACHING_TYPE, NTSTATUS, PKEVENT, PMDL,
-    STATUS_DEVICE_NOT_READY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_STATE,
+    _MEMORY_CACHING_TYPE, DWORD, FALSE, LARGE_INTEGER, MDL, MEMORY_CACHING_TYPE, NTSTATUS, PKEVENT,
+    PMDL, STATUS_DEVICE_NOT_READY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_STATE,
     STATUS_INVALID_PARAMETER, STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
     STATUS_SUCCESS, STATUS_UNSUCCESSFUL, TRUE, ULONG, ULONG64,
 };
+
+use wdk_sys::ntddk::KeDelayExecutionThread;
 
 use crate::com::{self, ComObject, Unknown};
 use crate::host_link::LinkRef;
@@ -73,6 +77,9 @@ pub struct Stream {
     mdl: AtomicPtr<MDL>,
     /// Frames per packet in event-driven mode, 0 in polling mode.
     frames_per_packet: AtomicU64,
+    /// Held while `allocate` builds a buffer or `free` releases one: a second allocation
+    /// meanwhile is refused instead of building another buffer over it, and a free waits.
+    allocating: AtomicBool,
     /// The notification event this stream registered with the host link, to release it if
     /// PortCls does not.
     event: AtomicPtr<wdk_sys::_KEVENT>,
@@ -126,6 +133,7 @@ pub fn new(link: LinkRef) -> Option<Unknown> {
         shared: AtomicPtr::new(ptr::null_mut()),
         mdl: AtomicPtr::new(ptr::null_mut()),
         frames_per_packet: AtomicU64::new(0),
+        allocating: AtomicBool::new(false),
         event: AtomicPtr::new(ptr::null_mut()),
         link,
     })?;
@@ -143,7 +151,12 @@ impl Stream {
         (self.buffer_bytes.load(Ordering::Acquire) / FRAME_BYTES) as u64
     }
 
-    /// Takes a buffer in the shared buffer; `packets` is 0 in polling mode.
+    /// Takes a buffer in the shared buffer; `packets` is 0 in polling mode. PortCls does not
+    /// document that it serializes these requests on a pin, and any process that opens the pin
+    /// can send `KSPROPERTY_RTAUDIO_BUFFER`: holding `allocating` makes the check that the
+    /// stream has no buffer and the buffer's publication one step, so that two requests at
+    /// once cannot both build one (the second's MDL and buffer reference would replace the
+    /// first's, which would never be freed).
     fn allocate(
         &self,
         requested: ULONG,
@@ -158,6 +171,31 @@ impl Stream {
         {
             return STATUS_INVALID_PARAMETER;
         }
+        if self
+            .allocating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            wdk::println!("hostmic: allocate refused: another allocation is in progress");
+            return STATUS_UNSUCCESSFUL;
+        }
+        let status = self.allocate_claimed(
+            requested, packets, mdl_out, actual_out, offset_out, cache_out,
+        );
+        self.allocating.store(false, Ordering::Release);
+        status
+    }
+
+    /// [`Stream::allocate`]'s work, with `allocating` held and the out-parameters not null.
+    fn allocate_claimed(
+        &self,
+        requested: ULONG,
+        packets: ULONG,
+        mdl_out: *mut PMDL,
+        actual_out: *mut ULONG,
+        offset_out: *mut ULONG,
+        cache_out: *mut MEMORY_CACHING_TYPE,
+    ) -> NTSTATUS {
         if !self.buffer.load(Ordering::Acquire).is_null() {
             return STATUS_UNSUCCESSFUL;
         }
@@ -204,10 +242,35 @@ impl Stream {
     /// `FreeAudioBuffer`: PortCls gives back `mdl`, the one `allocate` returned, no longer
     /// mapped into the audio engine. `PASSIVE_LEVEL`, stream stopped.
     fn free(&self, mdl: PMDL) {
-        if mdl != self.mdl.load(Ordering::Acquire) {
+        // The same gate as `allocate`: an allocation in progress could otherwise publish its
+        // buffer between this release's steps, which would then free the new MDL while PortCls
+        // maps it. A free cannot fail: it waits for the allocation (a short wait).
+        while self
+            .allocating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let mut interval = LARGE_INTEGER {
+                // 100 µs, relative (negative), in 100 ns units.
+                QuadPart: -1000,
+            };
+            // SAFETY: PASSIVE_LEVEL (FreeAudioBuffer's contract); a valid relative interval.
+            let _ = unsafe {
+                KeDelayExecutionThread(
+                    0, // KernelMode
+                    0, // not alertable
+                    &raw mut interval,
+                )
+            };
+        }
+        if mdl == self.mdl.load(Ordering::Acquire) {
+            self.release_buffer();
+        } else {
+            // Not this stream's buffer: releasing the stream's own here could free an MDL the
+            // audio engine still maps.
             wdk::println!("hostmic: FreeAudioBuffer with an MDL this stream did not allocate");
         }
-        self.release_buffer();
+        self.allocating.store(false, Ordering::Release);
     }
 
     /// Lets the buffer go: the host link first (no host advances into it any more), then the

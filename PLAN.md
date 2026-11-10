@@ -941,6 +941,17 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   output length counts as 0, so the output-size checks refuse a request before it changes
   anything, and a reply is written only to a system buffer that exists. The independent review
   suggested the output length: an `ATTACH` would otherwise map the buffer, then fail to say where.
+  *Stream buffer allocation (2026-11-10):* the stream checked that it had no buffer, then built
+  and published one, in separate steps; PortCls documents no serialization of
+  `AllocateAudioBuffer` and `AllocateBufferWithNotification` on a pin, and any process that opens
+  the capture pin can send `KSPROPERTY_RTAUDIO_BUFFER`. Two requests at once could both build a
+  partial MDL and a buffer reference, the second's replacing the first's, which leaked. An
+  `allocating` flag, taken by compare-and-exchange for the whole allocation, now refuses a second
+  one meanwhile (`STATUS_UNSUCCESSFUL`); `FreeAudioBuffer` takes the same flag, waiting for an
+  allocation in progress, so that it cannot free a buffer published between its check and its
+  release (the independent review found that window in the first version); and a free with an
+  MDL that is not the stream's releases nothing (it released the stream's own buffer, which the
+  audio engine might still map).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
