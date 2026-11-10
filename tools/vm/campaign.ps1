@@ -34,7 +34,8 @@
                  threads and processes that attach, advance, detach and die; nothing
                  unexpected, and the interface free at the end
       removal    devcon remove while a host plays unloads the driver; after the reinstall the
-                 host attaches again and plays cleanly
+                 host attaches again and plays cleanly; the host interface keeps its instance
+                 ID and leaves no phantom device
       disable    disabling and enabling the host interface (with and without a host) and the
                  adapter (with a host): the host lets go and attaches again; the host
                  interface is in D3 while disabled, in D0 again after
@@ -296,8 +297,9 @@ function Assert-Alive($Tool, [string]$What) {
 function Install-Driver {
     $install = Invoke-Devcon @('install', (Join-Path $Dir 'hostmic_driver.inf'), 'root\hostmic')
     Check ($install.Text -match 'successfully') "devcon install failed (log $(Split-Path $install.Log -Leaf))"
-    # A host interface disabled before an earlier removal comes back disabled.
-    Start-Sleep -Seconds 2
+    # A host interface disabled before an earlier removal comes back disabled: it keeps its
+    # devnode (HOSTMIC\HOST\0) across reinstalls. Wait for it to be present, then enable it.
+    Check (Wait-Until { $null -ne (Get-HostInterface) } 20) 'no host interface device within 20 s of the install'
     Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like 'HOSTMIC\*' -and $_.Problem -eq 'CM_PROB_DISABLED' } |
         ForEach-Object { Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false }
@@ -475,17 +477,26 @@ function Test-Fuzz {
 
 function Test-Removal {
     $player = Start-PlayingHost 300
+    # The host interface keeps its instance ID across the reinstall (UniqueID): no new device,
+    # present or not (a phantom), is left behind.
+    $interface = Get-HostInterface
+    Check ($null -ne $interface) 'no host interface device'
+    $devices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'HOSTMIC\*' }).Count
     Remove-Driver
     # Removed, the endpoint is "not present" (4) rather than unplugged (8).
     Check (Wait-Until { (Get-EndpointState) -ne 1 } 10) "the microphone stayed active after the removal (DeviceState $(Get-EndpointState))"
     Install-Driver
     Check (Wait-Plugged 20) 'the host did not attach again after the reinstall'
+    $again = Get-HostInterface
+    Check ($null -ne $again -and $again.InstanceId -eq $interface.InstanceId) "the host interface was $($interface.InstanceId) before the reinstall, $($again.InstanceId) after"
+    $after = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'HOSTMIC\*' }).Count
+    Check ($after -eq $devices) "$devices hostmic host interface devices (present or not) before the reinstall, $after after"
     $capture = Assert-Capture 10 'after the reinstall'
     Assert-Alive $player 'across the removal'
     $played = Stop-Tool $player
     $counts = Get-Attachments $played.Text
     Check ($counts[0] -ge 2 -and $counts[1] -ge 1) "attachments $($counts[0]), releases $($counts[1]) (log $(Split-Path $played.Log -Leaf))"
-    "unloaded while a host played, attached again after the reinstall: $capture"
+    "unloaded while a host played, attached again after the reinstall as $($again.InstanceId) ($after host interface devices): $capture"
 }
 
 function Test-Disable {

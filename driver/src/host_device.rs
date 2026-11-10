@@ -78,7 +78,11 @@ const IO_NO_INCREMENT: i8 = 0;
 
 /// The live host interface PDOs, one per adapter: [`owns`] recognizes them by address, without
 /// reading anything from a device object (the adapter's FDO belongs to PortCls).
-static DEVICES: [AtomicPtr<DEVICE_OBJECT>; 4] = [const { AtomicPtr::new(ptr::null_mut()) }; 4];
+static DEVICES: [AtomicPtr<DEVICE_OBJECT>; SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; SLOTS];
+
+/// The host interfaces the driver keeps track of at once, one per adapter ([`DEVICES`]).
+const SLOTS: usize = 4;
 
 /// The child's device class, `{FEFD76E2-6428-43C6-A8E1-776C497C8CB4}`: administrators can
 /// override its security descriptor under this class in the registry, as for any device
@@ -104,14 +108,23 @@ static SDDL: [u16; 42] = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
 
 /// `BusQueryDeviceID`, and the only hardware ID.
 static DEVICE_ID: [u16; 13] = wide("HOSTMIC\\Host");
-/// `BusQueryInstanceID`: unique among the adapter's children (`UniqueID` is 0).
-static INSTANCE_ID: [u16; 2] = wide("0");
+/// `BusQueryInstanceID`, by the PDO's slot in [`DEVICES`]: unique in the system, as
+/// `UniqueID` (1) says, among the host interfaces present at once, which hold distinct slots.
+/// The device keeps its name, and its devnode (with its disabled flag and registry settings),
+/// across the adapter's reinstallations; with `UniqueID` 0 the PnP manager named it after the
+/// adapter's devnode, which every uninstall replaces, and each left a phantom device behind.
+/// With several adapters, the name follows the order they start in, not the adapter: the host
+/// interfaces are interchangeable. Never a constant: two adapters' host interfaces with the
+/// same instance ID would be a duplicate device (code 42 on the second).
+static INSTANCE_IDS: [[u16; 2]; SLOTS] = [wide("0"), wide("1"), wide("2"), wide("3")];
 /// `DeviceTextDescription`: the name Device Manager shows.
 static DESCRIPTION: [u16; 23] = wide("hostmic host interface");
 
 /// The child's device extension.
 #[repr(C)]
 pub struct HostDevice {
+    /// The PDO's slot in [`DEVICES`], which names it ([`INSTANCE_IDS`]).
+    slot: usize,
     /// Whether the adapter still reports this child; cleared by [`detach`].
     present: AtomicBool,
     /// Whether the adapter reported this child to the PnP manager at least once ([`report`]).
@@ -195,6 +208,26 @@ pub unsafe fn create(
         return Err(status);
     }
     let device = NonNull::new(device).ok_or(STATUS_UNSUCCESSFUL)?;
+    // Registered first, as its slot names it, and before `DO_DEVICE_INITIALIZING` is cleared,
+    // which the previous order did the other way round (a create in between would have gone
+    // to PortCls with this extension). The PnP manager only learns of the device from the next
+    // bus relations query; an open by its generated name meanwhile is refused while that flag
+    // is set (the I/O manager's behaviour, not documented), and would otherwise find the
+    // extension zeroed by `IoCreateDevice` (documented): `started` false, refused before
+    // anything else is read.
+    let Some(slot) = DEVICES.iter().position(|slot| {
+        slot.compare_exchange(
+            ptr::null_mut(),
+            device.as_ptr(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    }) else {
+        // SAFETY: a device object nobody else knows of.
+        unsafe { IoDeleteDevice(device.as_ptr()) };
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    };
     // SAFETY: plain data, all zeroes until `KeInitializeGuardedMutex` below.
     let mutex: KGUARDED_MUTEX = unsafe { MaybeUninit::zeroed().assume_init() };
     // SAFETY: a device object just created and not reported to anyone yet: unique access.
@@ -205,6 +238,7 @@ pub unsafe fn create(
             .DeviceExtension
             .cast::<HostDevice>()
             .write(HostDevice {
+                slot,
                 present: AtomicBool::new(true),
                 enumerated: AtomicBool::new(false),
                 started: AtomicBool::new(false),
@@ -232,23 +266,6 @@ pub unsafe fn create(
     // Power requests at PASSIVE_LEVEL; the device is ready for requests.
     object.Flags |= DO_POWER_PAGABLE;
     object.Flags &= !DO_DEVICE_INITIALIZING;
-
-    // Registered before anyone can send it a request: the PnP manager only learns of it from
-    // the next bus relations query.
-    let registered = DEVICES.iter().any(|slot| {
-        slot.compare_exchange(
-            ptr::null_mut(),
-            device.as_ptr(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
-    });
-    if !registered {
-        // SAFETY: a device object nobody else knows of.
-        unsafe { IoDeleteDevice(device.as_ptr()) };
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
     Ok(device)
 }
 
@@ -583,7 +600,16 @@ unsafe fn pnp(device: PDEVICE_OBJECT, irp: *mut IRP, stack: &IO_STACK_LOCATION) 
                 BUS_QUERY_ID_TYPE::BusQueryDeviceID => (&DEVICE_ID, 0),
                 // A multi-string: one more NUL.
                 BUS_QUERY_ID_TYPE::BusQueryHardwareIDs => (&DEVICE_ID, 1),
-                BUS_QUERY_ID_TYPE::BusQueryInstanceID => (&INSTANCE_ID, 0),
+                BUS_QUERY_ID_TYPE::BusQueryInstanceID => {
+                    // SAFETY: a live device of this module.
+                    let slot = unsafe { this(device) }.slot;
+                    match INSTANCE_IDS.get(slot) {
+                        Some(id) => (id, 0),
+                        // Not reached: `create` takes a slot of `DEVICES`.
+                        // SAFETY: a PnP request owned by this driver.
+                        None => return unsafe { complete_unchanged(irp) },
+                    }
+                }
                 // SAFETY: a PnP request owned by this driver.
                 _ => return unsafe { complete_unchanged(irp) },
             };
@@ -747,7 +773,8 @@ unsafe fn capabilities(stack: &IO_STACK_LOCATION) -> NTSTATUS {
     capabilities.set_RawDeviceOK(1);
     capabilities.set_SilentInstall(1);
     capabilities.set_SurpriseRemovalOK(1);
-    capabilities.set_UniqueID(0);
+    // The instance ID is unique in the system (`INSTANCE_IDS`).
+    capabilities.set_UniqueID(1);
     let working = _SYSTEM_POWER_STATE::PowerSystemWorking as usize;
     for (state, device_state) in capabilities.DeviceState.iter_mut().enumerate() {
         if state == working {
