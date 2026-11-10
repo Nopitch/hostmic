@@ -30,6 +30,9 @@
                  the next host plays cleanly
       handles    handle-check's rules: a closed handle detaches, a duplicate in another
                  process neither detaches the host nor keeps a dead host's mapping
+      fuzz       ioctl-fuzz for -Seconds: opens, control codes, sizes, other requests, then
+                 threads and processes that attach, advance, detach and die; nothing
+                 unexpected, and the interface free at the end
       removal    devcon remove while a host plays unloads the driver; after the reinstall the
                  host attaches again and plays cleanly
       disable    disabling and enabling the host interface (with and without a host) and the
@@ -48,8 +51,8 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('install', 'power', 'tone', 'latency', 'load', 'kills', 'handles', 'removal', 'disable',
-        'audiosrv', 'uninstall')]
+    [ValidateSet('install', 'power', 'tone', 'latency', 'load', 'kills', 'handles', 'fuzz', 'removal',
+        'disable', 'audiosrv', 'uninstall')]
     [string[]]$Only,
     [ValidateRange(10, 86400)]
     [int]$Seconds = 30,
@@ -62,8 +65,8 @@ Set-StrictMode -Version 3
 $ErrorActionPreference = 'Stop'
 
 $Dir = $PSScriptRoot
-$Scenarios = 'install', 'power', 'tone', 'latency', 'load', 'kills', 'handles', 'removal', 'disable',
-'audiosrv', 'uninstall'
+$Scenarios = 'install', 'power', 'tone', 'latency', 'load', 'kills', 'handles', 'fuzz', 'removal',
+'disable', 'audiosrv', 'uninstall'
 if ($Only) { $Scenarios = $Scenarios | Where-Object { $Only -contains $_ } }
 $LogDir = Join-Path $Dir ('log-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $null = New-Item -ItemType Directory -Path $LogDir
@@ -447,6 +450,17 @@ function Test-Handles {
     'a closed handle detaches; a child cannot detach the host; a dead host is detached despite a holder; the last handle unmaps'
 }
 
+# The host interface fuzzed from user mode (tools/ioctl-fuzz); its seed is in the log.
+function Test-Fuzz {
+    $fuzz = Invoke-Tool 'ioctl-fuzz' @('--seconds', "$Seconds") ($Seconds + 300)
+    Check ($fuzz.Code -eq 0) "$(Find-Line $fuzz.Text '^(UNEXPECTED|FAIL|error)') (log $(Split-Path $fuzz.Log -Leaf))"
+    $codes = if ((Find-Line $fuzz.Text '^codes') -match '(\d+) requests') { $Matches[1] } else { '?' }
+    $stress = if ((Find-Line $fuzz.Text '^stress +\d+ operations') -match '(\d+) operations in (\d+) threads, (\d+) processes \((\d+) killed\)') {
+        "$($Matches[1]) operations in $($Matches[2]) threads and $($Matches[3]) processes ($($Matches[4]) killed)"
+    } else { '?' }
+    "$codes control codes, sizes, other requests; $stress; the interface free at the end ($(Find-Line $fuzz.Text '^seed'))"
+}
+
 function Test-Removal {
     $player = Start-PlayingHost 300
     Remove-Driver
@@ -595,6 +609,7 @@ foreach ($name in $Scenarios) {
             'load' { Test-Measure 'load' }
             'kills' { Test-Kills }
             'handles' { Test-Handles }
+            'fuzz' { Test-Fuzz }
             'removal' { Test-Removal }
             'disable' { Test-Disable }
             'audiosrv' { Test-AudioService }

@@ -7,6 +7,7 @@ members = [
     "hostmic-sys",
     "tools/capture-check",
     "tools/handle-check",
+    "tools/ioctl-fuzz",
     "tools/hostmic-ctl",
     "tools/measure",
     "tools/test-host",

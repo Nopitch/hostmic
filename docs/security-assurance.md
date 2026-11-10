@@ -145,7 +145,7 @@ of the build.
 - Clippy (pedantic, `-D warnings`), with `undocumented_unsafe_blocks` and
   `multiple_unsafe_ops_per_block` forbidden in the driver; CodeQL; zizmor.
 - VM tests documented in [docs/test-vm.md](test-vm.md), including a measured recording
-  (`tools/capture-check`: frequency, level, discontinuities), run as a campaign of eleven
+  (`tools/capture-check`: frequency, level, discontinuities), run as a campaign of twelve
   scenarios (`tools/vm/campaign.ps1`) on the debug and the release packages, among them the
   device idling to D3 through PortCls's inactivity timer and streaming again from it.
 - Driver Verifier (M6, [docs/test-vm.md](test-vm.md), section 9): the campaign passes with the
@@ -162,7 +162,11 @@ of the build.
   [docs/test-vm.md](test-vm.md), section 10): on the adapter, PnP transitions with Microsoft's
   test filter (surprise removal among them), an IOCTL fuzzer on the Kernel Streaming filters in
   the kernel, an API fuzzer and a reinstall with I/O pass. They leave the host interface out (a
-  raw device).
+  raw device); `tools/ioctl-fuzz` covers it from user mode instead ([docs/test-vm.md](test-vm.md),
+  section 6, and the campaign's `fuzz` scenario): every control code, method and access, sizes
+  and invalid buffer addresses, bad event handles, other requests, opens by kind and
+  integrity level, and threads and processes that attach, advance and die while others are
+  killed.
 - The host crate `hostmic` (M5) under the same `unsafe` lints; its writes into the shared
   buffer are volatile, never through a Rust reference, and its pure parts (the clock, the
   ring's wrap, sample conversion) are unit-tested in CI.
@@ -176,10 +180,9 @@ of the build.
   Driver Verifier's code integrity checks and the CI check of the binaries stand in for it,
   section 2.5). Sleep and hibernation on a real machine (M7: a Hyper-V guest has no sleep
   state; the device's own idle transitions to D3 and back are tested in the VM, section 2.5).
-  The host interface's
-  IOCTLs are fuzzed only in their pure validation code, not in the kernel code that calls it:
-  Microsoft's fuzzers leave that raw device out, and a fuzzer of our own is planned with the
-  security review (M6).
+  A process at low integrity can open the host interface for writing, and so attach as the
+  host: the device object has no integrity label, and `IoCreateDeviceSecure` takes a DACL only
+  (found by `tools/ioctl-fuzz`, M6; the fix is the security review's next pull request).
 
 - A single maintainer: no second human reviewer yet (GOVERNANCE.md).
 - Release signing and provenance attestations (M7).

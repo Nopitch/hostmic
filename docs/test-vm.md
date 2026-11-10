@@ -268,6 +268,27 @@ The microphone's jack follows the host. The endpoint's state is in the registry,
 while `test-host` is attached, 8 again once it detaches or is killed; `capture-check` then
 finds no active "hostmic" endpoint.
 
+The host interface is fuzzed from user mode with `tools/ioctl-fuzz` (cargo-fuzz covers the
+driver's pure validation; this covers the kernel code around it, which Microsoft's Device
+Fundamentals fuzzers leave out). Copy `target\release\ioctl-fuzz.exe` to `C:\hostmic\`, with no
+other host attached, under Driver Verifier (section 9):
+
+```powershell
+C:\hostmic\ioctl-fuzz.exe --seconds 60
+```
+
+It prints its seed (`--seed` replays the same choices), then one line per phase: `opens`
+(read, write and read-write opens and what each allows; opens with a trailing name or relative
+to a handle, refused; a low-integrity process may read, not write), `codes` (every vendor
+control code, method and access, and random ones: only the six host interface codes succeed),
+`sizes` (the six codes with every size around theirs, invalid buffer addresses, and `ATTACH`
+with handle values that are not a usable event), `requests` (read, write, flush, lock,
+information requests, and overlapped requests cancelled at once), `stress` (threads and
+processes that open, attach, advance with valid and stale positions, detach, hand handles to
+short-lived processes and die while attached, while some are killed; every process must end),
+and `end`: the interface is free. Expected: `PASS`; each `UNEXPECTED` line names what happened.
+A bug check or a Driver Verifier stop is the other way it fails.
+
 A host that keeps its handle open (`handle-check`, an old test host, a `Device` kept open by a
 tool) still makes a removal wait: the host interface vetoes it while a handle is open, `devcon`
 answers "Removed on reboot" and the driver stays loaded until the VM restarts. Close it first.
@@ -312,7 +333,7 @@ copies the package, the tools, the WDK's `devcon.exe` and the campaign into
 local build or the `driver` CI job's artifact (section 3), debug or release:
 
 ```powershell
-cargo build --release -p hostmic-test-host -p hostmic-capture-check -p hostmic-measure -p hostmic-handle-check -p hostmic-ctl
+cargo build --release -p hostmic-test-host -p hostmic-capture-check -p hostmic-measure -p hostmic-handle-check -p hostmic-ioctl-fuzz -p hostmic-ctl
 .\tools\vm\stage.ps1 -Package target\debug\hostmic_driver_package -Name debug
 ```
 
@@ -332,6 +353,7 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 | `load` | `measure load` with 16 spinning threads passes (0 crackle) |
 | `kills` | hosts killed at random moments (`-Kills`, default 10): the microphone is unplugged within 10 s after each; the next host plays and `capture-check` passes |
 | `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer |
+| `fuzz` | `ioctl-fuzz --seconds` (the recordings' length) prints `PASS`: nothing unexpected, the interface free at the end |
 | `removal` | `devcon remove` while a host plays unloads the driver without a reboot; after the reinstall the host attaches again and `capture-check` passes |
 | `disable` | the host interface answers again after a disable and enable; with a host, disabling the host interface or the adapter makes it let go, and it attaches again (`capture-check` passes each time) |
 | `audiosrv` | the host keeps playing across a restart of the audio service (`capture-check` passes) |

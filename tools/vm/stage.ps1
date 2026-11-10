@@ -11,7 +11,7 @@
     driver CI job published (gh run download <run id> --repo Nopitch/hostmic). The tools are
     built with:
 
-        cargo build --release -p hostmic-test-host -p hostmic-capture-check -p hostmic-measure -p hostmic-handle-check -p hostmic-ctl
+        cargo build --release -p hostmic-test-host -p hostmic-capture-check -p hostmic-measure -p hostmic-handle-check -p hostmic-ioctl-fuzz -p hostmic-ctl
 
 .PARAMETER Package
     The folder holding hostmic_driver.sys, .inf, .cat and WDRLocalTestCert.cer.
@@ -75,7 +75,7 @@ $files = @()
 foreach ($file in 'hostmic_driver.sys', 'hostmic_driver.inf', 'hostmic_driver.cat', 'WDRLocalTestCert.cer') {
     $files += Join-Path $Package $file
 }
-foreach ($tool in 'test-host', 'capture-check', 'measure', 'handle-check', 'hostmic-ctl') {
+foreach ($tool in 'test-host', 'capture-check', 'measure', 'handle-check', 'ioctl-fuzz', 'hostmic-ctl') {
     $files += Join-Path $Tools "$tool.exe"
 }
 $files += $Devcon, (Join-Path $PSScriptRoot 'campaign.ps1'), (Join-Path $PSScriptRoot 'verifier.ps1'),

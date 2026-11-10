@@ -872,6 +872,30 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   special pool, none failed: nothing allocates per period. No bug check (the VM's uptime ran
   through), and `uninstall` unloaded the driver. The release package was not run for 4 hours:
   it differs by its optimisations and passes the 30 s `load` under Driver Verifier (#60, #61).
+  *Security review (2026-11-10):* four independent reviews, one per trust boundary (Kernel
+  Streaming, the host interface, the shared memory, PnP and power); no critical or high
+  finding. Each defect gets its own pull request, in this order: the host's process cleared
+  before its mapping was undone (#82); a fuzzer of the host interface of our own; IOCTLs still
+  served after the host interface's surprise removal; the IOCTL input read before the control
+  code is checked; the stream buffer's allocation check-then-act and its partial zeroing; a late
+  stream's close stopping the next stream; the host interface's power policy (no
+  `PoSetPowerState`, no device power request on a system one); the adapter starting without its
+  host interface; the host interface's instance ID (phantom devices). Accepted and documented:
+  another interactive session's process may attach when no host is (the device is the
+  machine's, like a physical microphone; an administrator restricts it through the device
+  class's `Security` value; #81 will say who holds it).
+  *IOCTL fuzzer (2026-11-10):* `tools/ioctl-fuzz` (docs/test-vm.md, section 6; the campaign's
+  `fuzz` scenario) sends every vendor control code with every method and access, the six codes
+  with every size around theirs and invalid buffer addresses, `ATTACH` with handles that are not
+  a usable event, other requests (read, write, flush, lock, information, cancelled overlapped
+  requests), and runs threads and processes that attach, advance with valid and stale positions,
+  detach, hand their handles to short-lived processes and die while attached, some killed; every
+  process must end and the interface be free afterwards. In the VM under Driver Verifier, 60 s
+  runs (about 175000 operations, 200 processes) find no crash and nothing unexpected but one: a
+  process at low integrity (checked: level 0x1000) opens the host interface for writing, and so
+  could attach as the host. The device object has no integrity label (`IoCreateDeviceSecure`
+  takes a DACL only), and despite Microsoft's "objects that lack an integrity label are treated
+  as medium", the open succeeds; the fix is the next pull request.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
