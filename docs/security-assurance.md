@@ -47,9 +47,9 @@ development process meet them (an assurance case). It covers the state during mi
   at least medium integrity of any interactive user, in any session (fast user switching, a
   second Remote Desktop session), can be that host. Any process allowed to open the host
   interface, for reading only included, keeps it from being disabled, uninstalled or updated
-  without a reboot while its handle is open. The device belongs to the machine, like a physical microphone; an
-  administrator who wants fewer users to reach it restricts the host interface's device class
-  through its `Security` registry property (section 2.6).
+  without a reboot while its handle is open. The device belongs to the machine, like a
+  physical microphone; an administrator who wants fewer users to reach it restricts the host
+  interface's device class or device through its `Security` registry property (section 2.6).
 - **Protection against administrators or kernel code.** Anyone who can load drivers or enable
   test signing already controls the machine; such attacks are out of scope (SECURITY.md).
 
