@@ -83,6 +83,9 @@ pub struct Stream {
     /// The notification event this stream registered with the host link, to release it if
     /// PortCls does not.
     event: AtomicPtr<wdk_sys::_KEVENT>,
+    /// This stream's token with the host link ([`crate::host_link::HostLink::stream_opened`]):
+    /// its calls act only while it is the current stream.
+    token: u64,
     /// The adapter's host link: the position, the host, the engine's event.
     link: LinkRef,
 }
@@ -115,14 +118,21 @@ impl Drop for Stream {
             self.link.get().clear_engine_event(event);
         }
         self.release_buffer();
-        self.link.get().stream_closed();
+        self.link.get().stream_closed(self.token);
     }
 }
 
 /// Creates a capture stream, or `None` when the pool is exhausted.
 #[must_use]
 pub fn new(link: LinkRef) -> Option<Unknown> {
-    let stream = com::into_unknown(Stream {
+    // The stream becomes the current one first, so that its object carries its token; if the
+    // object cannot be allocated, dropping it (its `Drop`) closes the token again.
+    let token = link.get().stream_opened(Format {
+        rate: SAMPLE_RATE,
+        channels: CHANNELS,
+        sample_type: SampleType::Int16.code(),
+    });
+    com::into_unknown(Stream {
         notification: &NOTIFICATION_VTABLE,
         input: &INPUT_VTABLE,
         references: AtomicU32::new(1),
@@ -135,14 +145,9 @@ pub fn new(link: LinkRef) -> Option<Unknown> {
         frames_per_packet: AtomicU64::new(0),
         allocating: AtomicBool::new(false),
         event: AtomicPtr::new(ptr::null_mut()),
+        token,
         link,
-    })?;
-    link.get().stream_opened(Format {
-        rate: SAMPLE_RATE,
-        channels: CHANNELS,
-        sample_type: SampleType::Int16.code(),
-    });
-    Some(stream)
+    })
 }
 
 impl Stream {
@@ -229,7 +234,7 @@ impl Stream {
         self.buffer.store(base, Ordering::Release);
         self.link
             .get()
-            .set_buffer(geometry.frames, geometry.frames_per_packet);
+            .set_buffer(self.token, geometry.frames, geometry.frames_per_packet);
         // SAFETY: the out-parameters are writable (checked not null above).
         unsafe { mdl_out.write(mdl.as_ptr()) };
         // SAFETY: as above.
@@ -282,7 +287,7 @@ impl Stream {
         if base.is_null() {
             return;
         }
-        self.link.get().set_buffer(0, 0);
+        self.link.get().set_buffer(self.token, 0, 0);
         self.buffer_bytes.store(0, Ordering::Release);
         self.frames_per_packet.store(0, Ordering::Relaxed);
         let mdl = self.mdl.swap(ptr::null_mut(), Ordering::AcqRel);
@@ -306,13 +311,13 @@ impl Stream {
             KSSTATE::KSSTATE_RUN => {
                 self.state.store(state, Ordering::Release);
                 if previous != KSSTATE::KSSTATE_RUN {
-                    link.set_state(State::Running);
+                    link.set_state(self.token, State::Running);
                 }
             }
             KSSTATE::KSSTATE_PAUSE | KSSTATE::KSSTATE_ACQUIRE => {
                 self.state.store(state, Ordering::Release);
                 if previous == KSSTATE::KSSTATE_RUN || previous == KSSTATE::KSSTATE_STOP {
-                    link.set_state(State::Paused);
+                    link.set_state(self.token, State::Paused);
                 }
             }
             KSSTATE::KSSTATE_STOP => {
@@ -321,7 +326,7 @@ impl Stream {
                 // packet numbering starts a new run: a `GetReadPacket` that sees the new run's
                 // mark (`Acquire`) also sees the reset position.
                 if previous != KSSTATE::KSSTATE_STOP {
-                    link.set_state(State::Stopped);
+                    link.set_state(self.token, State::Stopped);
                 }
                 let _ = self
                     .read_mark
