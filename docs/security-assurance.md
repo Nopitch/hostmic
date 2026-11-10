@@ -19,7 +19,8 @@ development process meet them (an assurance case). It covers the state during mi
   whichever process holds it last, and when the host's process ends, even while another process
   holds a duplicate of its handle. Opening the host interface is restricted to the system,
   administrators and interactive users, enforced by the I/O manager on a device object of its
-  own.
+  own; opening it for writing, which attaching needs, to processes of at least medium integrity,
+  enforced by the driver.
 - **Malformed input is rejected, not trusted.** Unsupported formats, pins, property sizes and
   values are refused with an error status; the driver accepts one exactly specified format.
 - **A stable system.** The driver does no allocation, takes no lock and does no I/O in its
@@ -72,7 +73,10 @@ of the build.
    call, unit-tested on every truncation of a valid format.
 2. **User mode → kernel, through the host interface** (M4): a raw child device of the adapter
    with its own security descriptor (`IoCreateDeviceSecure`, `FILE_DEVICE_SECURE_OPEN`); opens
-   relative to another handle refused; its requests, IRPs and fast I/O alike, never reach
+   relative to another handle refused; opens asking for any write right refused unless the
+   caller's process token, and its impersonation token if any, are at least of medium integrity
+   (the descriptor can carry no integrity label, and a low-integrity process could open it for
+   writing: M6); its requests, IRPs and fast I/O alike, never reach
    PortCls. IOCTL input validation in pure Rust, unit-tested and fuzzed (PLAN.md, M4); user
    buffers copied once (`METHOD_BUFFERED`), then validated. `ATTACH` references the host's
    event only for a user-mode request in the requesting process, with `EVENT_MODIFY_STATE`;

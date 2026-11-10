@@ -337,6 +337,50 @@ pub fn advance(input: &[u8], word: u64, buffer_frames: u32) -> Result<u64, Rejec
     Ok(Cursor { position, ..cursor }.pack())
 }
 
+/// The access rights that write to an object, which mandatory integrity's "no write up" denies
+/// to a lower integrity level: `FILE_WRITE_DATA` (which `ATTACH`, `ADVANCE` and `DETACH` need),
+/// `FILE_APPEND_DATA`, `FILE_WRITE_EA`, `FILE_WRITE_ATTRIBUTES`, `DELETE`, `WRITE_DAC`,
+/// `WRITE_OWNER`, and the generic rights that include writing (`MAXIMUM_ALLOWED`, `GENERIC_ALL`,
+/// `GENERIC_WRITE`).
+const WRITE_RIGHTS: u32 = 0x0000_0002
+    | 0x0000_0004
+    | 0x0000_0010
+    | 0x0000_0100
+    | 0x0001_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x0200_0000
+    | 0x1000_0000
+    | 0x4000_0000;
+/// `SECURITY_MANDATORY_MEDIUM_RID`: the integrity level of a standard user's processes.
+pub const INTEGRITY_MEDIUM: u32 = 0x2000;
+
+/// Whether `access` (the access masks of a create request, combined: what was asked and what
+/// was granted) includes a right that writes.
+#[must_use]
+pub const fn asks_write(access: u32) -> bool {
+    access & WRITE_RIGHTS != 0
+}
+
+/// Whether an open of the host interface asking for `access` may proceed from a caller whose
+/// tokens' lowest integrity level is `integrity` (`None` when it could not be read).
+///
+/// Opening for writing is what lets a process attach as the host and feed the microphone: it
+/// needs at least medium integrity, as Windows' rule for objects without an integrity label says
+/// ("treated as medium", no write up), which a low-integrity process was seen to get past on
+/// this device. Reading needs no particular level: the security descriptor decides. An
+/// unreadable level refuses writing.
+#[must_use]
+pub const fn open_allowed(access: u32, integrity: Option<u32>) -> bool {
+    if !asks_write(access) {
+        return true;
+    }
+    match integrity {
+        Some(level) => level >= INTEGRITY_MEDIUM,
+        None => false,
+    }
+}
+
 /// `input` as an array of exactly `N` bytes.
 fn exact<const N: usize>(input: &[u8]) -> Result<&[u8; N], Rejection> {
     input.try_into().map_err(|_| Rejection::InputSize {
@@ -683,5 +727,51 @@ mod tests {
                 buffer: 0
             })
         );
+    }
+
+    #[test]
+    fn open_needs_medium_integrity_to_write() {
+        const LOW: u32 = 0x1000;
+        const HIGH: u32 = 0x3000;
+        const SYSTEM: u32 = 0x4000;
+        assert_eq!(INTEGRITY_MEDIUM, 0x2000);
+        // FILE_READ_DATA, FILE_GENERIC_READ, GENERIC_READ, READ_CONTROL, SYNCHRONIZE.
+        for read in [
+            0x0000_0001,
+            0x0012_0089,
+            0x8000_0000,
+            0x0002_0000,
+            0x0010_0000,
+        ] {
+            assert!(!asks_write(read));
+            assert!(open_allowed(read, Some(LOW)));
+            assert!(open_allowed(read, None));
+        }
+        // FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES, DELETE,
+        // WRITE_DAC, WRITE_OWNER, FILE_GENERIC_WRITE, GENERIC_WRITE, GENERIC_ALL,
+        // MAXIMUM_ALLOWED, and read-write.
+        for write in [
+            0x0000_0002,
+            0x0000_0004,
+            0x0000_0010,
+            0x0000_0100,
+            0x0001_0000,
+            0x0004_0000,
+            0x0008_0000,
+            0x0012_0116,
+            0x4000_0000,
+            0x1000_0000,
+            0x0200_0000,
+            0xC000_0000,
+        ] {
+            assert!(asks_write(write));
+            assert!(!open_allowed(write, Some(0)));
+            assert!(!open_allowed(write, Some(LOW)));
+            assert!(!open_allowed(write, Some(0x1FFF)));
+            assert!(!open_allowed(write, None));
+            assert!(open_allowed(write, Some(0x2000)));
+            assert!(open_allowed(write, Some(HIGH)));
+            assert!(open_allowed(write, Some(SYSTEM)));
+        }
     }
 }
