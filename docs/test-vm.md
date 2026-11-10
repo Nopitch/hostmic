@@ -252,6 +252,8 @@ $p = Start-Process C:\hostmic\handle-check.exe -ArgumentList '--seconds','8','--
 Start-Sleep 3; Get-Process ping | Stop-Process -Force; $p | Wait-Process; Get-Content C:\hostmic\b.txt
 # A child that inherits the host's handle sends DETACH: refused, the mapping stays.
 C:\hostmic\handle-check.exe --seconds 3 --detach-from-child
+# The host exits while its child closes the last handle, 2000 times: no bug check.
+C:\hostmic\handle-check.exe --exit-race 2000
 ```
 
 Expected: `--close` shows the mapping `unmapped` right after the close. After the kill, the
@@ -259,7 +261,10 @@ driver logs `the host's process exited with its handle still open elsewhere` and
 detached`, the microphone is unplugged, and the next `test-host` attaches; `b.txt` shows the
 mapping `mapped`, then `unmapped` once the holder is killed, while the host still runs.
 `--detach-from-child` prints the child's `DETACH` refused, the mapping `mapped`, then
-`detached` (its own `DETACH`). A holder left running keeps a handle to the interface open,
+`detached` (its own `DETACH`). `--exit-race` ends with the rounds whose last close began
+while the host's process was still ending (most of them; it fails if none did, the race not
+being exercised) and those after; under Driver Verifier, a wrong order would show as a bug
+check. A holder left running keeps a handle to the interface open,
 which makes `devcon remove` answer "Removed on reboot" (below).
 
 The microphone's jack follows the host. The endpoint's state is in the registry, under
@@ -331,7 +336,7 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 | `latency` | `measure latency` passes (every click due read, median near 10 ms) |
 | `load` | `measure load` with 16 spinning threads passes (0 crackle) |
 | `kills` | hosts killed at random moments (`-Kills`, default 10): the microphone is unplugged within 10 s after each; the next host plays and `capture-check` passes |
-| `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer |
+| `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer; `handle-check --exit-race 200` passes (a host exiting while its child closes the last handle) |
 | `removal` | `devcon remove` while a host plays unloads the driver without a reboot; after the reinstall the host attaches again and `capture-check` passes |
 | `disable` | the host interface answers again after a disable and enable; with a host, disabling the host interface or the adapter makes it let go, and it attaches again (`capture-check` passes each time) |
 | `audiosrv` | the host keeps playing across a restart of the audio service (`capture-check` passes) |
