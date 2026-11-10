@@ -344,6 +344,15 @@ for the next boot and whether Memory Integrity runs; the `install` line gives wh
 Verifier verifies now (its flags and drivers, from `verifier /query`), so that a run's output
 says under which conditions it passed.
 
+The endurance run (M6) is the `load` scenario for 4 hours, under Driver Verifier (section 9):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1 -Only install,load,uninstall -Seconds 14400
+```
+
+Its log folder keeps `measure`'s full output (the engine's and the driver's counters, the
+player's gaps by bucket) and `verifier /query` at the end (pool allocations, and none failed).
+
 ## 9. Run the campaign under Driver Verifier
 
 `tools/vm/verifier.ps1` (staged with the campaign) sets one of M6's Driver Verifier profiles
