@@ -931,6 +931,16 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   independent review found that last point. Not triggered in the VM (it needs a surprise
   removal while a host holds its handle, which only Device Fundamentals' PnP tests produce, and
   they run without a host); the campaign passes 12 of 12 under Driver Verifier.
+  *IOCTL input (2026-11-10):* the host interface built its input slice from the request's
+  `SystemBuffer` before checking the control code, under a comment that assumed
+  `METHOD_BUFFERED`; for another method that field is not the request's buffer ("The I/O manager
+  doesn't provide any system buffers or MDLs" for `METHOD_NEITHER`). Nothing read it for those
+  codes, and the I/O manager leaves it null for them, so no request from user mode could misuse
+  it; an IRP built by other kernel code could. Any code but the six (all `METHOD_BUFFERED`) now
+  goes to the unknown-code refusal before `SystemBuffer` is read; without a system buffer the
+  output length counts as 0, so the output-size checks refuse a request before it changes
+  anything, and a reply is written only to a system buffer that exists. The independent review
+  suggested the output length: an `ATTACH` would otherwise map the buffer, then fail to say where.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
