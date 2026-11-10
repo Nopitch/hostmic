@@ -972,6 +972,20 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   the audio engine's notification event has the same one-slot shape, keyed by the event, and
   relies on PortCls unregistering it before the stream's last release, which its documentation
   implies (a new stream's registration would otherwise fail, an availability issue only).
+  *The host interface's power policy (2026-11-10):* with no function driver, the host
+  interface's PDO is its own power policy owner, and it acted as none: it never declared a
+  device power state (`PoSetPowerState`), and completed a system power request without asking
+  for the matching device one. Nothing failed for it (no hardware), but the power manager's
+  records were wrong, and Microsoft's rules for a raw device's bus driver were not followed.
+  The PDO now declares D0 at start and D3 at a (surprise) removal, declares each device power
+  request it receives, and turns `IRP_MN_SET_POWER` for a system state into a device power
+  request for itself (`PoRequestPowerIrp`: D0 in the working state, D3 in any other, as its
+  capabilities report), marked pending first and completed with success from that request's
+  completion routine (a system set-power request cannot fail). At `PASSIVE_LEVEL`
+  (`DO_POWER_PAGABLE`), never in the real-time path. The campaign checks the declared state
+  (`DEVPKEY_Device_PowerData`): D0 after the install, D3 while disabled, D0 after enabling it
+  again. The system power path runs at each shutdown and restart of the VM (S5), the only
+  system power change a Hyper-V guest has; sleep and hibernation wait for M7's real machine.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
