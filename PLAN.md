@@ -1022,8 +1022,8 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   (`HOSTMIC\HOST\1&2A215B38&59&0`), which every uninstall of the adapter (`devcon remove`,
   Device Manager's Uninstall) replaces: each left a phantom device behind (102 host interface
   devices, present or not, in the test VM). A driver update restarts the stack without
-  replacing the devnode, so it does not (expected, not measured). The PDO now reports `UniqueID` 1 and the index of its slot in `DEVICES` as
-  instance ID (`HOSTMIC\HOST\0` for the first adapter): unique among the host interfaces
+  replacing the devnode, so it does not (expected, not measured). The PDO now reports
+  `UniqueID` 1 and the index of its slot in `DEVICES` as instance ID (`HOSTMIC\HOST\0` for the first adapter): unique among the host interfaces
   present at once, which hold distinct slots, and stable across reinstalls, so the device
   keeps its devnode, and with it its disabled flag and registry settings (the campaign's
   install now waits for the device to be present before enabling it again). With several
@@ -1068,6 +1068,68 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   image-data control): it now fails on any of these. Not covered: a clone made by another
   process from a handle to the host (the same kernel path, expected the same), and a fork that
   inherits the host's handle (the duplicate and holder checks cover that handle).
+  ***M6 done (2026-11-10).*** The driver has been run under the conditions it must survive
+  before it is signed, with evidence anyone can reproduce in the test VM: a campaign of twelve
+  scenarios in the repository (`tools/vm/`), Driver Verifier's profiles, Microsoft's Device
+  Fundamentals tests, a fuzzer of the host interface of our own, 4 hours of load, and a security
+  review of every trust boundary, each of whose findings was fixed in a pull request of its own
+  or accepted and recorded with its reason. Pull requests: the design (#57), the campaign (#58),
+  WaveRT kept over ACX through M8 (#59), overflow checks in release (#60), Driver Verifier and
+  the host mapping it refused (#61), a following player that registers before it attaches
+  (#62), Device Fundamentals (#63), the device idling to D3 (#64), Memory Integrity tried and a
+  check of the binaries in CI (#65), the README's account of how changes are reviewed (#66),
+  endurance (#67), the assurance case matching the code (#80), then the security review: a
+  host's exit waiting for a detach in progress elsewhere (#82), opening the host interface for
+  writing needing medium integrity (#83), the IOCTL fuzzer that found it (#84), `ATTACH` and
+  `ADVANCE` refused after a surprise removal (#85), the system buffer read only for the six
+  codes (#86), the stream buffer's allocation and release serialized (#87) and its whole pages
+  zeroed (#88), a late stream release leaving the next stream alone (#89), the host
+  interface's power policy (#90), the adapter not starting without its host interface (#91),
+  the host interface's stable instance ID (#92), the assurance case's assumptions and
+  accepted risks (#93), and a host that clones itself, answered by a test (#94). The "done
+  when" items:
+  - in the VM under Driver Verifier (`standard`), on `main` at the end of M6 (cd53ec0): the
+    campaign passes 12 of 12 on the local debug package (latency median 10.3 ms, 0 crackle
+    under load) and on the release package of `main`'s CI run (median 9.5 ms, 0 crackle); the
+    Device Fundamentals tests pass on both packages, 11 of 21 each with no failure and no bug
+    check: on the adapter, the PnP tests (surprise removal among them), the IOCTL and API
+    fuzzers and the reinstall with I/O; the 10 on the host interface are skipped, each test's
+    selection leaving it out (presumably as a raw device, #63), which the campaign and
+    `tools/ioctl-fuzz` cover instead;
+  - in the same runs, the device idles to D3 without a stream and streams again (the
+    campaign's `power` scenario);
+  - 4 hours of load show 0 crackle (#67, on the debug package, before the security review's
+    fixes; the release package passes the 30 s `load` in every run);
+  - every security finding is fixed (#82, #83, #85 to #92; #84 is the fuzzer that found #83's)
+    or accepted and recorded with its reason (`docs/security-assurance.md`, section 2.6, #93;
+    its open questions in section 2.7, one of them answered by a test, #94).
+  The independent reviews kept finding real defects, in the driver and in the tests alike,
+  among them: a bug check in the first version of the low-integrity fix (#83,
+  `SeQueryInformationToken`'s level read through the pointer it replaces); the adapter's state
+  borrowed mutably across calls into PortCls that can call back into the adapter (#91); races
+  between allocation and release (#87) and between a removal and a power request (#90); a
+  failed bus relations reply passed down instead of completed (#91); a player whose first
+  retry made the jack flap every second and swallowed every registration error (#62);
+  assertion failures swallowed by the mapping wrapper, and a boot loop a persistent profile
+  could cause (#61); and checks that could pass without their behaviour (#58, #63, #64, #82,
+  #84, #94's first verdict). Not run again since the security review's fixes: the `stack` and
+  `low-resources` profiles (#61, #62; the 7-of-10 low-resources run's missing host interface
+  after an adapter restart was not diagnosed, and would now show as a failed start or a
+  failed bus relations query, #91), and the 4 hours (#67). Not exercised in the VM: a surprise
+  removal while a host holds the host interface's handle (#85), the failure paths of #91, and
+  whether a driver update leaves a phantom device (#92, expected not to). No `capture-check`
+  `FAIL` like M4's after a killed host or M5's after a checkpoint restore (#51) was seen in
+  M6's campaign runs; whether one ran right after a restore is not recorded. Carried over:
+  - to M7, with a signed driver on a real machine and Secure Boot on: a run with Memory
+    Integrity on (#65), sleep and hibernation (the host interface's system power path is
+    exercised only by the VM's restarts, #90), `measure` against the target table, and the
+    endurance on the release package;
+  - to later pull requests: ETW instead of `DbgPrint` (#77), saying who holds the host
+    interface when an `ATTACH` is refused (#81), and the gaps of the assurance case (a clone
+    made by another process, a failed `IRP_MN_QUERY_ID` reply, the class and device `Security`
+    properties untested); the phantom host interface devices of the old naming stay on a
+    machine until removed (`pnputil /remove-device`, #92).
+  Next, by the maintainer's decision: M8 (Résonnance on the low layer) before M7 (signing).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

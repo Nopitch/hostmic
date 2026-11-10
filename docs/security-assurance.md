@@ -2,9 +2,9 @@
 
 hostmic is a Windows kernel-mode driver. This document states what users can and cannot expect
 from it in terms of security (its security requirements), then argues why the design and the
-development process meet them (an assurance case). It covers the state during milestone M6
-(hardening) and says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
-[SECURITY.md](../SECURITY.md) the vulnerability process and the security rules.
+development process meet them (an assurance case). It covers the state at the end of
+milestone M6 (hardening) and says what later milestones change; [PLAN.md](../PLAN.md) has the
+roadmap, [SECURITY.md](../SECURITY.md) the vulnerability process and the security rules.
 
 ## 1. What you can and cannot expect
 
