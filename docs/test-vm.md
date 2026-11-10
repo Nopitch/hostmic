@@ -266,10 +266,15 @@ mapping `mapped`, then `unmapped` once the holder is killed, while the host stil
 `detached` (its own `DETACH`). `--exit-race` ends with the rounds whose last close began
 while the host's process was still ending (most of them; it fails if none did, the race not
 being exercised) and those after; under Driver Verifier, a wrong order would show as a bug
-check. `--clone` reads each clone's memory: a static control (must read `0x5a x 256`), then
-the buffer's address with the host attached, after `DETACH` and with the next host attached;
-Windows copies no mapping of locked pages into a clone, so the address is `free` in both
-clones and the verdict is `no clone sees the next host's data`. A holder left running keeps a
+check. `--clone` makes both clones (it fails otherwise) and reads each one's memory: two
+controls written before cloning, a private page and a section's view (`private 0x5a x 256,
+mapped 0x6b x 256`), then the buffer's address with the host attached, after the host writes
+again, after `DETACH` and with the next host attached, and all its readable memory for the
+patterns written after cloning. On Windows 11 26H2 (build 26300) neither clone has a region
+at the buffer's address (`free`), which the host's process has committed, and the verdict is
+`no clone maps the buffer or holds what was written after cloning`. Not covered: a clone made
+by another process from a handle to the host, and a fork that inherits the host's handle (the
+duplicate and holder checks above cover that handle). A holder left running keeps a
 handle to the interface open, which makes `devcon remove` answer "Removed on reboot" (below).
 
 The microphone's jack follows the host. The endpoint's state is in the registry, under
