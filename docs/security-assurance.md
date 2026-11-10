@@ -18,9 +18,9 @@ development process meet them (an assurance case). It covers the state during mi
   host interface. The mapping is undone when that host detaches, when its handle is closed by
   whichever process holds it last, and when the host's process ends, even while another process
   holds a duplicate of its handle. Opening the host interface is restricted to the system,
-  administrators and interactive users, enforced by the I/O manager on a device object of its
-  own; opening it for writing, which attaching needs, to processes of at least medium integrity,
-  enforced by the driver.
+  administrators and interactive users (of any session), enforced by the I/O manager on a
+  device object of its own; opening it for writing, which attaching needs, to processes of at
+  least medium integrity, enforced by the driver.
 - **Malformed input is rejected, not trusted.** Unsupported formats, pins, property sizes and
   values are refused with an error status; the driver accepts one exactly specified format.
 - **A stable system.** The driver does no allocation, takes no lock and does no I/O in its
@@ -43,7 +43,11 @@ development process meet them (an assurance case). It covers the state during mi
 - **Authentication of the audio.** The driver does not check what the host writes: whatever the
   attached host plays is what applications record. Choose the host you run.
 - **Availability guarantees.** A host can stop feeding audio (the microphone then reports
-  unplugged); one host at a time can attach.
+  unplugged); one host at a time can attach, first come: when none is attached, a process of
+  any interactive user, in any session (fast user switching, a second Remote Desktop session),
+  can be that host. The device belongs to the machine, like a physical microphone; an
+  administrator who wants fewer users to reach it restricts the host interface's device class
+  through its `Security` registry property (section 2.6).
 - **Protection against administrators or kernel code.** Anyone who can load drivers or enable
   test signing already controls the machine; such attacks are out of scope (SECURITY.md).
 
@@ -85,16 +89,22 @@ of the build.
    `ADVANCE` is checked against the stream's packed generation and position and committed with
    one compare-and-exchange, so a request computed for an earlier state cannot move the
    position; the interface refuses removal while a handle to it is open, so no request reaches
-   a deleted device. Refused requests are counted (`GET_STATS`) and logged, at a bounded rate,
-   since any process allowed to open the interface can send them in a loop. `GET_STREAM` and
-   `GET_STATS` tell such a process whether, and how long, the microphone is in use, as the
-   Windows audio settings already do.
+   a deleted device, and after its surprise removal it refuses `ATTACH` and `ADVANCE` on the
+   handles still open (`DETACH` and the reads stay, so that a host can let go). A control code
+   other than the interface's six is refused before the request's buffer is read. Refused
+   requests are counted (`GET_STATS`) and logged, at a bounded rate, since any process allowed
+   to open the interface can send them in a loop; the counters therefore say how many requests
+   were refused, not who sent them. A process at low integrity can still open the interface
+   for reading: `GET_INFO`, `GET_STREAM` and `GET_STATS` tell it, as any other opener, whether,
+   and how long, the microphone is in use, as the Windows audio settings already do.
 3. **Shared memory** (M4): one buffer of whole pages, owned by the driver, from zeroed pages
    (`MmAllocatePagesForMdlEx`) and zeroed again for each host, so that neither kernel data nor
    a previous host's audio reaches a host. It is mapped into the attached host (readable and
    writable, never executable, through a C function of a few lines that catches the mapping's
    structured exception, which Rust cannot) and, through a partial MDL per stream, into the
-   audio engine; the driver produces no audio and never reads it. The pages are
+   audio engine, whose whole pages are zeroed when the stream's buffer is allocated (the audio
+   engine maps whole pages, beyond the bytes it asked for); the driver produces no audio and
+   never reads it. The pages are
    reference-counted by the adapter,
    each stream buffer and the host's mapping, so none is freed while mapped. A user mapping is
    undone in its own process: on `DETACH`, on the handle's last close from any process
@@ -102,12 +112,17 @@ of the build.
    exits; attaching and detaching are serialized, so the notification returns only once the
    mapping is gone.
 4. **PortCls → miniport**: COM-style calls, possibly concurrent; reference counting and the
-   real-time design below.
+   real-time design below. A stream's buffer allocation and release serialize themselves (a
+   second allocation at the same time is refused), and the host link acts on a stream's
+   requests only while it is the current stream (a token per stream), so that a late release
+   of a stream cannot stop the next one. What the driver assumes of PortCls and `ks.sys`
+   without checking it is listed in section 2.6.
 5. **Supply chain**: repository, CI, dependencies, and later the release signing.
 
 ### 2.3 Secure design principles applied
 
-- **Least privilege**: the host interface open to administrators and the interactive user only;
+- **Least privilege**: the host interface open to administrators and interactive users only,
+  for writing to processes of at least medium integrity;
   the buffer mapped into the attached host only; CI tokens read-only by default with no secrets.
 - **Economy of mechanism**: one format, one host, one stream; no lock in the real-time path,
   a single writer of the position (the attached host's `ADVANCE`, one compare-and-exchange)
@@ -132,9 +147,9 @@ of the build.
 | Out-of-bounds read or write (CWE-125, CWE-787) | Size checks before every access to a caller's buffer; ring writes through bounded slices; unaligned-safe reads and writes |
 | Integer overflow (CWE-190) | 128-bit intermediates for clock arithmetic, saturating and checked operations; overflow checks in every build, release included (an overflow stops the system with a bug check naming its place instead of wrapping) |
 | Use after free (CWE-416) | Atomic reference counting with `Arc`-like orderings, including the shared buffer's pages (the adapter, each stream buffer and the host's mapping hold one); rundown protection (`EX_RUNDOWN_REF`) on the objects a request may use while another thread lets them go (the host's event, the audio engine's notification event, the topology port's jack events): letting one go waits until no request holds it |
-| Race conditions (CWE-362) | One writer of each stream's position (the attached host's `ADVANCE`, committed with one compare-and-exchange on the packed generation and position, so a request computed for an earlier state is refused), positions published with release/acquire atomics, attaching and detaching serialized by a lock, state changes serialized by PortCls |
+| Race conditions (CWE-362) | One writer of each stream's position (the attached host's `ADVANCE`, committed with one compare-and-exchange on the packed generation and position, so a request computed for an earlier state is refused), positions published with release/acquire atomics, attaching and detaching serialized by a lock, state changes serialized by PortCls; a stream's buffer allocation and release serialized by a flag taken by compare-and-exchange; the host link's per-stream calls keyed by the stream's token, under a lock of their own, never in the real-time path |
 | Double fetch, TOCTOU on user memory (CWE-367) | User input copied once, then validated (M4) |
-| Kernel memory disclosure (CWE-200) | Buffers zeroed when allocated; the shared buffer made of whole zeroed pages, zeroed again for each host; no uninitialized structure returned |
+| Kernel memory disclosure (CWE-200) | Buffers zeroed when allocated; the shared buffer made of whole zeroed pages, zeroed again for each host, and the whole pages of each stream's buffer zeroed when it is allocated; no uninitialized structure returned |
 | Denial of service by a crash (CWE-248, CWE-400) | No panic on any input in the core logic; allocation only when a stream is created, never per period |
 | Hard-coded or leaked credentials (CWE-798) | No secrets in CI; secret scanning in CI, in pre-commit and with GitHub push protection |
 | Vulnerable or malicious dependencies (CWE-1395) | Pinned dependencies, required dependency review, Dependabot, actions pinned by commit SHA |
@@ -179,7 +194,39 @@ of the build.
 - Review of every change through pull requests, an independent review of the PortCls adapter
   (M3), and of every kernel and host-crate pull request since M4.
 
-### 2.6 Known gaps and plans
+### 2.6 Assumptions and accepted risks
+
+What the driver relies on without checking it, and what the M6 security review (PLAN.md, M6)
+left as it is, on purpose:
+
+- **`ks.sys` checks the sizes of what a client passes.** A client's data range in a format
+  intersection, and the data format of a new stream, are read up to the `FormatSize` they
+  declare: the driver relies on Kernel Streaming having checked that the buffer holds that
+  many bytes, as Microsoft's audio samples (sysvad) do. The format's content is then validated
+  in pure Rust (section 2.2).
+- **PortCls's ordering of a stream's calls.** A stream's `FreeAudioBuffer` comes before its
+  last `Release`, and the audio engine's notification event is unregistered before the stream
+  is released, as in Microsoft's samples and implied by PortCls's documentation; the driver
+  does not wait for either. Were the event's unregistration late, a new stream's registration
+  would fail: an availability issue, not a memory one (the event is held under rundown
+  protection, section 2.4).
+- **Any interactive session can attach.** First come, one host at a time (section 1). The
+  host interface's device class, `{FEFD76E2-6428-43C6-A8E1-776C497C8CB4}`, takes an
+  administrator's security descriptor from its `Security` registry property, as for any device
+  created with `IoCreateDeviceSecure`; [issue #81](https://github.com/Nopitch/hostmic/issues/81)
+  is to say which process holds the interface when an `ATTACH` is refused.
+- **Openers see the refusal counters and the stream's state.** Any process allowed to open the
+  host interface, a low-integrity one included (for reading), can read whether the microphone
+  is in use and raise the refusal counters (section 2.2).
+- **Not every log is rate-limited.** Refused host interface requests are; Kernel Streaming
+  requests (format intersection, proposed formats, stream creation, buffer allocation, state
+  changes) and successful `ATTACH` and `DETACH` are logged each time, so a process that can
+  open the microphone's filters can make the driver print in a loop. `DbgPrint` costs CPU time
+  only (its output is discarded unless a debugger or the debug print filter asks for it);
+  [issue #77](https://github.com/Nopitch/hostmic/issues/77) replaces it with ETW events that
+  are never per audio period.
+
+### 2.7 Known gaps and plans
 
 - A run with Memory Integrity on (M7: virtualization-based security
   requires Secure Boot, which test signing needs off, so it does not run in the test VM;
@@ -190,5 +237,12 @@ of the build.
 - Static analysis of the kernel code is shallow: CodeQL's Rust queries have no driver rules,
   and Static Driver Verifier does not take Rust. Clippy's lints, the independent reviews,
   fuzzing and Driver Verifier carry the kernel code's evidence, not CodeQL.
+- Not checked: whether a snapshot of the host's process that clones its address space
+  (`PssCaptureSnapshot` with `PSS_CAPTURE_VA_CLONE`) copies the host's mapping of the shared
+  buffer, and what the clone then sees after the host detaches. A process able to snapshot the
+  host can read its memory anyway; the question is only whether the clone keeps the pages.
+- Not checked: if an `IRP_MN_QUERY_ID` reply cannot be allocated, whether the PnP manager
+  drops the host interface's devnode without removing it; the PDO would then stay until the
+  driver unloads, and could keep it from unloading.
 - A single maintainer: no second human reviewer yet (GOVERNANCE.md).
 - Release signing and provenance attestations (M7).
