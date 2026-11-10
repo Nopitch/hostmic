@@ -1020,9 +1020,8 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   *The host interface's instance ID (2026-11-10):* the host interface reported instance ID "0"
   with `UniqueID` 0, so the PnP manager named it after the adapter's devnode
   (`HOSTMIC\HOST\1&2A215B38&59&0`), which every uninstall of the adapter (`devcon remove`,
-  Device Manager's Uninstall) replaces: each left a phantom device behind (102 host interface devices, present or not, in the
-  test VM).
-  A driver update restarts the stack without replacing the devnode, so it does not (expected,
+  Device Manager's Uninstall) replaces: each left a phantom device behind (102 host interface
+  devices, present or not, in the test VM). A driver update restarts the stack without replacing the devnode, so it does not (expected,
   not measured). The PDO now reports `UniqueID` 1 and the index of its slot in `DEVICES` as
   instance ID (`HOSTMIC\HOST\0` for the first adapter): unique among the host interfaces
   present at once, which hold distinct slots, and stable across reinstalls, so the device
