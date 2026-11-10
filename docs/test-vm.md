@@ -361,7 +361,7 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 | `kills` | hosts killed at random moments (`-Kills`, default 10): the microphone is unplugged within 10 s after each; the next host plays and `capture-check` passes |
 | `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer; `handle-check --exit-race 200` passes (a host exiting while its child closes the last handle) |
 | `fuzz` | `ioctl-fuzz --seconds` (the recordings' length) prints `PASS`: nothing unexpected, the interface free at the end |
-| `removal` | `devcon remove` while a host plays unloads the driver without a reboot; after the reinstall the host attaches again and `capture-check` passes |
+| `removal` | `devcon remove` while a host plays unloads the driver without a reboot; after the reinstall the host attaches again and `capture-check` passes; the host interface keeps its instance ID (`HOSTMIC\HOST\0`), and the count of `HOSTMIC` devices, present or not, stays the same (no phantom) |
 | `disable` | the host interface answers again after a disable and enable, in D3 while disabled and D0 again after; with a host, disabling the host interface or the adapter makes it let go, and it attaches again (`capture-check` passes each time) |
 | `audiosrv` | the host keeps playing across a restart of the audio service (`capture-check` passes) |
 | `uninstall` | `devcon remove` unloads the driver (`STOPPED`), the host interface is gone |

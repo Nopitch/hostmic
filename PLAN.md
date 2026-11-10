@@ -1017,6 +1017,20 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   state borrowed mutably across the calls into PortCls, which could send a PnP request to the
   adapter before returning; both fixed. Neither failure is provoked in the VM (an allocation of
   a few bytes, a device object); the campaign checks the normal paths.
+  *The host interface's instance ID (2026-11-10):* the host interface reported instance ID "0"
+  with `UniqueID` 0, so the PnP manager named it after the adapter's devnode
+  (`HOSTMIC\HOST\1&2A215B38&59&0`), which every reinstall of the adapter replaces: each left
+  a phantom device behind (59 in the test VM), and on a user's machine each driver update
+  would. The PDO now reports `UniqueID` 1 and the index of its slot in `DEVICES` as instance
+  ID (`HOSTMIC\HOST\0` for the first adapter): unique among the host interfaces present at
+  once, which hold distinct slots, and stable across reinstalls, so the device keeps its
+  devnode. Never a constant: two adapters' host interfaces would then be a duplicate device
+  (bug check 0xCA). A host interface still being removed when a new adapter starts makes the
+  new one take another slot, so at most one device per slot is ever left. The slot is now
+  taken before the device extension is written, while `DO_DEVICE_INITIALIZING` still keeps
+  the I/O manager from opening the device. The phantoms of the old naming stay until removed
+  (`pnputil /remove-device`); the campaign's `removal` scenario checks that a reinstall keeps
+  the instance ID and adds no device, present or not.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
