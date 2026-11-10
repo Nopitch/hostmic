@@ -153,6 +153,11 @@ of the build.
   failures without a bug check. Its first run found the host mapping requested without
   `MdlMappingNoExecute`, a code integrity violation that a too-broad exception handler had
   hidden (PLAN.md, M6).
+- Microsoft's Device Fundamentals tests under Driver Verifier (M6,
+  [docs/test-vm.md](test-vm.md), section 10): on the adapter, PnP transitions with Microsoft's
+  test filter (surprise removal among them), an IOCTL fuzzer on the Kernel Streaming filters in
+  the kernel, an API fuzzer and a reinstall with I/O pass. They leave the host interface out (a
+  raw device).
 - The host crate `hostmic` (M5) under the same `unsafe` lints; its writes into the shared
   buffer are volatile, never through a Rust reference, and its pure parts (the clock, the
   ring's wrap, sample conversion) are unit-tested in CI.
@@ -161,9 +166,10 @@ of the build.
 
 ### 2.6 Known gaps and plans
 
-- An HVCI run in the test VM, the Device Fundamentals tests (IOCTL fuzzing in the kernel among
-  them), sleep and resume, and endurance tests (M6). Fuzzing covers the pure validation code,
-  not the kernel code that calls it.
+- An HVCI run in the test VM, sleep and resume, and endurance tests (M6). The host interface's
+  IOCTLs are fuzzed only in their pure validation code, not in the kernel code that calls it:
+  Microsoft's fuzzers leave that raw device out, and a fuzzer of our own is planned with the
+  security review (M6).
 
 - A single maintainer: no second human reviewer yet (GOVERNANCE.md).
 - Release signing and provenance attestations (M7).

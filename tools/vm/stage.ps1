@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Copies a driver package, the release tools, devcon, campaign.ps1 and verifier.ps1 into the
-    test VM, in a folder of their own, and prints the command that runs the campaign there.
+    Copies a driver package, the release tools, devcon, campaign.ps1, verifier.ps1 and
+    devfund.ps1 into the test VM, in a folder of their own, and prints the command that runs the
+    campaign there.
 
 .DESCRIPTION
     Runs on the host, as a member of Hyper-V Administrators (Copy-VMFile needs the VM's Guest
@@ -26,6 +27,14 @@
 
 .PARAMETER Devcon
     devcon.exe (default: the newest x64 one of the installed WDK).
+
+.PARAMETER DevFund
+    Also copies the WDK's Device Fundamentals tests, TAEF and the WDTF installers into
+    C:\hostmic\devfund in the VM (devfund.ps1 uses them): once per VM, after which packages are
+    staged without it. Copying them again while TAEF's service runs would meet locked files.
+
+.PARAMETER Kit
+    The WDK's Testing folder (default: the installed WDK's).
 #>
 [CmdletBinding()]
 param(
@@ -35,11 +44,26 @@ param(
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$Name = (Get-Date -Format 'yyyyMMdd-HHmmss'),
     [string]$VMName = 'hostmic-test',
-    [string]$Devcon
+    [string]$Devcon,
+    [switch]$DevFund,
+    [string]$Kit = 'C:\Program Files (x86)\Windows Kits\10\Testing'
 )
 
 Set-StrictMode -Version 3
 $ErrorActionPreference = 'Stop'
+
+# Copies every file under $Source into the VM under $Destination, keeping the subfolders.
+function Copy-Tree([string]$Source, [string]$Destination, [string]$Filter = '*') {
+    $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
+    $count = 0
+    foreach ($item in Get-ChildItem -LiteralPath $root -Recurse -File -Filter $Filter) {
+        $relative = $item.FullName.Substring($root.Length + 1)
+        Copy-VMFile -Name $VMName -SourcePath $item.FullName -DestinationPath (Join-Path $Destination $relative) `
+            -FileSource Host -CreateFullPath -Force
+        $count++
+    }
+    $count
+}
 
 if (-not $Devcon) {
     $Devcon = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Tools\*\x64\devcon.exe' -ErrorAction SilentlyContinue |
@@ -54,9 +78,24 @@ foreach ($file in 'hostmic_driver.sys', 'hostmic_driver.inf', 'hostmic_driver.ca
 foreach ($tool in 'test-host', 'capture-check', 'measure', 'handle-check', 'hostmic-ctl') {
     $files += Join-Path $Tools "$tool.exe"
 }
-$files += $Devcon, (Join-Path $PSScriptRoot 'campaign.ps1'), (Join-Path $PSScriptRoot 'verifier.ps1')
+$files += $Devcon, (Join-Path $PSScriptRoot 'campaign.ps1'), (Join-Path $PSScriptRoot 'verifier.ps1'),
+(Join-Path $PSScriptRoot 'devfund.ps1')
 foreach ($file in $files) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "missing $file" }
+}
+
+if ($DevFund) {
+    # After the package check: the kit is long to copy. TAEF runs from its folder; the WDTF
+    # installers need the runtime cabinets beside them.
+    $copied = Copy-Tree (Join-Path $Kit 'Runtimes\TAEF\x64') 'C:\hostmic\devfund\taef'
+    foreach ($item in Get-ChildItem -LiteralPath (Join-Path $Kit 'Runtimes') -File |
+        Where-Object { $_.Extension -eq '.cab' -or $_.Name -match 'x64.*\.msi$' }) {
+        Copy-VMFile -Name $VMName -SourcePath $item.FullName -DestinationPath "C:\hostmic\devfund\runtimes\$($item.Name)" `
+            -FileSource Host -CreateFullPath -Force
+        $copied++
+    }
+    $copied += Copy-Tree (Join-Path $Kit 'Tests\Additional Tests\x64\DevFund') 'C:\hostmic\devfund\tests'
+    "copied     $copied Device Fundamentals files to $VMName`:C:\hostmic\devfund"
 }
 
 $destination = "C:\hostmic\$Name"
