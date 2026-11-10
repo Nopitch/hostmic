@@ -326,6 +326,7 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 | Scenario | What passes |
 |---|---|
 | `install` | the test certificate trusted, `devcon install` succeeds, the host interface answers, the adapter and the host interface device are `OK`, the microphone is unplugged (`DeviceState` 8) |
+| `power` | the adapter idles to D3 within 20 s without a host (PortCls's inactivity timer, 5 s, set by the INF; read from `DEVPKEY_Device_PowerData`); a host attaching wakes it, and it idles again; it powers up for a `capture-check`, stays in D0 to the end of the recording, which passes, and idles again after it |
 | `tone` | `test-host` plays; a second host is kept waiting; `capture-check` passes; the host ends with 0 late, no packet skipped, `detached`; the microphone is unplugged again |
 | `latency` | `measure latency` passes (every click due read, median near 10 ms) |
 | `load` | `measure load` with 16 spinning threads passes (0 crackle) |

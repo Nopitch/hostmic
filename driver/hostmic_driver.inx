@@ -45,6 +45,15 @@ HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
 HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
 HKR,Drivers\wave\wdmaud.drv,Description,,%DeviceDesc%
 HKR,Drivers\mixer\wdmaud.drv,Description,,%DeviceDesc%
+; PortCls's inactivity timer ("Audio Device Class Inactivity Timer Implementation"), off by
+; default: after 5 s without I/O or property requests, on battery or AC power, the device goes
+; to D3; PortCls powers it up again on the next request. A running stream stays in D0: the
+; audio engine sends a request every period. hostmic has no hardware to save power on: a short
+; time-out makes every stream start after an idle period go through D3 and D0, which the test
+; campaign checks.
+HKR,PowerSettings,ConservationIdleTime,%REG_BINARY%,05,00,00,00
+HKR,PowerSettings,PerformanceIdleTime,%REG_BINARY%,05,00,00,00
+HKR,PowerSettings,IdlePowerState,%REG_BINARY%,03,00,00,00
 
 ; ================= Kernel Streaming interfaces =================
 ; The reference strings match the names the driver passes to PcRegisterSubdevice.
@@ -102,6 +111,7 @@ HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 [Strings]
 ; Non-localizable
 SPSVCINST_ASSOCSERVICE = 0x00000002
+REG_BINARY             = 0x00000001
 KSNAME_WaveMic         = "WaveMic"
 KSNAME_TopologyMic     = "TopologyMic"
 Proxy.CLSID            = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"

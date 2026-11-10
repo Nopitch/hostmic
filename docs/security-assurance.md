@@ -145,8 +145,9 @@ of the build.
 - Clippy (pedantic, `-D warnings`), with `undocumented_unsafe_blocks` and
   `multiple_unsafe_ops_per_block` forbidden in the driver; CodeQL; zizmor.
 - VM tests documented in [docs/test-vm.md](test-vm.md), including a measured recording
-  (`tools/capture-check`: frequency, level, discontinuities), run as a campaign of ten
-  scenarios (`tools/vm/campaign.ps1`) on the debug and the release packages.
+  (`tools/capture-check`: frequency, level, discontinuities), run as a campaign of eleven
+  scenarios (`tools/vm/campaign.ps1`) on the debug and the release packages, among them the
+  device idling to D3 through PortCls's inactivity timer and streaming again from it.
 - Driver Verifier (M6, [docs/test-vm.md](test-vm.md), section 9): the campaign passes with the
   driver, `portcls.sys` and `ks.sys` under the standard rule classes, DDI compliance,
   PortCls's port/miniport rules and code integrity checks, and survives randomized allocation
@@ -166,7 +167,9 @@ of the build.
 
 ### 2.6 Known gaps and plans
 
-- An HVCI run in the test VM, sleep and resume, and endurance tests (M6). The host interface's
+- An HVCI run in the test VM and endurance tests (M6); sleep and hibernation on a real machine
+  (M7: a Hyper-V guest has no sleep state; the device's own idle transitions to D3 and back
+  are tested in the VM, section 2.5). The host interface's
   IOCTLs are fuzzed only in their pure validation code, not in the kernel code that calls it:
   Microsoft's fuzzers leave that raw device out, and a fuzzer of our own is planned with the
   security review (M6).
