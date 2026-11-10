@@ -44,9 +44,9 @@ use wdk_sys::{
     IRP_MN_START_DEVICE, IRP_MN_STOP_DEVICE, IRP_MN_SURPRISE_REMOVAL, NT_SUCCESS, NTSTATUS,
     PACCESS_TOKEN, PDEVICE_OBJECT, POOL_FLAG_PAGED, PVOID, STATUS_ACCESS_DENIED,
     STATUS_BUFFER_TOO_SMALL, STATUS_DELETE_PENDING, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_DEVICE_STATE,
-    STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS,
-    STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
+    STATUS_DEVICE_REMOVED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE,
+    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, ULONG, UNICODE_STRING,
     ntddk::{
         ExAllocatePool2, ExFreePool, IoDeleteDevice, IoGetCurrentProcess, IoGetRequestorProcess,
         IoIs32bitProcess, IoRegisterDeviceInterface, IoSetDeviceInterfaceState, IofCompleteRequest,
@@ -112,6 +112,11 @@ pub struct HostDevice {
     started: AtomicBool,
     /// Whether the PnP manager removed this child (`IRP_MN_REMOVE_DEVICE`) since its last start.
     removed: AtomicBool,
+    /// Whether the PnP manager reported this child gone (`IRP_MN_SURPRISE_REMOVAL`) since its
+    /// last start. Requests on handles still open then must fail, except close, cleanup and
+    /// PnP (Microsoft's page on handling a surprise removal request): `ATTACH` and `ADVANCE` are
+    /// refused; `DETACH` and the reads stay, so that a host can let go.
+    surprise_removed: AtomicBool,
     /// Handles open on the child, from a successful create to its close. While any is open,
     /// the child refuses removal: requests on those handles use the adapter's host link,
     /// which lives in the adapter's device extension.
@@ -187,6 +192,7 @@ pub unsafe fn create(
                 enumerated: AtomicBool::new(false),
                 started: AtomicBool::new(false),
                 removed: AtomicBool::new(false),
+                surprise_removed: AtomicBool::new(false),
                 open_files: AtomicU32::new(0),
                 remove_pending: AtomicBool::new(false),
                 link: UnsafeCell::new(UNICODE_STRING {
@@ -504,6 +510,10 @@ unsafe fn pnp(device: PDEVICE_OBJECT, irp: *mut IRP, stack: &IO_STACK_LOCATION) 
             STATUS_SUCCESS
         }
         IRP_MN_SURPRISE_REMOVAL => {
+            // SAFETY: a live device of this module.
+            unsafe { this(device) }
+                .surprise_removed
+                .store(true, Ordering::Release);
             // SAFETY: a PnP request for this device.
             unsafe { stop(device) };
             STATUS_SUCCESS
@@ -597,6 +607,7 @@ unsafe fn start(device: PDEVICE_OBJECT) -> NTSTATUS {
         // removed, then started, with no cancellation in between: both flags go back here,
         // before opens are allowed again.
         this.removed.store(false, Ordering::Release);
+        this.surprise_removed.store(false, Ordering::Release);
         this.remove_pending.store(false, Ordering::SeqCst);
         this.started.store(true, Ordering::Release);
     }
@@ -891,6 +902,28 @@ impl Reply {
     }
 }
 
+/// Refuses, counts and completes a device control request with an unknown control `code`.
+///
+/// # Safety
+///
+/// `irp` is a device control request owned by this driver, not yet completed.
+unsafe fn unknown_code(irp: *mut IRP, code: u32, shared: &HostLink) -> NTSTATUS {
+    let count = shared.refused(
+        function(code),
+        Reason::Status,
+        STATUS_INVALID_DEVICE_REQUEST,
+    );
+    // Rate-limited as `count_refusal` does.
+    if count <= 16 || count.is_power_of_two() {
+        println!(
+            "hostmic: unknown control code {code:#010x}, process {}",
+            current_process()
+        );
+    }
+    // SAFETY: the caller's contract.
+    unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) }
+}
+
 /// `IRP_MJ_DEVICE_CONTROL`: the host interface's requests (`hostmic-abi`), all
 /// `METHOD_BUFFERED`. The I/O manager has already checked the handle's access against the
 /// code's access bits.
@@ -916,8 +949,11 @@ unsafe fn device_control(
     let output = parameters.OutputBufferLength as usize;
     let file = stack.FileObject;
     // SAFETY: a live host interface device (the caller's contract).
-    let shared = unsafe { this(device) }.shared;
-    let shared = shared.get();
+    let state = unsafe { this(device) };
+    let shared = state.shared.get();
+    // Gone: surprise-removed (or removed), with this handle still open.
+    let gone =
+        state.surprise_removed.load(Ordering::Acquire) || state.removed.load(Ordering::Acquire);
     let (name, result) = {
         let input = if buffer.is_null() || parameters.InputBufferLength == 0 {
             &[][..]
@@ -939,6 +975,17 @@ unsafe fn device_control(
                     .and_then(|()| host::output(output, StreamState::SIZE))
                     .map(|()| Reply::of(shared.snapshot().to_bytes()))
                     .map_err(Refusal::Rejected),
+            ),
+            IOCTL_ATTACH | IOCTL_ADVANCE if gone => (
+                if parameters.IoControlCode == IOCTL_ATTACH {
+                    "ATTACH"
+                } else {
+                    "ADVANCE"
+                },
+                Err(Refusal::Status(
+                    STATUS_DEVICE_REMOVED,
+                    "the host interface was removed",
+                )),
             ),
             // SAFETY: the caller's contract.
             IOCTL_ATTACH => ("ATTACH", unsafe {
@@ -978,22 +1025,8 @@ unsafe fn device_control(
                     .map(|()| Reply::of(shared.stats().to_bytes()))
                     .map_err(Refusal::Rejected),
             ),
-            code => {
-                let count = shared.refused(
-                    function(code),
-                    Reason::Status,
-                    STATUS_INVALID_DEVICE_REQUEST,
-                );
-                // Rate-limited as `count_refusal` does.
-                if count <= 16 || count.is_power_of_two() {
-                    println!(
-                        "hostmic: unknown control code {code:#010x}, process {}",
-                        current_process()
-                    );
-                }
-                // SAFETY: the caller's contract.
-                return unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) };
-            }
+            // SAFETY: the caller's contract.
+            code => return unsafe { unknown_code(irp, code, shared) },
         }
     };
     match result {

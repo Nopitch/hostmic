@@ -917,6 +917,20 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   terminal's high integrity level; read from the minidump with the WDK's `kd`). The independent
   review found it; fixed, the campaign passes 12 of 12 under Driver Verifier (`standard`) with
   `tools/ioctl-fuzz`'s `fuzz` scenario, whose low-integrity probe now reads but cannot write.
+  *Surprise removal (2026-11-10):* after the host interface's `IRP_MN_SURPRISE_REMOVAL`, its
+  handles still open got `ATTACH` and `ADVANCE` served, while Microsoft's "Handling an
+  IRP_MN_SURPRISE_REMOVAL Request" says a driver must fail every later request it would have
+  handled, but close, cleanup and PnP. The child now refuses `ATTACH` and `ADVANCE` with
+  `STATUS_DEVICE_REMOVED` from its surprise removal to its next start (a plain stop for
+  rebalancing refuses nothing). A deliberate deviation: `DETACH` and the reads (`GET_INFO`,
+  `GET_STREAM`, `GET_STATS`) stay served, so that a host can let go and diagnose; they touch
+  nothing a removal frees (the link lives until the last handle closes). The host crate turns
+  `ERROR_DEVICE_REMOVED` on `ADVANCE` into `Error::NotHost` (attachment kept, for `DETACH`), so a
+  following `Player` releases and waits for the next arrival instead of ending: the PnP manager
+  surprise-removes the child before it tells applications, so the refusal comes first. The
+  independent review found that last point. Not triggered in the VM (it needs a surprise
+  removal while a host holds its handle, which only Device Fundamentals' PnP tests produce, and
+  they run without a host); the campaign passes 12 of 12 under Driver Verifier.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
