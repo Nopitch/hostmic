@@ -13,3 +13,7 @@
 *.spc
 .env
 .env.*
+
+# Claude Code local settings: may contain plaintext secrets ("don't ask again" rules)
+.claude/settings.local.json
+.claude/settings.local.json.*
