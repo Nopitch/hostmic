@@ -110,10 +110,12 @@ static SDDL: [u16; 42] = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
 static DEVICE_ID: [u16; 13] = wide("HOSTMIC\\Host");
 /// `BusQueryInstanceID`, by the PDO's slot in [`DEVICES`]: unique in the system, as
 /// `UniqueID` (1) says, among the host interfaces present at once, which hold distinct slots.
-/// The device keeps its name, and its devnode, across the adapter's reinstallations; with
-/// `UniqueID` 0 the PnP manager named it after the adapter's devnode, which every reinstall
-/// replaces, and each left a phantom device behind. Never a constant: two adapters' host
-/// interfaces with the same instance ID would be a duplicate device (bug check 0xCA).
+/// The device keeps its name, and its devnode (with its disabled flag and registry settings),
+/// across the adapter's reinstallations; with `UniqueID` 0 the PnP manager named it after the
+/// adapter's devnode, which every uninstall replaces, and each left a phantom device behind.
+/// With several adapters, the name follows the order they start in, not the adapter: the host
+/// interfaces are interchangeable. Never a constant: two adapters' host interfaces with the
+/// same instance ID would be a duplicate device (code 42 on the second).
 static INSTANCE_IDS: [[u16; 2]; SLOTS] = [wide("0"), wide("1"), wide("2"), wide("3")];
 /// `DeviceTextDescription`: the name Device Manager shows.
 static DESCRIPTION: [u16; 23] = wide("hostmic host interface");
@@ -206,9 +208,13 @@ pub unsafe fn create(
         return Err(status);
     }
     let device = NonNull::new(device).ok_or(STATUS_UNSUCCESSFUL)?;
-    // Registered first, as its slot names it. Nothing can send it a request before it is
-    // initialized below: the I/O manager refuses opens while `DO_DEVICE_INITIALIZING` is set,
-    // and the PnP manager only learns of it from the next bus relations query.
+    // Registered first, as its slot names it, and before `DO_DEVICE_INITIALIZING` is cleared,
+    // which the previous order did the other way round (a create in between would have gone
+    // to PortCls with this extension). The PnP manager only learns of the device from the next
+    // bus relations query; an open by its generated name meanwhile is refused while that flag
+    // is set (the I/O manager's behaviour, not documented), and would otherwise find the
+    // extension zeroed by `IoCreateDevice` (documented): `started` false, refused before
+    // anything else is read.
     let Some(slot) = DEVICES.iter().position(|slot| {
         slot.compare_exchange(
             ptr::null_mut(),

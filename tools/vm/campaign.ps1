@@ -297,8 +297,9 @@ function Assert-Alive($Tool, [string]$What) {
 function Install-Driver {
     $install = Invoke-Devcon @('install', (Join-Path $Dir 'hostmic_driver.inf'), 'root\hostmic')
     Check ($install.Text -match 'successfully') "devcon install failed (log $(Split-Path $install.Log -Leaf))"
-    # A host interface disabled before an earlier removal comes back disabled.
-    Start-Sleep -Seconds 2
+    # A host interface disabled before an earlier removal comes back disabled: it keeps its
+    # devnode (HOSTMIC\HOST\0) across reinstalls. Wait for it to be present, then enable it.
+    Check (Wait-Until { $null -ne (Get-HostInterface) } 20) 'no host interface device within 20 s of the install'
     Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like 'HOSTMIC\*' -and $_.Problem -eq 'CM_PROB_DISABLED' } |
         ForEach-Object { Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false }

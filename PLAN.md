@@ -1019,18 +1019,26 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   a few bytes, a device object); the campaign checks the normal paths.
   *The host interface's instance ID (2026-11-10):* the host interface reported instance ID "0"
   with `UniqueID` 0, so the PnP manager named it after the adapter's devnode
-  (`HOSTMIC\HOST\1&2A215B38&59&0`), which every reinstall of the adapter replaces: each left
-  a phantom device behind (59 in the test VM), and on a user's machine each driver update
-  would. The PDO now reports `UniqueID` 1 and the index of its slot in `DEVICES` as instance
-  ID (`HOSTMIC\HOST\0` for the first adapter): unique among the host interfaces present at
-  once, which hold distinct slots, and stable across reinstalls, so the device keeps its
-  devnode. Never a constant: two adapters' host interfaces would then be a duplicate device
-  (bug check 0xCA). A host interface still being removed when a new adapter starts makes the
-  new one take another slot, so at most one device per slot is ever left. The slot is now
-  taken before the device extension is written, while `DO_DEVICE_INITIALIZING` still keeps
-  the I/O manager from opening the device. The phantoms of the old naming stay until removed
-  (`pnputil /remove-device`); the campaign's `removal` scenario checks that a reinstall keeps
-  the instance ID and adds no device, present or not.
+  (`HOSTMIC\HOST\1&2A215B38&59&0`), which every uninstall of the adapter (`devcon remove`,
+  Device Manager's Uninstall) replaces: each left a phantom device behind (102 host interface devices, present or not, in the
+  test VM).
+  A driver update restarts the stack without replacing the devnode, so it does not (expected,
+  not measured). The PDO now reports `UniqueID` 1 and the index of its slot in `DEVICES` as
+  instance ID (`HOSTMIC\HOST\0` for the first adapter): unique among the host interfaces
+  present at once, which hold distinct slots, and stable across reinstalls, so the device
+  keeps its devnode, and with it its disabled flag and registry settings (the campaign's
+  install now waits for the device to be present before enabling it again). With several
+  adapters the name follows the order they start in, not the adapter: the host interfaces are
+  interchangeable. Never a constant: two adapters' host interfaces would then be a duplicate
+  device (code 42 on the second). A host interface still being removed when a new adapter
+  starts makes the new one take another slot, so at most one device per slot is ever left.
+  The slot is now taken before `DO_DEVICE_INITIALIZING` is cleared (the old order left a
+  moment when an open by the device's generated name went to PortCls with this extension).
+  The phantoms of the old naming stay until removed (`pnputil /remove-device`). The campaign's
+  `removal` scenario checks that a reinstall keeps the instance ID and adds no device, present
+  or not; the previous driver fails it (`&63&0` became `&64&0`). The independent review
+  corrected the duplicate's outcome (code 42, not a bug check), the driver-update claim, and
+  asked for the persistence and start-order notes and the install's wait.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
