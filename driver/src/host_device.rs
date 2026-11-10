@@ -297,8 +297,9 @@ unsafe fn link(this: &HostDevice) -> &mut UNICODE_STRING {
 ///
 /// `STATUS_INSUFFICIENT_RESOURCES`, with the request failed: its status set to that, and the
 /// relations an upper driver put there released (their references and the structure), as a
-/// failed request carries none. Leaving the request unchanged would report the relations
-/// without the child, which the PnP manager would take for the child's departure and remove it.
+/// failed request carries none; the caller completes it. Passing the request down unchanged
+/// would report the relations without the child, which the PnP manager would take for the
+/// child's departure and remove it.
 ///
 /// # Safety
 ///

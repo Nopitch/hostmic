@@ -129,8 +129,9 @@ pub unsafe extern "C" fn add_device(
 /// The host interface comes first, and the start fails with its status when it cannot be
 /// created: without it no host can feed the microphone, which would otherwise be present, and
 /// silent, with nothing to say why. A failed start shows in Device Manager (code 10) instead.
-/// A PDO created by a start that fails later was never reported: the adapter's removal deletes
-/// it ([`host_device::detach`]).
+/// A PDO created by a start that fails later was never reported: the adapter's removal, which
+/// follows a failed start, deletes it ([`host_device::detach`]). A fifth adapter, beyond the
+/// host interfaces [`host_device::create`] keeps track of, now fails to start as well.
 unsafe extern "C" fn start_device(
     device: PDEVICE_OBJECT,
     irp: PIRP,
@@ -142,29 +143,37 @@ unsafe extern "C" fn start_device(
         println!("hostmic: StartDevice returned {status:#010x}: no shared buffer");
         return status;
     }
-    // SAFETY: `device` is the adapter's FDO, in a PnP request.
-    let adapter = unsafe { adapter(device) };
-    let created = adapter.host.is_none();
-    if created {
-        // SAFETY: `device` is the adapter's FDO, at PASSIVE_LEVEL.
-        match unsafe { host_device::create(device, link) } {
-            Ok(host) => adapter.host = Some(host),
-            Err(status) => {
-                println!(
-                    "hostmic: StartDevice returned {status:#010x}: host interface not created"
-                );
-                return status;
+    // The adapter is borrowed apart from the calls into PortCls below, which might send a PnP
+    // request to this device (and `dispatch_pnp` borrow it) before they return.
+    let created = {
+        // SAFETY: `device` is the adapter's FDO, in a PnP request; the reference ends with this
+        // block.
+        let adapter = unsafe { adapter(device) };
+        let created = adapter.host.is_none();
+        if created {
+            // SAFETY: `device` is the adapter's FDO, at PASSIVE_LEVEL.
+            match unsafe { host_device::create(device, link) } {
+                Ok(host) => adapter.host = Some(host),
+                Err(status) => {
+                    println!(
+                        "hostmic: StartDevice returned {status:#010x}: host interface not created"
+                    );
+                    return status;
+                }
             }
         }
-    }
+        created
+    };
     // SAFETY: `device`, `irp` and `resources` come from PortCls for this start request.
     let status = match unsafe { install_filters(device, irp, resources, link) } {
         Ok((topology_port, wave_port)) => {
+            // SAFETY: as above, after the calls into PortCls.
+            let adapter = unsafe { adapter(device) };
             adapter.topology_port = Some(topology_port);
             adapter.wave_port = Some(wave_port);
             if created {
-                // Once started: the PnP manager queries the bus relations, which report the
-                // new child.
+                // The PnP manager queries a started device's bus relations anyway; asked
+                // again here, so that the new child is reported without relying on that.
                 // SAFETY: `device` is the adapter's FDO, at PASSIVE_LEVEL.
                 unsafe { enumerate_children(device) };
             }
@@ -345,11 +354,14 @@ pub unsafe fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATU
     // SAFETY: an IRP being dispatched has a valid current stack location for the call.
     let stack = unsafe { &*stack };
     let minor = stack.MinorFunction;
-    // SAFETY: `device` is the adapter's FDO (the driver's dispatch routine sends the host
-    // interface's requests elsewhere), in a PnP request.
-    let adapter = unsafe { adapter(device) };
+    // The adapter is borrowed only in the arms that use it: other requests may arrive while
+    // `start_device` calls into PortCls.
     match u32::from(minor) {
         IRP_MN_REMOVE_DEVICE | IRP_MN_SURPRISE_REMOVAL | IRP_MN_STOP_DEVICE => {
+            // SAFETY: `device` is the adapter's FDO (the driver's dispatch routine sends the
+            // host interface's requests elsewhere), in a PnP request the PnP manager
+            // serializes with the start.
+            let adapter = unsafe { adapter(device) };
             let topology = adapter.topology_port.take();
             let wave = adapter.wave_port.take();
             if topology.is_some() || wave.is_some() {
@@ -369,14 +381,21 @@ pub unsafe fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATU
         IRP_MN_QUERY_DEVICE_RELATIONS => {
             // SAFETY: the parameters of a relations query.
             let relation = unsafe { stack.Parameters.QueryDeviceRelations.Type };
+            // SAFETY: as above; only the child's pointer is read.
+            let host = unsafe { adapter(device) }.host;
             if relation == _DEVICE_RELATION_TYPE::BusRelations
-                && let Some(host) = adapter.host
+                && let Some(host) = host
             {
                 // SAFETY: the adapter's bus relations query, with its live child.
                 if let Err(status) = unsafe { host_device::report(irp, host) } {
-                    // `report` failed the request, which still goes down (a bus driver does
-                    // not complete it): the PnP manager keeps the relations it knows.
+                    // A driver that fails a PnP request completes it rather than passing it
+                    // down ("Passing PnP IRPs Down the Device Stack"). The PnP manager is
+                    // expected to keep the children it knows when the query fails (not
+                    // documented); a reply without the child would remove it.
                     println!("hostmic: host interface not reported: {status:#010x}");
+                    // SAFETY: a request owned by this driver, failed by `report`; not touched
+                    // afterwards.
+                    return unsafe { host_device::complete(irp, status, 0) };
                 }
             }
         }
