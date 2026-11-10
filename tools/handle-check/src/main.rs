@@ -4,6 +4,7 @@
 //! ```text
 //! handle-check [--seconds N] (--close | --holder [--close-own-handle] | --detach-from-child)
 //! handle-check --exit-race ROUNDS
+//! handle-check --clone
 //! ```
 //!
 //! Attaches to the first host interface as its host, does what the option says, then watches
@@ -34,7 +35,12 @@
 //! when no close overlapped an exit. Run it under Driver Verifier: a wrong order shows as a bug
 //! check, not as an exit status.
 //!
+//! And the mapping must not outlive the host in a clone of its address space: `--clone` (see
+//! the `clone` module).
+//!
 //! Exit status: 0 on success, 1 on failure, 2 on a usage error.
+
+mod clone;
 
 use std::{
     env,
@@ -75,7 +81,8 @@ use windows::{
 };
 
 const USAGE: &str = "usage: handle-check [--seconds N] (--close | --holder [--close-own-handle] | --detach-from-child)
-       handle-check --exit-race ROUNDS";
+       handle-check --exit-race ROUNDS
+       handle-check --clone";
 
 /// The check to run.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +99,8 @@ enum Mode {
     SendDetach(u64),
     /// `--exit-race ROUNDS`.
     ExitRace(u32),
+    /// `--clone`.
+    Clone,
     /// `--race-host DELAY ENDING ENDED` (internal): one round's host; its child waits `DELAY`
     /// microseconds and gives its verdict through the events `ENDING` and `ENDED`.
     RaceHost { delay: u32, ending: u64, ended: u64 },
@@ -136,6 +145,7 @@ fn parse() -> Result<Options, String> {
                     format!("--send-detach: not a number: {value}")
                 })?))?;
             }
+            "--clone" => set(Mode::Clone)?,
             "--exit-race" => set(Mode::ExitRace(number(&mut args, "--exit-race")?))?,
             "--race-host" => set(Mode::RaceHost {
                 delay: number(&mut args, "--race-host")?,
@@ -193,6 +203,7 @@ fn main() -> ExitCode {
             ended,
         } => race_host(delay, ending, ended),
         Mode::ExitRace(rounds) => exit_race(rounds),
+        Mode::Clone => clone::clone_check(),
         _ => run(&options),
     };
     match result {
@@ -276,6 +287,7 @@ fn check(options: &Options, device: Handle, reply: &AttachReply) -> Result<(), S
         Mode::DetachFromChild => detach_from_child(&device)?,
         Mode::SendDetach(_)
         | Mode::ExitRace(_)
+        | Mode::Clone
         | Mode::RaceHost { .. }
         | Mode::RaceClose { .. } => {
             unreachable!("handled in main")

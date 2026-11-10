@@ -29,7 +29,8 @@
       kills      hosts killed at random moments: the microphone is unplugged after each, and
                  the next host plays cleanly
       handles    handle-check's rules: a closed handle detaches, a duplicate in another
-                 process neither detaches the host nor keeps a dead host's mapping
+                 process neither detaches the host nor keeps a dead host's mapping; a clone of
+                 the host's address space holds no mapping of the buffer
       fuzz       ioctl-fuzz for -Seconds: opens, control codes, sizes, other requests, then
                  threads and processes that attach, advance, detach and die; nothing
                  unexpected, and the interface free at the end
@@ -459,7 +460,14 @@ function Test-Handles {
     $raced = Find-Line $race.Text '^exit-race  200 rounds:'
     Check ($race.Code -eq 0) "--exit-race: $(Find-Line $race.Text '^(error|exit-race)') (log $(Split-Path $race.Log -Leaf))"
     $overlapped = if ($raced -match 'ending in (\d+)') { $Matches[1] } else { '?' }
-    "a closed handle detaches; a child cannot detach the host; a dead host is detached despite a holder; the last handle unmaps; 200 exits raced with the last close ($overlapped overlapped)"
+
+    # A clone of the host's address space (a VA-clone snapshot and a fork) holds no mapping of
+    # the buffer: the next host's data stays out of it. Both clones must have been made and
+    # must read the control, or the check proves nothing.
+    $clone = Invoke-Tool 'handle-check' @('--clone') 60
+    $made = $clone.Text -match '(?m)^va-clone +control' -and $clone.Text -match '(?m)^fork +control'
+    Check ($clone.Code -eq 0 -and $made) "--clone: $(Find-Line $clone.Text '^(error|verdict|va-clone|fork)') (log $(Split-Path $clone.Log -Leaf))"
+    "a closed handle detaches; a child cannot detach the host; a dead host is detached despite a holder; the last handle unmaps; 200 exits raced with the last close ($overlapped overlapped); no clone of the host keeps the buffer"
 }
 
 # The host interface fuzzed from user mode (tools/ioctl-fuzz); its seed is in the log.

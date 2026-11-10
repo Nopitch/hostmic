@@ -254,6 +254,8 @@ Start-Sleep 3; Get-Process ping | Stop-Process -Force; $p | Wait-Process; Get-Co
 C:\hostmic\handle-check.exe --seconds 3 --detach-from-child
 # The host exits while its child closes the last handle, 2000 times: no bug check.
 C:\hostmic\handle-check.exe --exit-race 2000
+# The host clones its own address space (a VA-clone snapshot, a fork): no clone maps the buffer.
+C:\hostmic\handle-check.exe --clone
 ```
 
 Expected: `--close` shows the mapping `unmapped` right after the close. After the kill, the
@@ -264,8 +266,16 @@ mapping `mapped`, then `unmapped` once the holder is killed, while the host stil
 `detached` (its own `DETACH`). `--exit-race` ends with the rounds whose last close began
 while the host's process was still ending (most of them; it fails if none did, the race not
 being exercised) and those after; under Driver Verifier, a wrong order would show as a bug
-check. A holder left running keeps a handle to the interface open,
-which makes `devcon remove` answer "Removed on reboot" (below).
+check. `--clone` makes both clones (it fails otherwise) and reads each one's memory: two
+controls written before cloning, a private page and a section's view (`private 0x5a x 256,
+mapped 0x6b x 256`), then the buffer's address with the host attached, after the host writes
+again, after `DETACH` and with the next host attached, and all its readable memory for the
+patterns written after cloning. On Windows 11 26H2 (build 26300) neither clone has a region
+at the buffer's address (`free`), which the host's process has committed, and the verdict is
+`no clone maps the buffer or holds what was written after cloning`. Not covered: a clone made
+by another process from a handle to the host, and a fork that inherits the host's handle (the
+duplicate and holder checks above cover that handle). A holder left running keeps a
+handle to the interface open, which makes `devcon remove` answer "Removed on reboot" (below).
 
 The microphone's jack follows the host. The endpoint's state is in the registry, under
 `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{…}` (the key whose
@@ -359,7 +369,7 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 | `latency` | `measure latency` passes (every click due read, median near 10 ms) |
 | `load` | `measure load` with 16 spinning threads passes (0 crackle) |
 | `kills` | hosts killed at random moments (`-Kills`, default 10): the microphone is unplugged within 10 s after each; the next host plays and `capture-check` passes |
-| `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer; `handle-check --exit-race 200` passes (a host exiting while its child closes the last handle) |
+| `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer; `handle-check --exit-race 200` passes (a host exiting while its child closes the last handle); `handle-check --clone` passes (no clone of the host's address space maps the buffer) |
 | `fuzz` | `ioctl-fuzz --seconds` (the recordings' length) prints `PASS`: nothing unexpected, the interface free at the end |
 | `removal` | `devcon remove` while a host plays unloads the driver without a reboot; after the reinstall the host attaches again and `capture-check` passes; the host interface keeps its instance ID (`HOSTMIC\HOST\0`), and the count of `HOSTMIC` devices, present or not, stays the same (no phantom) |
 | `disable` | the host interface answers again after a disable and enable, in D3 while disabled and D0 again after; with a host, disabling the host interface or the adapter makes it let go, and it attaches again (`capture-check` passes each time) |
