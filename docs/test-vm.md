@@ -353,7 +353,7 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 
 | Scenario | What passes |
 |---|---|
-| `install` | the test certificate trusted, `devcon install` succeeds, the host interface answers, the adapter and the host interface device are `OK`, the microphone is unplugged (`DeviceState` 8) |
+| `install` | the test certificate trusted, `devcon install` succeeds, the host interface answers, the adapter and the host interface device are `OK`, the host interface in D0 (`DEVPKEY_Device_PowerData`), the microphone is unplugged (`DeviceState` 8) |
 | `power` | the adapter idles to D3 within 20 s without a host (PortCls's inactivity timer, 5 s, set by the INF; read from `DEVPKEY_Device_PowerData`); a host attaching wakes it, and it idles again; it powers up for a `capture-check`, stays in D0 to the end of the recording, which passes, and idles again after it |
 | `tone` | `test-host` plays; a second host is kept waiting; `capture-check` passes; the host ends with 0 late, no packet skipped, `detached`; the microphone is unplugged again |
 | `latency` | `measure latency` passes (every click due read, median near 10 ms) |
@@ -362,7 +362,7 @@ powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\campaign.ps1
 | `handles` | `handle-check --close` and `--detach-from-child` pass; a dead host whose handle a holder keeps is detached (the next host attaches); the holder's last handle unmaps the living host's buffer; `handle-check --exit-race 200` passes (a host exiting while its child closes the last handle) |
 | `fuzz` | `ioctl-fuzz --seconds` (the recordings' length) prints `PASS`: nothing unexpected, the interface free at the end |
 | `removal` | `devcon remove` while a host plays unloads the driver without a reboot; after the reinstall the host attaches again and `capture-check` passes |
-| `disable` | the host interface answers again after a disable and enable; with a host, disabling the host interface or the adapter makes it let go, and it attaches again (`capture-check` passes each time) |
+| `disable` | the host interface answers again after a disable and enable, in D3 while disabled and D0 again after; with a host, disabling the host interface or the adapter makes it let go, and it attaches again (`capture-check` passes each time) |
 | `audiosrv` | the host keeps playing across a restart of the audio service (`capture-check` passes) |
 | `uninstall` | `devcon remove` unloads the driver (`STOPPED`), the host interface is gone |
 

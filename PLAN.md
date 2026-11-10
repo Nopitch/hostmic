@@ -972,6 +972,33 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   the audio engine's notification event has the same one-slot shape, keyed by the event, and
   relies on PortCls unregistering it before the stream's last release, which its documentation
   implies (a new stream's registration would otherwise fail, an availability issue only).
+  *The host interface's power policy (2026-11-10):* with no function driver, the host
+  interface's PDO is its own power policy owner, and it acted as none: it never declared a
+  device power state (`PoSetPowerState`), and completed a system power request without asking
+  for the matching device one. Nothing failed for it (no hardware), but the power manager's
+  records were wrong, and Microsoft's rules for a raw device's bus driver were not followed.
+  The PDO now declares D0 at start and D3 at a (surprise) removal, declares each device power
+  request it receives, and turns a system power request (set or query) into a device power
+  request of the same kind for itself (`PoRequestPowerIrp`: D0 in the working state, D3 in any
+  other, as its capabilities report), sent even when the device is already in that state,
+  marked pending first and completed from that request's completion routine (a system
+  set-power request with success, as it cannot fail; a query with its device query's status).
+  A guarded mutex serializes each declaration with the check that allows it, and a removal
+  marks the device removed before declaring D3, so that a device power request handled during
+  a removal cannot declare D0 after it (Microsoft's pages use a remove lock for the same end).
+  The dispatch runs at `PASSIVE_LEVEL` (`DO_POWER_PAGABLE`), the completion routine at
+  `PASSIVE_LEVEL` or `DISPATCH_LEVEL`; never in the real-time path. The independent review
+  found the departures from Microsoft's pages in the first version (no device request when
+  already in the state, a system query answered without a device query, no serialization with
+  a removal, `PoRequestPowerIrp`'s result tested with `NT_SUCCESS` rather than against
+  `STATUS_PENDING`). The campaign checks the declared state (`DEVPKEY_Device_PowerData`): D0
+  after the install, D3 while disabled, D0 after enabling it again; but the previous driver
+  passes those checks too (measured in the VM): the PnP manager records D0 at a start and D3 at
+  a removal on its own, so they guard against a wrong declaration and show nothing of this
+  change. What this change adds is the system power path, which runs at each shutdown and
+  restart of the VM (S5), the only system power change a Hyper-V guest has: a restart under
+  Driver Verifier with the driver installed completes without a bug check. Sleep and
+  hibernation wait for M7's real machine.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

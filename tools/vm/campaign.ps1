@@ -18,8 +18,8 @@
 
     Scenarios, in order (-Only runs a subset, in the same order; without "install" the driver
     must already be installed, without "uninstall" it stays installed):
-      install    trust the test certificate, install, the host interface answers, the
-                 microphone is unplugged without a host
+      install    trust the test certificate, install, the host interface answers and is in D0,
+                 the microphone is unplugged without a host
       power      the adapter idles to D3 without a stream (with and without a host), stays in
                  D0 through a recording, and idles again after it
       tone       test-host plays, a second host is refused, capture-check passes, the
@@ -36,7 +36,8 @@
       removal    devcon remove while a host plays unloads the driver; after the reinstall the
                  host attaches again and plays cleanly
       disable    disabling and enabling the host interface (with and without a host) and the
-                 adapter (with a host): the host lets go and attaches again
+                 adapter (with a host): the host lets go and attaches again; the host
+                 interface is in D3 while disabled, in D0 again after
       audiosrv   restarting the audio service while a host plays
       uninstall  devcon remove unloads the driver
 
@@ -196,8 +197,8 @@ function Get-EndpointState {
     return $null
 }
 
-# The adapter's most recent device power state, 'D0' to 'D3' ('unknown' without an adapter or
-# the property): DEVPKEY_Device_PowerData is a CM_POWER_DATA, whose second ULONG is a
+# A device's most recent device power state, the adapter's by default, 'D0' to 'D3' ('unknown'
+# without the device or the property): DEVPKEY_Device_PowerData is a CM_POWER_DATA, whose second ULONG is a
 # DEVICE_POWER_STATE (1 for D0 to 4 for D3). Reading it sends the driver no request, so it does
 # not wake the device. $InstanceId saves enumerating every device (about 0.5 s) at each read.
 function Get-PowerState([string]$InstanceId) {
@@ -316,6 +317,8 @@ function Test-Install {
     Check ($null -ne $adapter -and $adapter.Status -eq 'OK') 'the adapter is not OK after the install'
     $interface = Get-HostInterface
     Check ($null -ne $interface -and $interface.Status -eq 'OK') 'the host interface device is not OK'
+    # Its own power policy owner: it declares D0 once started.
+    Check ((Get-PowerState $interface.InstanceId) -eq 'D0') "the host interface is not in D0 once started (state $(Get-PowerState $interface.InstanceId))"
     Check (Wait-Unplugged 20) "the microphone is not unplugged without a host (DeviceState $(Get-EndpointState))"
     # What Driver Verifier verifies now, with the driver loaded: its settings may be pending a
     # restart.
@@ -329,7 +332,7 @@ function Test-Install {
     } else {
         'not verified now'
     }
-    "driver $(Get-DriverState), $($adapter.InstanceId), host interface OK, microphone unplugged, $now"
+    "driver $(Get-DriverState), $($adapter.InstanceId), host interface OK in D0, microphone unplugged, $now"
 }
 
 # PortCls's inactivity timer (the INF's PowerSettings, 5 s): the adapter idles to D3 without a
@@ -494,8 +497,13 @@ function Test-Disable {
         $disabled += $interface.InstanceId
         Disable-PnpDevice -InstanceId $interface.InstanceId -Confirm:$false
         Check ((Invoke-Tool 'hostmic-ctl' @('info') 10).Code -ne 0) 'the host interface answered while disabled'
+        # Removed: it declares D3; started again: D0.
+        $id = $interface.InstanceId
+        Check (Wait-Until { (Get-PowerState $id) -eq 'D3' } 5) "the host interface is not in D3 while disabled (state $(Get-PowerState $id))"
         Enable-PnpDevice -InstanceId $interface.InstanceId -Confirm:$false
         Check (Wait-InterfaceAnswers 15) 'the host interface did not answer after a disable and enable'
+        $on = Get-PowerState $interface.InstanceId
+        Check ($on -eq 'D0') "the host interface is not in D0 after a disable and enable (state $on)"
 
         $player = Start-PlayingHost 300
         $interface = Get-HostInterface
@@ -520,7 +528,7 @@ function Test-Disable {
         $played = Stop-Tool $player
         $counts = Get-Attachments $played.Text
         Check ($counts[0] -ge 3 -and $counts[1] -ge 2) "attachments $($counts[0]), releases $($counts[1]) (log $(Split-Path $played.Log -Leaf))"
-        "interface: $first; adapter: $second"
+        "interface D3 while disabled, D0 again; interface: $first; adapter: $second"
     } finally {
         # A failed check must not leave a device disabled for the next scenarios.
         foreach ($id in $disabled) {
