@@ -20,6 +20,8 @@
     must already be installed, without "uninstall" it stays installed):
       install    trust the test certificate, install, the host interface answers, the
                  microphone is unplugged without a host
+      power      the adapter idles to D3 without a stream (with and without a host), stays in
+                 D0 through a recording, and idles again after it
       tone       test-host plays, a second host is refused, capture-check passes, the
                  microphone is unplugged again after the host ends
       latency    measure latency
@@ -46,7 +48,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('install', 'tone', 'latency', 'load', 'kills', 'handles', 'removal', 'disable',
+    [ValidateSet('install', 'power', 'tone', 'latency', 'load', 'kills', 'handles', 'removal', 'disable',
         'audiosrv', 'uninstall')]
     [string[]]$Only,
     [ValidateRange(10, 86400)]
@@ -60,7 +62,7 @@ Set-StrictMode -Version 3
 $ErrorActionPreference = 'Stop'
 
 $Dir = $PSScriptRoot
-$Scenarios = 'install', 'tone', 'latency', 'load', 'kills', 'handles', 'removal', 'disable',
+$Scenarios = 'install', 'power', 'tone', 'latency', 'load', 'kills', 'handles', 'removal', 'disable',
 'audiosrv', 'uninstall'
 if ($Only) { $Scenarios = $Scenarios | Where-Object { $Only -contains $_ } }
 $LogDir = Join-Path $Dir ('log-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -191,6 +193,34 @@ function Get-EndpointState {
     return $null
 }
 
+# The adapter's most recent device power state, 'D0' to 'D3' ('unknown' without an adapter or
+# the property): DEVPKEY_Device_PowerData is a CM_POWER_DATA, whose second ULONG is a
+# DEVICE_POWER_STATE (1 for D0 to 4 for D3). Reading it sends the driver no request, so it does
+# not wake the device. $InstanceId saves enumerating every device (about 0.5 s) at each read.
+function Get-PowerState([string]$InstanceId) {
+    if (-not $InstanceId) {
+        $adapter = Get-Adapter
+        if (-not $adapter) { return 'unknown' }
+        $InstanceId = $adapter.InstanceId
+    }
+    $property = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName 'DEVPKEY_Device_PowerData' -ErrorAction SilentlyContinue
+    if (-not $property -or $property.Data -isnot [byte[]] -or $property.Data.Length -lt 8) { return 'unknown' }
+    $state = [System.BitConverter]::ToInt32($property.Data, 4)
+    if ($state -ge 1 -and $state -le 4) { "D$($state - 1)" } else { 'unknown' }
+}
+
+# Waits for the adapter to idle to D3; returns the seconds it took from the call, or fails.
+# With -Woken, it must first be seen out of D3: an adapter that something should have woken,
+# and that stayed in D3, must not pass for one that idled again.
+function Wait-Idle([string]$InstanceId, [string]$What, [switch]$Woken, [double]$Seconds = 20) {
+    $started = Get-Date
+    if ($Woken) {
+        Check (Wait-Until { (Get-PowerState $InstanceId) -ne 'D3' } 10) "the adapter stayed in D3 $What"
+    }
+    Check (Wait-Until { (Get-PowerState $InstanceId) -eq 'D3' } $Seconds) "the adapter did not idle to D3 within $Seconds s $What (state $(Get-PowerState $InstanceId))"
+    [int]((Get-Date) - $started).TotalSeconds
+}
+
 function Wait-Plugged([double]$Seconds = 15) { Wait-Until { (Get-EndpointState) -eq 1 } $Seconds }
 function Wait-Unplugged([double]$Seconds = 10) { Wait-Until { (Get-EndpointState) -eq 8 } $Seconds }
 
@@ -297,6 +327,48 @@ function Test-Install {
         'not verified now'
     }
     "driver $(Get-DriverState), $($adapter.InstanceId), host interface OK, microphone unplugged, $now"
+}
+
+# PortCls's inactivity timer (the INF's PowerSettings, 5 s): the adapter idles to D3 without a
+# stream, with or without a host; a recording powers it up and keeps it in D0 to the end; it
+# idles again afterwards. The time-out runs from the last access, so the times reported (from
+# each wait's start) can be shorter than its 5 s.
+function Test-Power {
+    Check (Wait-Until { (Get-EndpointState) -ne 1 } 10) 'the microphone is still active from a previous host'
+    $adapter = Get-Adapter
+    Check ($null -ne $adapter) 'no adapter'
+    $id = $adapter.InstanceId
+    $alone = Wait-Idle $id 'without a host'
+    $player = Start-PlayingHost 240
+    # Attaching plugs the microphone in: the audio service's requests wake the adapter.
+    $attached = Wait-Idle $id 'with a host attached and no stream' -Woken
+
+    $seconds = 15
+    $capture = Start-Tool 'capture-check' @('--seconds', "$seconds")
+    # The stream is open once the adapter has left D3; from then on it must stay in D0 until
+    # the recording ends. The samples only see the most recent state: capture-check's glitch
+    # count covers a power-down between two of them.
+    Check (Wait-Until { (Get-PowerState $id) -eq 'D0' } 10) "the adapter did not power up for a recording (state $(Get-PowerState $id))"
+    $samples = 0
+    $states = @()
+    while (-not $capture.Process.HasExited -and $samples -lt 4 * ($seconds + 10)) {
+        $state = Get-PowerState $id
+        $samples++
+        if ($state -ne 'D0' -and -not $capture.Process.HasExited) { $states += $state }
+        Start-Sleep -Milliseconds 250
+    }
+    $recorded = Wait-Tool $capture 60
+    $reason = Find-Line $recorded.Text '^(engine|glitches|frequency):'
+    Check ($recorded.Code -eq 0) "capture-check after D3: exit $($recorded.Code), $reason (log $(Split-Path $recorded.Log -Leaf))"
+    Check ($states.Count -eq 0) "the adapter left D0 during the recording: $($states -join ' ') in $samples samples"
+    $frequency = (Find-Line $recorded.Text '^frequency:') -replace '^frequency:\s*(\S+ Hz).*$', '$1'
+    $glitches = (Find-Line $recorded.Text '^glitches:') -replace '^glitches:\s*', ''
+
+    $after = Wait-Idle $id 'after the recording, with a host attached'
+    Assert-Alive $player 'across the power transitions'
+    $played = Stop-Tool $player
+    Check ($played.Text -notmatch '(?m)^error') "the host stopped on an error (log $(Split-Path $played.Log -Leaf))"
+    "D3 within $alone s without a host, woken and D3 again within $attached s with one; D0 through a $seconds s recording ($samples samples): $frequency, $glitches glitch; D3 again within $after s"
 }
 
 function Test-Tone {
@@ -517,6 +589,7 @@ foreach ($name in $Scenarios) {
         if (-not $installed -and $name -ne 'uninstall') { Fail 'skipped: the driver is not installed' }
         $detail = switch ($name) {
             'install' { Test-Install }
+            'power' { Test-Power }
             'tone' { Test-Tone }
             'latency' { Test-Measure 'latency' }
             'load' { Test-Measure 'load' }

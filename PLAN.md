@@ -818,7 +818,28 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   earlier run tested instead of the package's) and no cleanup when a run throws: a test now
   passes only when every test ran and passed (or was skipped) and TE.exe exited with 0, the
   script checks that WDTF finds each device first, and a `finally` removes the driver, the test
-  filter with it, whatever happened.- **M7, signing:** submit to an open-source signing programme, then install on a real machine
+  filter with it, whatever happened.
+  *Power (2026-11-10):* the INF turns PortCls's inactivity timer on (`PowerSettings`: 5 s on
+  battery and on AC power, `IdlePowerState` 3). hostmic has no hardware to save power on, and
+  the release package that M7 signs keeps the 5 s on purpose: every stream start after an idle
+  period goes through D3 and D0, the path a real machine takes, instead of a path tried once
+  in a while. No driver code: PortCls handles the adapter's power requests without
+  `IAdapterPowerManagement` (not needed, as the design expected), no miniport code runs on a
+  power change, and a running stream stays in D0 because the audio engine sends a request every
+  period. The campaign's `power` scenario reads the adapter's `DEVPKEY_Device_PowerData`: D3
+  without a host; with a host attached, the audio service's requests wake the adapter (it must
+  be seen out of D3) and it idles again; D0 throughout a 15 s `capture-check` (1000.00 Hz, 0
+  glitch); D3 again after it, the host still attached. In the VM under Driver Verifier
+  (`standard`), the campaign passes 11 of 11 on the debug and the release packages, and on the
+  debug package again after the review's fixes. The independent review found one check that
+  could pass without its behaviour (the adapter idling again after the attach, without having
+  been seen woken) and slow sampling (each read enumerated every device); both fixed. Left for
+  the security review (PnP and teardown): the host interface's PDO completes `IRP_MN_SET_POWER`
+  without `PoSetPowerState`, and, as its power policy owner, requests no device power IRP on a
+  system power change; nothing reaches that path in the VM (the idle timer is the adapter's,
+  and a Hyper-V guest has no sleep state), but sleep and hibernation on a real machine (M7)
+  do. Hibernation in the VM (an undocumented Hyper-V setting) is left to M7's real machine.
+- **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
   - an OSI-approved license, all released code public;
