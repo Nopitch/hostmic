@@ -15,10 +15,10 @@ security reports. The list is kept up to date in this file whenever access chang
 
 ## Roles and responsibilities
 
-- **Maintainer.** Sets the direction (PLAN.md); reviews and merges pull requests; keeps CI,
-  dependencies and repository settings secure; handles vulnerability reports as described in
-  [SECURITY.md](SECURITY.md); prepares releases; tests the driver in the test VM before merging
-  driver changes.
+- **Maintainer.** Sets the direction (PLAN.md); reviews contributors' pull requests and decides
+  what is merged; keeps CI, dependencies and repository settings secure; handles vulnerability
+  reports as described in [SECURITY.md](SECURITY.md); prepares releases; tests the driver in the
+  test VM before merging driver changes.
 - **Contributors.** Anyone may open issues and pull requests, following
   [CONTRIBUTING.md](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
 - **Security reporters.** Report vulnerabilities privately, as described in SECURITY.md.
