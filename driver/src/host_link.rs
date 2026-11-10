@@ -737,7 +737,9 @@ impl HostLink {
     fn process_exited(&self, process: PEPROCESS) {
         // Every other process's exit returns here, without the lock: only a thread of the host's
         // process stores it (`attach` requires the requestor to be the current process), and
-        // when this runs, no other thread of `process` is left to store it.
+        // when this runs, no other thread of `process` is left to store it. A detach in progress
+        // elsewhere clears it only once the mapping is undone ([`HostLink::release_host`]), so
+        // finding it here means waiting for that detach to finish.
         if self.process.load(Ordering::Acquire) != process {
             return;
         }
@@ -767,7 +769,10 @@ impl HostLink {
             // SAFETY: the reference `attach` took ownership of; nobody uses the event any more.
             unsafe { ObfDereferenceObject(event.cast()) };
         }
-        let process = self.process.swap(ptr::null_mut(), Ordering::AcqRel);
+        // `process` stays published until the mapping is undone: `process_exited` takes the lock
+        // only when it finds its process here, so clearing it first would let the host's
+        // process end, and its address space go, while the mapping is undone in it.
+        let process = self.process.load(Ordering::Acquire);
         let mapping = self.mapping.swap(ptr::null_mut(), Ordering::AcqRel);
         // SAFETY: the mapping's reference, taken out of the link.
         let buffer =
@@ -776,10 +781,13 @@ impl HostLink {
             && !process.is_null()
         {
             // SAFETY: a mapping `attach` made in `process`, which is referenced and has not
-            // ended: its end runs `process_exited`, which needs the lock held here.
+            // ended: its end runs `process_exited`, which finds `process` still published
+            // above and waits for the lock held here.
             unsafe { unmap_in(process, buffer, mapping) };
         }
         drop(buffer);
+        // Only now may `process_exited` return without the lock: the mapping is gone.
+        self.process.store(ptr::null_mut(), Ordering::Release);
         if !process.is_null() {
             // SAFETY: the reference `attach` took.
             unsafe { ObfDereferenceObject(process.cast()) };
