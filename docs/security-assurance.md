@@ -205,6 +205,15 @@ of the build.
 - The host interface's system power path (M6): a restart of the VM under Driver Verifier,
   with the driver installed, completes without a bug check (a Hyper-V guest's only system
   power change).
+- A host that clones its own address space keeps no mapping of the buffer in the clone (M6,
+  `handle-check --clone`, run by the campaign's `handles` scenario). The driver undoes the
+  mapping in the host's process only, so a clone that kept it would read the next host's
+  audio, and freed pages after the adapter's removal. The check makes a VA-clone process
+  snapshot and a suspended fork (`RtlCloneUserProcess`); both carry a private page and a
+  section's view written before cloning, while the buffer's address is free in both with the
+  host attached, after `DETACH` and with the next host attached, and none of their readable
+  memory holds the patterns written into the buffer after cloning (Windows 11 26H2, build
+  26300, under Driver Verifier).
 
 ### 2.6 Assumptions and accepted risks
 
@@ -263,15 +272,10 @@ the M6 security review (PLAN.md, M6):
 - Static analysis of the kernel code is shallow: CodeQL's Rust queries have no driver rules,
   and Static Driver Verifier does not take Rust. Clippy's lints, the independent reviews,
   fuzzing and Driver Verifier carry the kernel code's evidence, not CodeQL.
-- **Not checked yet, and important: a host that clones itself.** A host, which any
-  medium-integrity interactive process can become, could clone its own address space after
-  attaching (`RtlCloneUserProcess`, `NtCreateProcessEx` with itself as parent,
-  `PssCaptureSnapshot` with `PSS_CAPTURE_VA_CLONE`). The driver undoes the mapping in the
-  host's process only. Whether Windows copies a locked-pages mapping into the clone is not
-  known here; if it does, the clone would keep reading the shared buffer after the host
-  detaches (the next host's audio), and after the adapter's removal frees the pages, it would
-  map freed physical memory, which breaks section 1's first two promises. To be tested in the
-  VM, and fixed if so.
+- A clone of the host's address space made by another process from a handle to the host
+  (`PssCaptureSnapshot` on that handle, `NtCreateProcessEx` with the host as parent): not
+  tested. The clones the host can make of itself are (section 2.5), and go through the same
+  kernel path.
 - Not checked: if an `IRP_MN_QUERY_ID` reply cannot be allocated, whether the PnP manager
   drops the host interface's devnode without removing it. The PDO would then never be
   deleted (the adapter's removal deletes only a child that was removed or never reported): it

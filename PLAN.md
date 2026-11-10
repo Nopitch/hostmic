@@ -1053,6 +1053,21 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   clone, which the driver undoes only in the host's process: if so, the clone would read the
   next host's audio, and freed pages after the adapter's removal; to be tested in the VM next.
   And a failed `IRP_MN_QUERY_ID` reply might leave the PDO never deleted.
+  *A host that clones itself (2026-11-10):* the first of those questions is answered, and needs
+  no driver change. `handle-check --clone` attaches, then makes a VA-clone process snapshot
+  (`PssCaptureSnapshot`, `PSS_CAPTURE_VA_CLONE`) and a suspended fork (`RtlCloneUserProcess`)
+  of itself, and reads their memory (`ReadProcessMemory`, `VirtualQueryEx`). Both clones carry
+  a private page and a section's view written before cloning, so they are readable and copy
+  this process's memory; the buffer's address, committed in the host (192512 bytes, private,
+  read-write), is free in both with the host attached, after it writes again, after `DETACH`
+  and with the next host attached; and none of their readable memory holds the patterns
+  written into the buffer after cloning, which only pages shared with it could show (Windows
+  11 26H2, build 26300, under Driver Verifier). The campaign's `handles` scenario runs it. The
+  independent review found the first version's verdict too weak (it failed only on the next
+  host's pattern at the buffer's address, with no check that both clones were made, and an
+  image-data control): it now fails on any of these. Not covered: a clone made by another
+  process from a handle to the host (the same kernel path, expected the same), and a fork that
+  inherits the host's handle (the duplicate and holder checks cover that handle).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
