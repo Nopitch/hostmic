@@ -31,8 +31,12 @@ host application ──writes into the shared ring buffer──▶ [hostmic micr
 audio engine; the host sets the pace (milestone M4). The host library, the `hostmic` crate,
 finds the microphone, runs a real-time loop that feeds it, and lets it go when Windows removes
 the driver (milestone M5). Measured in a test VM: 10.1 ms median from the host's write to an
-application's read, and no crackle with 16 threads saturating the CPU. Hardening is the next
-milestone. See [PLAN.md](PLAN.md) for the roadmap. There is no release. Until the driver is signed through Microsoft attestation, it can
+application's read, and no crackle with 16 threads saturating the CPU. The driver has then
+been hardened (milestone M6): a test campaign, Driver Verifier, Microsoft's Device
+Fundamentals tests, 4 hours of load without a crackle, and a security review of every trust
+boundary, each finding fixed or recorded in
+[docs/security-assurance.md](docs/security-assurance.md). See [PLAN.md](PLAN.md) for the
+roadmap. There is no release. Until the driver is signed through Microsoft attestation, it can
 only be loaded with test signing enabled, which requires Secure Boot to be disabled: use a
 virtual machine, never your everyday machine ([docs/test-vm.md](docs/test-vm.md)).
 
