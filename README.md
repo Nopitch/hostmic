@@ -43,11 +43,13 @@ decisions (recorded in [PLAN.md](PLAN.md)), tests the driver and decides what is
 the code and documentation is written with Claude, Anthropic's AI assistant, and every such
 commit says so (`Co-Authored-By`). Nothing reaches `main` without:
 
-- the maintainer's review of the pull request;
+- an independent review of every kernel and host-crate change by a second AI agent, whose
+  findings are fixed and reviewed again;
 - the required checks: formatting, clippy with strict lints, unit tests, the driver build,
   CodeQL, secret scanning, dependency review, workflow audit and a signed-off commit (DCO);
-- for driver changes, a test in a virtual machine with measured results
-  ([docs/test-vm.md](docs/test-vm.md)).
+- for driver changes, the maintainer's test in a virtual machine, with measured results
+  ([docs/test-vm.md](docs/test-vm.md));
+- the maintainer's decision to merge it.
 
 Why the design can be trusted, and where it cannot yet, is argued in
 [docs/security-assurance.md](docs/security-assurance.md).
