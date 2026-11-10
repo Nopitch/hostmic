@@ -447,7 +447,14 @@ function Test-Handles {
     $watched = Wait-Tool $last 30
     $after = Find-Line $watched.Text '^mapping'
     Check ($watched.Code -eq 0 -and $after -match ': unmapped$') "the mapping outlived the last handle: $after (log $(Split-Path $watched.Log -Leaf))"
-    'a closed handle detaches; a child cannot detach the host; a dead host is detached despite a holder; the last handle unmaps'
+
+    # A host exits while its child closes the last handle: the detach in the child undoes the
+    # mapping in the host's process while it ends, and the host's exit waits for it.
+    $race = Invoke-Tool 'handle-check' @('--exit-race', '200') 120
+    $raced = Find-Line $race.Text '^exit-race  200 rounds:'
+    Check ($race.Code -eq 0) "--exit-race: $(Find-Line $race.Text '^(error|exit-race)') (log $(Split-Path $race.Log -Leaf))"
+    $overlapped = if ($raced -match 'ending in (\d+)') { $Matches[1] } else { '?' }
+    "a closed handle detaches; a child cannot detach the host; a dead host is detached despite a holder; the last handle unmaps; 200 exits raced with the last close ($overlapped overlapped)"
 }
 
 # The host interface fuzzed from user mode (tools/ioctl-fuzz); its seed is in the log.
