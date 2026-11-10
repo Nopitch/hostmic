@@ -57,8 +57,9 @@ use wdk_sys::{
     ntddk::{
         ExAllocatePool2, ExFreePool, IoDeleteDevice, IoGetCurrentProcess, IoGetRequestorProcess,
         IoIs32bitProcess, IoRegisterDeviceInterface, IoSetDeviceInterfaceState, IofCompleteRequest,
-        KeInitializeGuardedMutex, ObReferenceObjectByHandle, ObfReferenceObject, PoRequestPowerIrp,
-        PoSetPowerState, PsGetCurrentProcessId, RtlFreeUnicodeString, SeQueryInformationToken,
+        KeInitializeGuardedMutex, ObReferenceObjectByHandle, ObfDereferenceObject,
+        ObfReferenceObject, PoRequestPowerIrp, PoSetPowerState, PsGetCurrentProcessId,
+        RtlFreeUnicodeString, SeQueryInformationToken,
     },
 };
 
@@ -294,8 +295,10 @@ unsafe fn link(this: &HostDevice) -> &mut UNICODE_STRING {
 ///
 /// # Errors
 ///
-/// `STATUS_INSUFFICIENT_RESOURCES`, leaving the request unchanged: the child is just not
-/// reported this time.
+/// `STATUS_INSUFFICIENT_RESOURCES`, with the request failed: its status set to that, and the
+/// relations an upper driver put there released (their references and the structure), as a
+/// failed request carries none. Leaving the request unchanged would report the relations
+/// without the child, which the PnP manager would take for the child's departure and remove it.
 ///
 /// # Safety
 ///
@@ -333,6 +336,17 @@ pub unsafe fn report(irp: *mut IRP, child: NonNull<DEVICE_OBJECT>) -> Result<(),
     let new = unsafe { ExAllocatePool2(POOL_FLAG_PAGED, bytes as u64, POOL_TAG) }
         .cast::<DEVICE_RELATIONS>();
     if new.is_null() {
+        for &object in old_objects {
+            // SAFETY: each reported object carries a reference for the PnP manager, which a
+            // failed request does not hand over.
+            unsafe { ObfDereferenceObject(object.cast()) };
+        }
+        if !old.is_null() {
+            // SAFETY: the old relations came from the pool; `old_objects` is not used after.
+            unsafe { ExFreePool(old.cast()) };
+        }
+        irp.IoStatus.Information = 0;
+        irp.IoStatus.__bindgen_anon_1.Status = STATUS_INSUFFICIENT_RESOURCES;
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     // SAFETY: a fresh, zeroed allocation with room for a count and `count` object pointers.

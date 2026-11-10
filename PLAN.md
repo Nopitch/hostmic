@@ -999,6 +999,19 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   restart of the VM (S5), the only system power change a Hyper-V guest has: a restart under
   Driver Verifier with the driver installed completes without a bug check. Sleep and
   hibernation wait for M7's real machine.
+  *The adapter without its host interface (2026-11-10):* the adapter created the host
+  interface's PDO after its filters, and started anyway when that failed: a microphone present
+  and silent, with no host able to feed it, and nothing in Device Manager to say why (only a
+  `DbgPrint`). The start now creates the PDO first and fails with its status (code 10 in
+  Device Manager); a PDO created by a start that fails later was never reported, and the
+  adapter's removal deletes it, as before. And when the bus relations reply could not be
+  allocated, the query went down unchanged, without the child: the PnP manager would have
+  taken that for the child's departure and removed the host interface, a host attached or
+  not. `report` now fails the query (`STATUS_INSUFFICIENT_RESOURCES`, as the IRP's page lists
+  for a failure), releasing the relations an upper driver put there, and it still goes down
+  (a bus driver does not complete it); that a failed query leaves the known children in place
+  is the PnP manager's behaviour, not stated on that page. Neither failure is provoked in the
+  VM (an allocation of a few bytes, a device object); the campaign checks the normal paths.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

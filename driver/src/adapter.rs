@@ -123,8 +123,14 @@ pub unsafe extern "C" fn add_device(
     status
 }
 
-/// `StartDevice`, called by PortCls on `IRP_MN_START_DEVICE`: creates and registers the
-/// filters.
+/// `StartDevice`, called by PortCls on `IRP_MN_START_DEVICE`: creates the host interface's PDO
+/// (on the first start), then creates and registers the filters.
+///
+/// The host interface comes first, and the start fails with its status when it cannot be
+/// created: without it no host can feed the microphone, which would otherwise be present, and
+/// silent, with nothing to say why. A failed start shows in Device Manager (code 10) instead.
+/// A PDO created by a start that fails later was never reported: the adapter's removal deletes
+/// it ([`host_device::detach`]).
 unsafe extern "C" fn start_device(
     device: PDEVICE_OBJECT,
     irp: PIRP,
@@ -136,26 +142,31 @@ unsafe extern "C" fn start_device(
         println!("hostmic: StartDevice returned {status:#010x}: no shared buffer");
         return status;
     }
+    // SAFETY: `device` is the adapter's FDO, in a PnP request.
+    let adapter = unsafe { adapter(device) };
+    let created = adapter.host.is_none();
+    if created {
+        // SAFETY: `device` is the adapter's FDO, at PASSIVE_LEVEL.
+        match unsafe { host_device::create(device, link) } {
+            Ok(host) => adapter.host = Some(host),
+            Err(status) => {
+                println!(
+                    "hostmic: StartDevice returned {status:#010x}: host interface not created"
+                );
+                return status;
+            }
+        }
+    }
     // SAFETY: `device`, `irp` and `resources` come from PortCls for this start request.
     let status = match unsafe { install_filters(device, irp, resources, link) } {
         Ok((topology_port, wave_port)) => {
-            // SAFETY: `device` is the adapter's FDO, in a PnP request.
-            let adapter = unsafe { adapter(device) };
             adapter.topology_port = Some(topology_port);
             adapter.wave_port = Some(wave_port);
-            if adapter.host.is_none() {
+            if created {
+                // Once started: the PnP manager queries the bus relations, which report the
+                // new child.
                 // SAFETY: `device` is the adapter's FDO, at PASSIVE_LEVEL.
-                match unsafe { host_device::create(device, link) } {
-                    Ok(host) => {
-                        adapter.host = Some(host);
-                        // SAFETY: as above.
-                        unsafe { enumerate_children(device) };
-                    }
-                    // The microphone works without its host interface; say why it is missing.
-                    Err(status) => {
-                        println!("hostmic: host interface not created: {status:#010x}");
-                    }
-                }
+                unsafe { enumerate_children(device) };
             }
             STATUS_SUCCESS
         }
@@ -363,7 +374,8 @@ pub unsafe fn dispatch_pnp(device: *mut DEVICE_OBJECT, irp: *mut IRP) -> NTSTATU
             {
                 // SAFETY: the adapter's bus relations query, with its live child.
                 if let Err(status) = unsafe { host_device::report(irp, host) } {
-                    // The request goes down unchanged: the child is missing this time only.
+                    // `report` failed the request, which still goes down (a bus driver does
+                    // not complete it): the PnP manager keeps the relations it knows.
                     println!("hostmic: host interface not reported: {status:#010x}");
                 }
             }
