@@ -2,8 +2,8 @@
 
 hostmic is a Windows kernel-mode driver. This document states what users can and cannot expect
 from it in terms of security (its security requirements), then argues why the design and the
-development process meet them (an assurance case). It covers the state after milestone M5 and
-says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
+development process meet them (an assurance case). It covers the state during milestone M6
+(hardening) and says what later milestones change; [PLAN.md](../PLAN.md) has the roadmap,
 [SECURITY.md](../SECURITY.md) the vulnerability process and the security rules.
 
 ## 1. What you can and cannot expect
@@ -106,7 +106,8 @@ of the build.
 - **Least privilege**: the host interface open to administrators and the interactive user only;
   the buffer mapped into the attached host only; CI tokens read-only by default with no secrets.
 - **Economy of mechanism**: one format, one host, one stream; no lock in the real-time path,
-  a single writer (the stream's timer) and atomics; small, static descriptor tables.
+  a single writer of the position (the attached host's `ADVANCE`, one compare-and-exchange)
+  and atomics; small, static descriptor tables.
 - **Fail-safe defaults**: unknown formats, pins and requests are rejected; without a host, the
   microphone reports unplugged instead of streaming silence.
 - **Complete mediation**: every request is checked when it arrives, nothing is cached from an
@@ -126,8 +127,8 @@ of the build.
 | Improper input validation (CWE-20) | Allowlist checks of formats and sizes in pure, unit-tested Rust (`format::is_supported`); IOCTL validation the same way; both fuzzed |
 | Out-of-bounds read or write (CWE-125, CWE-787) | Size checks before every access to a caller's buffer; ring writes through bounded slices; unaligned-safe reads and writes |
 | Integer overflow (CWE-190) | 128-bit intermediates for clock arithmetic, saturating and checked operations; overflow checks in every build, release included (an overflow stops the system with a bug check naming its place instead of wrapping) |
-| Use after free (CWE-416) | Atomic reference counting with `Arc`-like orderings, including the shared buffer's pages (the adapter, each stream buffer and the host's mapping hold one); timers deleted and DPCs flushed before a stream is freed; the notification event dropped and callbacks flushed before unregistration returns |
-| Race conditions (CWE-362) | One writer per stream (its timer), positions published with release/acquire atomics, state changes serialized by PortCls |
+| Use after free (CWE-416) | Atomic reference counting with `Arc`-like orderings, including the shared buffer's pages (the adapter, each stream buffer and the host's mapping hold one); rundown protection (`EX_RUNDOWN_REF`) on the objects a request may use while another thread lets them go (the host's event, the audio engine's notification event, the topology port's jack events): letting one go waits until no request holds it |
+| Race conditions (CWE-362) | One writer of each stream's position (the attached host's `ADVANCE`, committed with one compare-and-exchange on the packed generation and position, so a request computed for an earlier state is refused), positions published with release/acquire atomics, attaching and detaching serialized by a lock, state changes serialized by PortCls |
 | Double fetch, TOCTOU on user memory (CWE-367) | User input copied once, then validated (M4) |
 | Kernel memory disclosure (CWE-200) | Buffers zeroed when allocated; the shared buffer made of whole zeroed pages, zeroed again for each host; no uninitialized structure returned |
 | Denial of service by a crash (CWE-248, CWE-400) | No panic on any input in the core logic; allocation only when a stream is created, never per period |
@@ -181,5 +182,8 @@ of the build.
   Microsoft's fuzzers leave that raw device out, and a fuzzer of our own is planned with the
   security review (M6).
 
+- Static analysis of the kernel code is shallow: CodeQL's Rust queries have no driver rules,
+  and Static Driver Verifier does not take Rust. Clippy's lints, the independent reviews,
+  fuzzing and Driver Verifier carry the kernel code's evidence, not CodeQL.
 - A single maintainer: no second human reviewer yet (GOVERNANCE.md).
 - Release signing and provenance attestations (M7).
