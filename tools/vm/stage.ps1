@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    Copies a driver package, the release tools, devcon, campaign.ps1, verifier.ps1 and
-    devfund.ps1 into the test VM, in a folder of their own, and prints the command that runs the
-    campaign there.
+    Copies a driver package, the release tools, devcon, campaign.ps1, verifier.ps1,
+    memory-integrity.ps1 and devfund.ps1 into the test VM, in a folder of their own, and prints
+    the command that runs the campaign there.
 
 .DESCRIPTION
     Runs on the host, as a member of Hyper-V Administrators (Copy-VMFile needs the VM's Guest
@@ -79,7 +79,7 @@ foreach ($tool in 'test-host', 'capture-check', 'measure', 'handle-check', 'host
     $files += Join-Path $Tools "$tool.exe"
 }
 $files += $Devcon, (Join-Path $PSScriptRoot 'campaign.ps1'), (Join-Path $PSScriptRoot 'verifier.ps1'),
-(Join-Path $PSScriptRoot 'devfund.ps1')
+(Join-Path $PSScriptRoot 'memory-integrity.ps1'), (Join-Path $PSScriptRoot 'devfund.ps1')
 foreach ($file in $files) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "missing $file" }
 }

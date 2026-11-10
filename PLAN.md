@@ -839,6 +839,25 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   system power change; nothing reaches that path in the VM (the idle timer is the adapter's,
   and a Hyper-V guest has no sleep state), but sleep and hibernation on a real machine (M7)
   do. Hibernation in the VM (an undocumented Hyper-V setting) is left to M7's real machine.
+  *HVCI (2026-11-10):* Memory Integrity does not run in the test VM.
+  `tools/vm/memory-integrity.ps1 on` sets Microsoft's registry keys (recommended settings,
+  without UEFI lock; the VM, a Hyper-V generation 2 guest, needs no nested virtualization for
+  it); after the restart, `Win32_DeviceGuard` reports VBS "enabled but not running": it requires
+  Secure Boot (required properties 1 and 2, available 1, 3, 5 and 7), Microsoft documents no
+  setting without it (Secure Boot, or Secure Boot with DMA protection), and test signing needs
+  Secure Boot off. As the design foresaw, the run with Memory Integrity on moves to M7 (a signed
+  driver, Secure Boot on, on a real machine; a Hyper-V VM with Secure Boot on would do too).
+  Microsoft's "Driver compatibility with memory integrity and VBS" lists three checks: Driver
+  Verifier's code integrity checking, a run with Memory Integrity on, and HLK's readiness test
+  (not in M6). The first runs in the `standard` and `stack` profiles since #61 (it found the
+  host mapping without `MdlMappingNoExecute`). New, a check of the binaries in the `driver` CI
+  job (`.github/scripts/check-hvci.ps1`, reading the PE headers itself): no writable and
+  executable section, sections aligned on pages, NX compatible ("How to build compatible
+  drivers"); the debug and release drivers pass, as does Windows' `portcls.sys`, and a copy
+  with NX cleared and `.text` made writable fails. `hvciscan` (a separate download) is left
+  out: Microsoft's page does not list it, and the CI check reads those properties from the file.
+  The independent review's other findings were fixed (an optional header too short to read, a
+  test-signing check that depended on the display language).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

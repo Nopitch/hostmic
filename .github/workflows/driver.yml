@@ -231,6 +231,15 @@ jobs:
             }
           }
 
+      # Memory Integrity (HVCI) refuses a driver with a writable and executable section; its
+      # other header requirements are page-aligned sections and NX compatibility. Memory
+      # Integrity itself runs in M7 (it needs Secure Boot, which test signing turns off); until
+      # then Driver Verifier's code integrity checks and this check stand in (docs/test-vm.md).
+      - name: Check the driver binaries for Memory Integrity
+        if: steps.scope.outputs.code == 'true'
+        shell: pwsh
+        run: ./.github/scripts/check-hvci.ps1 target/debug/hostmic_driver_package/hostmic_driver.sys target/release/hostmic_driver_package/hostmic_driver.sys
+
       # The test-signed packages, for the VM tests (docs/test-vm.md) without a local build. A
       # pull request's artifact is for looking at only: nothing privileged ever consumes it.
       - name: Upload the driver packages
