@@ -1024,8 +1024,8 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   devices, present or not, in the test VM). A driver update restarts the stack without
   replacing the devnode, so it does not (expected, not measured). The PDO now reports
   `UniqueID` 1 and the index of its slot in `DEVICES` as instance ID (`HOSTMIC\HOST\0` for the
-  first adapter): unique among the host interfaces present at once, which hold distinct slots, and stable across reinstalls, so the device
-  keeps its devnode, and with it its disabled flag and registry settings (the campaign's
+  first adapter): unique among the host interfaces present at once, which hold distinct
+  slots, and stable across reinstalls, so the device keeps its devnode, and with it its disabled flag and registry settings (the campaign's
   install now waits for the device to be present before enabling it again). With several
   adapters the name follows the order they start in, not the adapter: the host interfaces are
   interchangeable. Never a constant: two adapters' host interfaces would then be a duplicate
