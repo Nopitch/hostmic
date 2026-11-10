@@ -370,3 +370,45 @@ passes; under `low-resources` some may fail, but the system must stay up. A bug 
 the VM with Driver Verifier off and leaves `C:\Windows\MEMORY.DMP`: copy the WDK's
 `Debuggers\x64` folder into the VM and run `kd -z C:\Windows\MEMORY.DMP`, then `!analyze -v`
 and `!verifier`.
+
+## 10. Run the Device Fundamentals tests
+
+`tools/vm/devfund.ps1` runs Microsoft's Device Fundamentals tests from the WDK
+(`Testing\Tests\Additional Tests\x64\DevFund`) with TAEF, without an HLK controller ("Run
+DevFund tests via the command line" on Microsoft Learn), on the adapter (`ROOT\MEDIA\0000`, the
+Kernel Streaming filters) and on the host interface (`HOSTMIC\…`). Stage the package with the
+test kit once (host):
+
+```powershell
+.\tools\vm\stage.ps1 -Package target\debug\hostmic_driver_package -Name df -DevFund
+```
+
+`-DevFund` copies TAEF, the WDTF installers and their cabinets, and the tests into
+`C:\hostmic\devfund`. In the VM, elevated, preferably under Driver Verifier (section 9):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\hostmic\df\devfund.ps1
+```
+
+The first run installs WDTF (the content installers before the product's, whose custom actions
+install the PnP tests' filter driver from the content's files; the other order fails with
+msiexec 1603, "Failed to install IOSPY filter driver") and TAEF's service (TAEF blocks a test
+that may restart the machine unless its service can resume it). Then:
+
+| Group | Tests | Device |
+|---|---|---|
+| `pnp` | PNPDTest: disable and enable, remove and restart, cancelled remove, cancelled stop, stop and restart, failed restart, surprise removal; then the test filter removed (`DisableEnhancedDeviceTestingSupport`) | both (the host interface: `SKIP`, see below) |
+| `fuzz` | the IOCTL fuzzer (function codes 0 to 15 on the adapter, Kernel Streaming's; 0x8F0 to 0x91F on the host interface, around hostmic's 0x900 to 0x905) and the API fuzzer (open, close, sub-opens, miscellaneous calls) | both (the host interface: `SKIP`) |
+| `reinstall` | the driver reinstalled with I/O before and after | the adapter |
+
+One line per test, from TAEF's own count and exit code: `PASS` when every test ran and passed
+(or was skipped) and TE.exe exited with 0; `FAIL` on a failed, blocked or unrun test, no test
+at all, a timeout, or no device found; `SKIP` when everything was skipped. The tests leave the
+host interface out (WDTF's query finds it, which the script checks first, but the tests' own
+selection does not take it, presumably as a raw device without a function driver) while
+counting that as a pass: there, "no device found for testing" is a `SKIP`. The
+script installs this package's driver first (removing one left installed), and removes it at
+the end whatever happened, with any test process left and the test filter. The whole run
+takes about an hour (two minutes per PnP test on the adapter). `-Only`
+with several groups needs PowerShell rather than `-File`: `Set-ExecutionPolicy -Scope Process
+Bypass`, then `& C:\hostmic\df\devfund.ps1 -Only fuzz,reinstall`.

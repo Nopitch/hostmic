@@ -789,7 +789,36 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   next restart. The independent review found that a first version, which
   retried after attaching, made the jack flap every second under lasting pressure and
   swallowed every registration error.
-- **M7, signing:** submit to an open-source signing programme, then install on a real machine
+  *Device Fundamentals tests (2026-11-10):* `tools/vm/devfund.ps1` runs the WDK's DevFund tests
+  with TAEF in the VM (`stage.ps1 -DevFund` copies the kit; docs/test-vm.md, section 10). Under
+  Driver Verifier (`standard`), on the adapter: the 8 PnP tests pass (disable and enable, remove
+  and restart, cancelled remove and stop, stop and restart, failed restart, surprise removal,
+  each with Microsoft's test filter on the device, then the filter removed); the IOCTL fuzzer
+  (6 tests, function codes 0 to 15, Kernel Streaming's, about 6 minutes) and the API fuzzer
+  (5 tests) pass on its Kernel Streaming filters; the reinstall with I/O passes; no bug check.
+  The host interface is tested by none of them: WDTF's query finds it (`DeviceID='…'`, one
+  device), but each test's own selection leaves it out, presumably as a raw device without a
+  function driver, and passes all the same ("No devices were found for testing"): the script
+  calls that SKIP. A first run read those passes as 16 PnP passes on both devices; the
+  stricter verdict below exposed them. So the host interface's PnP paths are tested only by the
+  campaign (removal, disable and enable, killed hosts), and its IOCTLs are not fuzzed in the
+  kernel: the security review is to cover them, with a fuzzer of our own sending random
+  requests to the interface (the validation itself stays fuzzed by `cargo-fuzz`). Also found:
+  the host interface reports instance ID "0" without `UniqueID`, so its devices are named
+  after the adapter's devnode, which every `devcon remove` and reinstall replaces; 53 phantom
+  host interface devices had piled up in the VM. Harmless, but a stable unique ID would avoid
+  it: for the security review too. Lessons, on the way to a working run: WDTF's content
+  installers must come before its product's, whose custom actions install the filter drivers
+  from the content's files (the other order fails with "Failed to install IOSPY filter
+  driver"); TAEF blocks a test that may restart the machine unless its service can resume it
+  (`/RebootStateFile`); the IOCTL fuzzer tries all 4096 function codes by default (hours), and
+  a timed-out `TE.exe` leaves its test host fuzzing alone. The independent review found false
+  passes in the first version of the verdict (a class with one test blocked and the others
+  passed, a timed-out run, a device query matching nothing, a driver left installed by an
+  earlier run tested instead of the package's) and no cleanup when a run throws: a test now
+  passes only when every test ran and passed (or was skipped) and TE.exe exited with 0, the
+  script checks that WDTF finds each device first, and a `finally` removes the driver, the test
+  filter with it, whatever happened.- **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
   - an OSI-approved license, all released code public;
