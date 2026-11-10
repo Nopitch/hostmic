@@ -858,6 +858,20 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   out: Microsoft's page does not list it, and the CI check reads those properties from the file.
   The independent review's other findings were fixed (an optional header too short to read, a
   test-signing check that depended on the display language).
+  *Endurance (2026-11-10):* 4 hours of `measure load` (16 spinning threads) on the debug
+  package under Driver Verifier (`standard`, flags 0x021b093b), in the VM: `campaign.ps1 -Only
+  install,load,uninstall -Seconds 14400` (docs/test-vm.md, section 8) passes. **0 crackle**,
+  0 silence, 98.8 % audible after the warm-up (as in the 30 s runs); the engine read 1439989
+  packets with 0 discontinuity, 0 silent and 0 timeout, 100.0 % of the frames due; the player
+  made 9942076 advances, 0 late, 0 stale, one attachment; the driver advanced the same
+  691205689 frames, skipped 0 packet and refused 0 request. The gaps' tail the reference loop's
+  note asked for: 1415749 below 1.5 ms, 8526214 in 1.5-2 ms, then 37 in 2-3 ms, 6 in 3-4 ms,
+  2 in 4-5 ms, 2 in 5-7 ms and none above, the longest 5.9 ms (the 10 minutes of M5: 14 above
+  2 ms, the longest 4.5 ms): 47 gaps above 2 ms in 4 hours, all far below the engine's 10 ms
+  period, none heard. Driver Verifier counted 16 pool allocations in 4 hours, all from the
+  special pool, none failed: nothing allocates per period. No bug check (the VM's uptime ran
+  through), and `uninstall` unloaded the driver. The release package was not run for 4 hours:
+  it differs by its optimisations and passes the 30 s `load` under Driver Verifier (#60, #61).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
