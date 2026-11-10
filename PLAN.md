@@ -900,6 +900,23 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   could attach as the host. The device object has no integrity label (`IoCreateDeviceSecure`
   takes a DACL only), and despite Microsoft's "objects that lack an integrity label are treated
   as medium", the open succeeds; the fix is #83.
+  *Low integrity (2026-11-10):* the security review's fuzzer found that a process at low
+  integrity (its token checked at level 0x1000) could open the host interface for writing, and
+  so attach as the host and feed the microphone. The device object has no integrity label
+  (`IoCreateDeviceSecure` takes a DACL only), and despite Microsoft's "objects that lack an
+  integrity label are treated as medium", the I/O manager let the open through. The host
+  interface's `IRP_MJ_CREATE` now refuses (`STATUS_ACCESS_DENIED`) an open asking for any write
+  right (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_EA`, `FILE_WRITE_ATTRIBUTES`,
+  `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, and the generic rights that include writing) unless the
+  process token, and the impersonation token if there is one, are at least of medium integrity;
+  reading stays open to low integrity (`GET_INFO`, `GET_STREAM`, `GET_STATS`), as the security
+  descriptor allows. The rule is `hostmic_driver_core::host::open_allowed`, unit-tested. Its
+  first version read `SeQueryInformationToken(TokenIntegrityLevel)`'s result as a pointer to a
+  label, while the routine writes the level itself in place of the pointer ("a DWORD value
+  (not a pointer to it)"): the first open bug-checked the VM (0x3B, reading address 0x3000, the
+  terminal's high integrity level; read from the minidump with the WDK's `kd`). The independent
+  review found it; fixed, the campaign passes 12 of 12 under Driver Verifier (`standard`) with
+  `tools/ioctl-fuzz`'s `fuzz` scenario, whose low-integrity probe now reads but cannot write.
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

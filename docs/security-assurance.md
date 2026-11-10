@@ -19,7 +19,8 @@ development process meet them (an assurance case). It covers the state during mi
   whichever process holds it last, and when the host's process ends, even while another process
   holds a duplicate of its handle. Opening the host interface is restricted to the system,
   administrators and interactive users, enforced by the I/O manager on a device object of its
-  own.
+  own; opening it for writing, which attaching needs, to processes of at least medium integrity,
+  enforced by the driver.
 - **Malformed input is rejected, not trusted.** Unsupported formats, pins, property sizes and
   values are refused with an error status; the driver accepts one exactly specified format.
 - **A stable system.** The driver does no allocation, takes no lock and does no I/O in its
@@ -72,7 +73,10 @@ of the build.
    call, unit-tested on every truncation of a valid format.
 2. **User mode → kernel, through the host interface** (M4): a raw child device of the adapter
    with its own security descriptor (`IoCreateDeviceSecure`, `FILE_DEVICE_SECURE_OPEN`); opens
-   relative to another handle refused; its requests, IRPs and fast I/O alike, never reach
+   relative to another handle refused; opens asking for any write right refused unless the
+   caller's process token, and its impersonation token if any, are at least of medium integrity
+   (the descriptor can carry no integrity label, and a low-integrity process could open it for
+   writing: M6); its requests, IRPs and fast I/O alike, never reach
    PortCls. IOCTL input validation in pure Rust, unit-tested and fuzzed (PLAN.md, M4); user
    buffers copied once (`METHOD_BUFFERED`), then validated. `ATTACH` references the host's
    event only for a user-mode request in the requesting process, with `EVENT_MODIFY_STATE`;
@@ -167,7 +171,8 @@ of the build.
   section 6, and the campaign's `fuzz` scenario): every control code, method and access, sizes
   and invalid buffer addresses, bad event handles, other requests, opens by kind and
   integrity level, and threads and processes that attach, advance and die while others are
-  killed.
+  killed. It found that a process at low integrity could open the host interface for
+  writing, now refused (section 2.2, PLAN.md, M6).
 - The host crate `hostmic` (M5) under the same `unsafe` lints; its writes into the shared
   buffer are volatile, never through a Rust reference, and its pure parts (the clock, the
   ring's wrap, sample conversion) are unit-tested in CI.
@@ -181,9 +186,6 @@ of the build.
   Driver Verifier's code integrity checks and the CI check of the binaries stand in for it,
   section 2.5). Sleep and hibernation on a real machine (M7: a Hyper-V guest has no sleep
   state; the device's own idle transitions to D3 and back are tested in the VM, section 2.5).
-  A process at low integrity can open the host interface for writing, and so attach as the
-  host: the device object has no integrity label, and `IoCreateDeviceSecure` takes a DACL only
-  (found by `tools/ioctl-fuzz`, M6; fixed by #83).
 
 - Static analysis of the kernel code is shallow: CodeQL's Rust queries have no driver rules,
   and Static Driver Verifier does not take Rust. Clippy's lints, the independent reviews,
