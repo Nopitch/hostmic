@@ -37,8 +37,9 @@ Fundamentals tests, 4 hours of load without a crackle, and a security review of 
 boundary, each finding fixed or recorded in
 [docs/security-assurance.md](docs/security-assurance.md). Next comes a first real host, then
 signing; see [PLAN.md](PLAN.md) for the roadmap. There is no release. Until the driver is
-signed through Microsoft attestation, it can only be loaded with test signing enabled, which requires Secure Boot to be disabled: use a
-virtual machine, never your everyday machine ([docs/test-vm.md](docs/test-vm.md)).
+signed through Microsoft attestation, it can only be loaded with test signing enabled, which
+requires Secure Boot to be disabled: use a virtual machine, never your everyday machine
+([docs/test-vm.md](docs/test-vm.md)).
 
 ## How hostmic is built
 
