@@ -154,6 +154,9 @@ of the build.
   failures without a bug check. Its first run found the host mapping requested without
   `MdlMappingNoExecute`, a code integrity violation that a too-broad exception handler had
   hidden (PLAN.md, M6).
+- A check of the debug and release drivers in the `driver` CI job against Memory Integrity's
+  header requirements (`.github/scripts/check-hvci.ps1`): no section both writable and
+  executable, 4 KiB section alignment, NX compatible.
 - Microsoft's Device Fundamentals tests under Driver Verifier (M6,
   [docs/test-vm.md](test-vm.md), section 10): on the adapter, PnP transitions with Microsoft's
   test filter (surprise removal among them), an IOCTL fuzzer on the Kernel Streaming filters in
@@ -167,9 +170,12 @@ of the build.
 
 ### 2.6 Known gaps and plans
 
-- An HVCI run in the test VM and endurance tests (M6); sleep and hibernation on a real machine
-  (M7: a Hyper-V guest has no sleep state; the device's own idle transitions to D3 and back
-  are tested in the VM, section 2.5). The host interface's
+- Endurance tests (M6). A run with Memory Integrity on (M7: virtualization-based security
+  requires Secure Boot, which test signing needs off, so it does not run in the test VM;
+  Driver Verifier's code integrity checks and the CI check of the binaries stand in for it,
+  section 2.5). Sleep and hibernation on a real machine (M7: a Hyper-V guest has no sleep
+  state; the device's own idle transitions to D3 and back are tested in the VM, section 2.5).
+  The host interface's
   IOCTLs are fuzzed only in their pure validation code, not in the kernel code that calls it:
   Microsoft's fuzzers leave that raw device out, and a fuzzer of our own is planned with the
   security review (M6).

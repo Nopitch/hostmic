@@ -413,3 +413,24 @@ the end whatever happened, with any test process left and the test filter. The w
 takes about an hour (two minutes per PnP test on the adapter). `-Only`
 with several groups needs PowerShell rather than `-File`: `Set-ExecutionPolicy -Scope Process
 Bypass`, then `& C:\hostmic\df\devfund.ps1 -Only fuzz,reinstall`.
+
+## 11. Memory Integrity (HVCI)
+
+`tools/vm/memory-integrity.ps1` sets Memory Integrity with the registry keys of "Enable memory
+integrity" on Microsoft Learn (recommended settings, without UEFI lock) and reports what runs.
+In the VM, elevated:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\hostmic\debug\memory-integrity.ps1 on
+shutdown /r /t 0
+```
+
+then, after the restart, `memory-integrity.ps1 status`. Only `memory integrity RUNNING` (from
+`Win32_DeviceGuard`) means it runs; the campaign's header says the same. In this VM it does
+not: virtualization-based security requires Secure Boot (the only documented settings are
+Secure Boot, and Secure Boot with DMA protection), which test signing needs off, and `status`
+reports `missing: secure boot`. `memory-integrity.ps1 off` puts the settings back. The run
+with Memory Integrity on is M7's, with a signed driver and Secure Boot on; until then, Driver
+Verifier's code integrity checks (section 9) and the `driver` CI job's check of the binaries
+(`.github/scripts/check-hvci.ps1`: no writable and executable section, 4 KiB alignment, NX
+compatible) stand in for it.
