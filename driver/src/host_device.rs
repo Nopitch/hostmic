@@ -939,18 +939,42 @@ unsafe fn device_control(
 ) -> NTSTATUS {
     // SAFETY: the parameters of a device control request.
     let parameters = unsafe { stack.Parameters.DeviceIoControl };
-    let buffer = {
-        // SAFETY: the caller's contract.
-        let associated = unsafe { &(*irp).AssociatedIrp };
-        // SAFETY: METHOD_BUFFERED: `SystemBuffer` is the union's member, holding max(input,
-        // output) bytes, the input copied from the caller once by the I/O manager.
-        unsafe { associated.SystemBuffer }.cast::<u8>()
-    };
-    let output = parameters.OutputBufferLength as usize;
-    let file = stack.FileObject;
     // SAFETY: a live host interface device (the caller's contract).
     let state = unsafe { this(device) };
     let shared = state.shared.get();
+    // The six host interface codes are all METHOD_BUFFERED; for any other code (another
+    // method or access among them), `SystemBuffer` need not hold the request's buffers, so it
+    // is not read at all.
+    if !matches!(
+        parameters.IoControlCode,
+        IOCTL_GET_INFO
+            | IOCTL_ATTACH
+            | IOCTL_GET_STREAM
+            | IOCTL_ADVANCE
+            | IOCTL_DETACH
+            | IOCTL_GET_STATS
+    ) {
+        // SAFETY: the caller's contract.
+        return unsafe { unknown_code(irp, parameters.IoControlCode, shared) };
+    }
+    let buffer = {
+        // SAFETY: the caller's contract.
+        let associated = unsafe { &(*irp).AssociatedIrp };
+        // SAFETY: one of the six METHOD_BUFFERED codes: `SystemBuffer` is the union's member,
+        // holding max(input, output) bytes, the input copied from the caller once by the I/O
+        // manager.
+        unsafe { associated.SystemBuffer }.cast::<u8>()
+    };
+    // No system buffer, no room for a reply: the output-size checks then refuse a request
+    // before it changes anything (an ATTACH would otherwise map the buffer, then fail to say
+    // where). The I/O manager always allocates one when a length is not 0; an IRP built by
+    // other kernel code might not.
+    let output = if buffer.is_null() {
+        0
+    } else {
+        parameters.OutputBufferLength as usize
+    };
+    let file = stack.FileObject;
     // Gone: surprise-removed (or removed), with this handle still open.
     let gone =
         state.surprise_removed.load(Ordering::Acquire) || state.removed.load(Ordering::Acquire);
@@ -1025,15 +1049,45 @@ unsafe fn device_control(
                     .map(|()| Reply::of(shared.stats().to_bytes()))
                     .map_err(Refusal::Rejected),
             ),
+            // Not reached: the code was checked above.
             // SAFETY: the caller's contract.
             code => return unsafe { unknown_code(irp, code, shared) },
         }
     };
+    // SAFETY: the caller's contract; `buffer` is the request's system buffer, of at least
+    // `output` bytes when not null.
+    unsafe { finish(irp, buffer, shared, parameters.IoControlCode, name, result) }
+}
+
+/// Completes a host interface request with its reply, copied into the system buffer, or its
+/// refusal, counted and logged.
+///
+/// # Safety
+///
+/// `irp` is a device control request owned by this driver, not yet completed, with one of the
+/// six `METHOD_BUFFERED` codes; `buffer` is its `SystemBuffer`, of at least the reply's size when
+/// not null (the reply is only built once the output length was checked).
+unsafe fn finish(
+    irp: *mut IRP,
+    buffer: *mut u8,
+    shared: &HostLink,
+    code: u32,
+    name: &str,
+    result: Result<Reply, Refusal>,
+) -> NTSTATUS {
     match result {
+        Ok(reply) if reply.len != 0 && buffer.is_null() => {
+            // Not from the I/O manager, which allocates the system buffer whenever the output
+            // length is not 0: an IRP built by other kernel code.
+            let refusal = Refusal::Status(STATUS_INVALID_PARAMETER, "no system buffer");
+            let status = count_refusal(shared, code, name, &refusal);
+            // SAFETY: the caller's contract.
+            unsafe { complete(irp, status, 0) }
+        }
         Ok(reply) => {
             if reply.len != 0 {
-                // SAFETY: `output` >= the reply's size was checked, so the system buffer
-                // exists and holds it; the slice ends before the request completes.
+                // SAFETY: not null, and at least the reply's size (the caller's contract); the
+                // slice ends before the request completes.
                 let out = unsafe { slice::from_raw_parts_mut(buffer, reply.len) };
                 out.copy_from_slice(&reply.bytes[..reply.len]);
             }
@@ -1041,7 +1095,7 @@ unsafe fn device_control(
             unsafe { complete(irp, STATUS_SUCCESS, reply.len as u64) }
         }
         Err(refusal) => {
-            let status = count_refusal(shared, parameters.IoControlCode, name, &refusal);
+            let status = count_refusal(shared, code, name, &refusal);
             // SAFETY: the caller's contract.
             unsafe { complete(irp, status, 0) }
         }
