@@ -28,7 +28,8 @@ pub enum Error {
     },
     /// Another host is attached to this microphone.
     Busy,
-    /// This handle is no longer the attached host: it detached, or the driver detached it.
+    /// This handle is no longer the attached host: it detached, the driver detached it, or the
+    /// host interface was removed (the host should let go: `Player::follow` does).
     NotHost,
     /// A write the stream cannot take.
     Write(&'static str),

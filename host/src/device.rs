@@ -15,8 +15,8 @@ use windows::{
             CM_Get_Device_Interface_ListW, CR_BUFFER_SMALL, CR_SUCCESS,
         },
         Foundation::{
-            ERROR_BAD_COMMAND, ERROR_BUSY, ERROR_NOT_READY, GENERIC_READ, GENERIC_WRITE, HANDLE,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
+            ERROR_BAD_COMMAND, ERROR_BUSY, ERROR_DEVICE_REMOVED, ERROR_NOT_READY, GENERIC_READ,
+            GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -395,7 +395,8 @@ impl Host {
     /// - [`Error::Write`] for no frame, a partial frame, more than the stream's buffer, or a
     ///   stream buffer larger than the mapping;
     /// - [`Error::NotHost`] when the driver no longer takes this handle as the host (then on
-    ///   every later call, without writing);
+    ///   every later call, without writing), or when the host interface was removed (let go:
+    ///   `detach`, or drop);
     /// - [`Error::Os`] and [`Error::Reply`] otherwise.
     pub fn write(
         &mut self,
@@ -446,6 +447,10 @@ impl Host {
                 self.attached = false;
                 Err(Error::NotHost)
             }
+            // The host interface was surprise-removed: the driver refuses to advance, and its
+            // removal notification may not have come yet. The host must let go, as when the
+            // driver detached it; `DETACH` still works, so `attached` stays.
+            Err(error) if error.code() == ERROR_DEVICE_REMOVED.to_hresult() => Err(Error::NotHost),
             Err(error) => Err(Error::Os {
                 call: "ADVANCE",
                 error,
