@@ -214,8 +214,10 @@ impl Stream {
         let Some(mdl) = shared.stream_mdl(geometry.bytes) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
-        // Not shared with the audio engine yet; the host writes only once the stream runs.
-        shared.zero(geometry.bytes as usize);
+        // Not shared with the audio engine yet; a host is told the buffer only once the stream
+        // runs (`set_buffer`, below). Whole pages: the client maps whole pages, so the tail of
+        // the last one, beyond the buffer, must not keep an earlier stream's audio either.
+        shared.zero_pages(geometry.bytes as usize);
         let base = shared.system();
 
         self.frames_per_packet

@@ -952,6 +952,13 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   release (the independent review found that window in the first version); and a free with an
   MDL that is not the stream's releases nothing (it released the stream's own buffer, which the
   audio engine might still map).
+  *Stream buffer zeroing (2026-11-10):* a stream's allocation zeroed only the bytes asked for,
+  while its client maps whole pages: a buffer of 3840 bytes (shared mode) showed the 256 bytes
+  after it too, which an earlier, larger stream (exclusive mode) may have filled with the host's
+  audio, and a request for 4 bytes showed the rest of its page. The shared buffer is zeroed for
+  each host, not for each stream. Low: a process that can open the capture pin can record the
+  microphone anyway, but the assurance case says buffers are zeroed when allocated. The stream
+  now zeroes the whole pages it hands out (`BufferRef::zero_pages`).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):
