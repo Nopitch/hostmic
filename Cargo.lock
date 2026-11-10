@@ -317,6 +317,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostmic-ioctl-fuzz"
+version = "0.1.0"
+dependencies = [
+ "hostmic-abi",
+ "windows",
+]
+
+[[package]]
 name = "hostmic-measure"
 version = "0.1.0"
 dependencies = [
