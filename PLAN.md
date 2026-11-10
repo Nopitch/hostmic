@@ -959,6 +959,19 @@ A driver that maps memory into a user process is a classic source of vulnerabili
   each host, not for each stream. Low: a process that can open the capture pin can record the
   microphone anyway, but the assurance case says buffers are zeroed when allocated. The stream
   now zeroes the whole pages it hands out (`BufferRef::zero_pages`).
+  *A late stream release (2026-11-10):* the host link's stream state is one for the adapter,
+  and a stream's release called `stream_closed` and cleared the buffer geometry. One capture pin
+  at a time does not order a stream object's last `Release` before the next stream's creation
+  (PortCls documents no such order): a late release would stop the new stream's cursor and clear
+  its geometry, so the host's `ADVANCE`s were refused and the new stream got no packets until it
+  was reopened (availability only). `stream_opened` now hands the stream a token (a counter,
+  never 0), and `stream_closed`, `set_buffer` and `set_state` carry it and act, under a
+  `stream_lock` of their own (`PASSIVE_LEVEL`, never in the real-time path), only for the
+  current stream; a new stream also starts without the previous one's buffer geometry (the
+  independent review: the old stream's late `FreeAudioBuffer` is now refused). Left as it is:
+  the audio engine's notification event has the same one-slot shape, keyed by the event, and
+  relies on PortCls unregistering it before the stream's last release, which its documentation
+  implies (a new stream's registration would otherwise fail, an availability issue only).
 - **M7, signing:** submit to an open-source signing programme, then install on a real machine
   with Secure Boot on. OSSign signs kernel drivers through Microsoft attestation. Its published
   criteria (read 2026-11-08; applications were then suspended because of a backlog):

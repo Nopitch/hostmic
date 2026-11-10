@@ -9,8 +9,9 @@
 //! The stream's generation and position follow `hostmic_driver_core::host::Cursor`'s protocol:
 //! a state change or a new buffer first halts the generation, then changes the rest. The writers
 //! here are the stream's creation, state changes, buffer allocations and release (`PASSIVE_LEVEL`,
-//! serialized by PortCls), and `ADVANCE`, which moves the position with one compare-and-exchange
-//! and loses to any of them.
+//! serialized by `stream_lock`, and acting only for the current stream: each carries the
+//! stream's token), and `ADVANCE`, which moves the position with one compare-and-exchange and
+//! loses to any of them.
 //!
 //! The link holds the adapter's reference to the shared buffer ([`crate::shared_buffer`]), and
 //! the attached host's mapping of it. A user mapping must be undone in its process before the
@@ -127,6 +128,16 @@ pub struct HostLink {
     jack_rundown: UnsafeCell<EX_RUNDOWN_REF>,
     /// Serializes the changes of `jack_events`; initialized by [`HostLink::init`].
     jack_lock: UnsafeCell<KGUARDED_MUTEX>,
+    /// The token of the stream whose state, format and buffer the link holds; 0 without one.
+    /// A stream's late release (its last `Release` after the next stream was created) must not
+    /// reset what the next stream published: the stream calls carry their token, and act only
+    /// for the current one. Changed under `stream_lock`.
+    current_stream: AtomicU64,
+    /// The last token handed out: 0 is never one.
+    last_stream: AtomicU64,
+    /// Serializes the stream calls, so that a token's check and its stores are one step;
+    /// initialized by [`HostLink::init`]. `PASSIVE_LEVEL` calls, never in the real-time path.
+    stream_lock: UnsafeCell<KGUARDED_MUTEX>,
     /// The audio engine's notification event, which `ADVANCE` signals when a packet completes;
     /// null without one. Not referenced: the stream registers and unregisters it, and
     /// unregistering waits for `engine_rundown`.
@@ -202,6 +213,8 @@ impl HostLink {
             unsafe { KeInitializeGuardedMutex(self.jack_lock.get()) };
             // SAFETY: as above.
             unsafe { KeInitializeGuardedMutex(self.host_lock.get()) };
+            // SAFETY: as above.
+            unsafe { KeInitializeGuardedMutex(self.stream_lock.get()) };
             self.registered.store(register(self), Ordering::Release);
             self.started.store(true, Ordering::Release);
         }
@@ -282,38 +295,83 @@ impl HostLink {
         self.update(Cursor::stopped);
     }
 
-    /// A stream was created in `format`.
-    pub fn stream_opened(&self, format: Format) {
-        self.stop();
-        self.state.store(State::Stopped.code(), Ordering::Release);
-        self.format
-            .store(u64::from_le_bytes(format.to_bytes()), Ordering::Release);
-        self.notify();
+    /// Runs `f` under `stream_lock` if `token` is the current stream's; whether it ran.
+    fn for_stream(&self, token: u64, f: impl FnOnce()) -> bool {
+        let ran = with_lock(&self.stream_lock, || {
+            if token == 0 || self.current_stream.load(Ordering::Acquire) != token {
+                return false;
+            }
+            f();
+            true
+        });
+        if !ran {
+            println!("hostmic: a stream that is no longer the current one left the link alone");
+        }
+        ran
     }
 
-    /// The stream was freed.
-    pub fn stream_closed(&self) {
-        self.stop();
-        self.state.store(State::Stopped.code(), Ordering::Release);
-        self.buffer_frames.store(0, Ordering::Release);
-        self.frames_per_packet.store(0, Ordering::Release);
-        self.format.store(0, Ordering::Release);
+    /// A stream was created in `format`: it becomes the current one. Returns its token, which
+    /// its other calls carry.
+    pub fn stream_opened(&self, format: Format) -> u64 {
+        let token = with_lock(&self.stream_lock, || {
+            let token = self
+                .last_stream
+                .load(Ordering::Relaxed)
+                .wrapping_add(1)
+                .max(1);
+            self.last_stream.store(token, Ordering::Relaxed);
+            self.current_stream.store(token, Ordering::Release);
+            self.stop();
+            self.state.store(State::Stopped.code(), Ordering::Release);
+            // No buffer yet: the previous stream's release may come later and is then refused,
+            // so its geometry is not left for this one.
+            self.buffer_frames.store(0, Ordering::Release);
+            self.frames_per_packet.store(0, Ordering::Release);
+            self.format
+                .store(u64::from_le_bytes(format.to_bytes()), Ordering::Release);
+            token
+        });
         self.notify();
+        token
     }
 
-    /// The stream got a buffer of `frames` frames (0: freed), in packets of
-    /// `frames_per_packet` frames (0: polling mode).
-    pub fn set_buffer(&self, frames: u32, frames_per_packet: u32) {
-        // Halt first, so that no request computed for the old buffer can commit.
-        self.update(Cursor::halted);
-        self.buffer_frames.store(frames, Ordering::Release);
-        self.frames_per_packet
-            .store(frames_per_packet, Ordering::Release);
-        self.notify();
+    /// The stream of `token` was freed; nothing if it is no longer the current one.
+    pub fn stream_closed(&self, token: u64) {
+        if self.for_stream(token, || {
+            self.current_stream.store(0, Ordering::Release);
+            self.stop();
+            self.state.store(State::Stopped.code(), Ordering::Release);
+            self.buffer_frames.store(0, Ordering::Release);
+            self.frames_per_packet.store(0, Ordering::Release);
+            self.format.store(0, Ordering::Release);
+        }) {
+            self.notify();
+        }
     }
 
-    /// The stream changed state.
-    pub fn set_state(&self, state: State) {
+    /// The stream of `token` got a buffer of `frames` frames (0: freed), in packets of
+    /// `frames_per_packet` frames (0: polling mode); nothing if it is no longer the current one.
+    pub fn set_buffer(&self, token: u64, frames: u32, frames_per_packet: u32) {
+        if self.for_stream(token, || {
+            // Halt first, so that no request computed for the old buffer can commit.
+            self.update(Cursor::halted);
+            self.buffer_frames.store(frames, Ordering::Release);
+            self.frames_per_packet
+                .store(frames_per_packet, Ordering::Release);
+        }) {
+            self.notify();
+        }
+    }
+
+    /// The stream of `token` changed state; nothing if it is no longer the current one.
+    pub fn set_state(&self, token: u64, state: State) {
+        if self.for_stream(token, || self.apply_state(state)) {
+            self.notify();
+        }
+    }
+
+    /// [`HostLink::set_state`]'s stores, for the current stream.
+    fn apply_state(&self, state: State) {
         match state {
             State::Running => {
                 self.state.store(state.code(), Ordering::Release);
@@ -328,7 +386,6 @@ impl HostLink {
                 self.state.store(state.code(), Ordering::Release);
             }
         }
-        self.notify();
     }
 
     /// What `GET_STREAM` replies. The fields are read one by one, then the cursor again: a
