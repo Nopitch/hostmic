@@ -110,9 +110,9 @@ How the project is run is in [GOVERNANCE.md](GOVERNANCE.md).
 
 - The **driver** is a port of Microsoft's audio driver samples and is distributed under the
   [Microsoft Public License](LICENSES/MS-PL.txt) (MS-PL), like the samples it derives from.
-- The **user-mode host library** is original code, licensed under either the
-  [MIT license](LICENSES/MIT.txt) or the [Apache License 2.0](LICENSES/Apache-2.0.txt), at
-  your option.
+- The **user-mode host library** (`hostmic`, in `host/`) and the tools are original code,
+  licensed under either the [MIT license](LICENSES/MIT.txt) or the
+  [Apache License 2.0](LICENSES/Apache-2.0.txt), at your option (SPDX: `MIT OR Apache-2.0`).
 - **`hostmic-abi`**, the contract between the driver and the host (control codes and request
   layouts), is shared by both and licensed like the host library: MIT or Apache-2.0, at your
   option.
