@@ -51,8 +51,9 @@ useful contributions today:
 - **Reviewing kernel code**: pull requests that touch the driver are read line by line, and a
   second pair of eyes is welcome on any of them.
 - **Documentation**: what was unclear, wrong or missing when you set it up.
-- **Hosts**: applications that feed the microphone, and feedback on the host interface
-  (`hostmic-abi`) before the host library (M5) settles it.
+- **Hosts**: applications that feed the microphone, and feedback on the host library
+  (`hostmic`, in `host/`) and its contract with the driver (`hostmic-abi`) before the first
+  release settles them.
 
 Issues labeled [`good first issue`](https://github.com/Nopitch/hostmic/labels/good%20first%20issue)
 are small and self-contained. Questions go to
