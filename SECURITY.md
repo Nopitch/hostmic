@@ -65,7 +65,8 @@ its design are in [docs/security-assurance.md](docs/security-assurance.md).
 
 Dependencies come from standard sources only: crates from crates.io, pinned in `Cargo.lock`;
 GitHub Actions pinned by full commit SHA; the Windows Driver Kit from Microsoft's NuGet package,
-pinned by version. Dependabot raises alerts and update pull requests.
+pinned by version. Dependabot raises alerts and update pull requests; version updates wait
+7 days after a release (cooldown), security updates do not.
 
 - **Every pull request** is checked by the required `dependencies` CI check (GitHub dependency
   review): a change that adds or updates a dependency with a known vulnerability of any

@@ -1,9 +1,14 @@
 version: 2
+# Version updates wait 7 days after a release (`cooldown`): a compromised or broken release is
+# usually reported and pulled within days, before Dependabot proposes it. Security updates
+# are not delayed (GitHub does not apply cooldown to them).
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
@@ -13,6 +18,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       # windows-drivers-rs crates are released together and must move together.
       windows-drivers-rs:
@@ -25,3 +32,5 @@ updates:
     directory: "/fuzz"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
